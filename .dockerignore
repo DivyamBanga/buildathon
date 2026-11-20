@@ -1,0 +1,8 @@
+.git
+.lab
+sample
+tools
+kit
+*.tar.gz
+output.jsonl
+**/__pycache__
