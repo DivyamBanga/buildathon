@@ -11,6 +11,8 @@ from __future__ import annotations
 import importlib.util
 import marshal
 import os
+import re
+import posixpath
 
 from . import patchlib, pydiff
 from .covmap import CovMap
@@ -19,6 +21,13 @@ from .covmap import CovMap
 # so a change to how pytest is configured cannot be reproduced by running.
 _PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py")
 _MAYBE_PYTEST_CONFIG = ("pyproject.toml", "setup.cfg")
+# What only pytest honours in a unittest-based test file: its name, the xunit hooks (the runner calls
+# setUpModule and setUp, never these), marks, fixtures, collection switches.
+_PYTEST_ONLY = re.compile(
+    r"pytest|\b(?:setup|teardown)_(?:module|function|class|method)\b|\b(?:setUp|tearDown)Module\b"
+    r"|__test__|\bnose\b|collect_ignore|\bxfail\b|\bfixture\b",
+    re.IGNORECASE,
+)
 # Only these two trees are reproduced faithfully for a child: a test that
 # resolves the real location of its own file ends up in the pinned checkout
 # for anything else.
@@ -190,7 +199,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     if path.startswith("tests/") and not diff.isomorphic:
         prefix = path + "::"
         known = {test_id[len(prefix):] for test_id in covmap.ids if test_id.startswith(prefix)}
-        if pydiff.only_new_definitions(patch.old_text, patch.new_text, known):
+        if pydiff.only_new_definitions(patch.old_text, patch.new_text, known, covmap.test_names()):
             plan.note(f"{path}: only new tests or helpers were added")
             return
     old_lines = patch.old_text.splitlines(keepends=True)
@@ -358,6 +367,73 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.redirects[os.path.join(root, path)] = patch.new_text
 
 
+def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
+    """A file that appears or vanishes changes what its directory lists.
+
+    Some test lists the directory itself, or asks the import system for a name
+    the new file would answer to (see CovMap.entry_listers); the new file is in
+    the overlay a child runs in, so they are run like the other candidates.
+    """
+    path = patch.path
+    old_path = patch.old_path or path
+    entries = []
+    name = os.path.basename(path)
+    if (
+        patch.new_file
+        and old_path == path
+        and path.startswith("tests/")
+        and (name.startswith("test_") or name.endswith("_test.py"))
+        and pydiff.harmless_new_test_module(patch.new_text or "")
+    ):
+        # pytest lists the directory but keeps only what its arguments name, and
+        # nothing asks the import system for the new module: only this rule's
+        # own judgement (below, in _analyze_python) applies.
+        return
+    if patch.new_file or old_path != path:
+        entries.append(path)
+    if old_path != path or patch.new_text is None:
+        entries.append(old_path)
+    for entry in entries:
+        found, unchecked = covmap.entry_listers(entry, root)
+        if found:
+            plan.candidates |= found
+            plan.rest_candidates |= found
+            plan.unverified |= unchecked
+            plan.needs_clean = True
+            plan.sliceable = False
+            plan.note(f"{entry}: appears in or vanishes from its directory, {found.bit_count()} tests list it or ask for its name")
+
+
+def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> None:
+    """Rules for a Python file under tests/ that no run of one test can settle.
+
+    The runner executes tests with unittest in one forked child each, while the
+    labels come from pytest running every test file in one process.
+    """
+    path = patch.path
+    old_path = patch.old_path or path
+    if not (path.startswith("tests/") or old_path.startswith("tests/")):
+        return
+    if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
+        # A new or changed statement that stores into a class, a module or a
+        # registry: in the whole suite it reaches tests of other files.
+        plan.select_all = True
+        plan.note(f"{path}: new code stores outside its own locals")
+        return
+    if patch.old_text is None:
+        return
+    touched = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-")
+    if _PYTEST_ONLY.search(touched):
+        # Added or removed lines that speak to pytest (marks, skips, fixtures, the
+        # hooks only it calls): only pytest sees them, so the tests of the file, or those that import it
+        # when it is a helper, are selected as they are.
+        found = covmap.tests_of_file(old_path) | covmap.file_any(old_path)
+        plan.candidates |= found
+        plan.rest_candidates |= found
+        plan.unverified |= found
+        plan.note(f"{path}: lines about pytest-only behaviour changed, {found.bit_count()} tests selected unchecked")
+
+
 def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
     """`loaded` holds the absolute paths of the modules already imported by the coordinator."""
     plan = Plan(commit)
@@ -374,6 +450,18 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note("unrecognised patch")
         else:
             plan.note("empty patch")
+        return plan
+    sections: dict[str, int] = {}
+    for patch in plan.files:
+        for name in {posixpath.normpath(p) for p in (patch.old_path, patch.new_path) if p}:
+            sections[name] = sections.get(name, 0) + 1
+    repeated = sorted(name for name, count in sections.items() if count > 1)
+    if repeated:
+        # A path in more than one section (edited twice, deleted and created,
+        # renamed and edited): the sections are not applied one after the other
+        # here, and what the tests see depends on how they are.
+        plan.select_all = True
+        plan.note(f"{repeated[0]} occurs in more than one section of the patch")
         return plan
     for patch in plan.files:
         path = patch.path
@@ -409,7 +497,9 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note(f"{path}: unchanged")
             continue
         try:
+            _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
+                _test_file_rules(plan, patch, covmap)
                 _analyze_python(plan, patch, covmap, root, loaded)
             else:
                 _analyze_data(plan, patch, covmap, root)

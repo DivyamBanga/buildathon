@@ -24,6 +24,7 @@ inside the phase belongs to it. So every recording is made in a process that
 has done nothing yet: the two tests in every order a child can meet them in
 (both, reversed, each alone), and every query on its own.
 """
+import ast
 import json
 import marshal
 import os
@@ -126,9 +127,12 @@ if queries_path:
         in_fork(lambda: record_lines([case[1]], case, os.path.join(work_dir, f"lines-case-{number}.json")))
 
 memo = {}
+typed_of = {}  # memo key -> digest of the tree with its type annotations
 for name in os.listdir(record_dir):
     with open(os.path.join(record_dir, name), "rb") as handle:
-        key, data = pickle.load(handle)
+        key, typed, data = pickle.load(handle)
+    if typed_of.setdefault(key, typed) != typed:
+        raise SystemExit(f"two sets of type annotations for {key}")
     known = memo.setdefault(key, data)
     if known != data:
         one, two = pickle.loads(known), pickle.loads(data)
@@ -264,10 +268,42 @@ if queries_path and trace_dir and attrs_path:
             reads_of.setdefault(key, set()).update(watched_entry["reads"])
     if set(lines_of) != set(memo):
         raise SystemExit(f"queries recorded one by one: {len(lines_of)}, results: {len(memo)}")
+    # Does planning and executing a query ask a node for its type? Only then do
+    # the annotations of its tree matter to the result. A node is asked through
+    # Expr.is_type or the `type` property; any other executed line that reads
+    # the `_type` slot (copying it along, in __deepcopy__, does not count)
+    # makes every query count as asking.
+    asking = set()
+    stray = []
+    for path in units:
+        tree = ast.parse(open("/sqlglot/" + path, encoding="utf-8").read())
+        functions = [
+            (min([node.lineno] + [d.lineno for d in node.decorator_list]), node.end_lineno, node.name)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        executed = {line for _first, line in units[path]}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_type" and isinstance(node.ctx, ast.Load) and node.lineno in executed:
+                holders = [(last - first, name) for first, last, name in functions if first <= node.lineno <= last]
+                name = min(holders)[1] if holders else "<module>"
+                if not (path == "sqlglot/expressions/core.py" and name in ("is_type", "type", "__deepcopy__")):
+                    stray.append((path, node.lineno, name))
+        if path == "sqlglot/expressions/core.py":
+            for first, last, name in functions:
+                if name in ("is_type", "type"):
+                    asking.update(row for row in every if row[0] == path and first <= row[2] <= last)
+    if stray:
+        print(f"the type slot is read outside is_type and the type property: {stray[:5]}; every query counts as asking")
     queries = {
-        key: (mask(row_index[row] for row in lines_of[key]), mask(read_index[name] for name in reads_of[key]))
+        key: (
+            mask(row_index[row] for row in lines_of[key]),
+            mask(read_index[name] for name in reads_of[key]),
+            typed_of[key] if stray or lines_of[key] & asking else "",
+        )
         for key in sorted(memo)
     }
+    print(f"{sum(1 for entry in queries.values() if entry[2])} of {len(queries)} queries ask a node for its type")
     with open(queries_path, "wb") as handle:
         handle.write(zlib.compress(marshal.dumps(queries), 9))
     sizes = sorted(len(rows) for rows in lines_of.values())

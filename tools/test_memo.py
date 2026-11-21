@@ -62,6 +62,13 @@ check(digest(swapped) != digest(plain), "argument order counts")
 typed = plain.copy()
 typed.expressions[0].type = exp.DataType.build("int")
 check(digest(typed) != digest(plain), "a type annotation counts")
+both = runner.tree_digests
+check(both(typed)[0] == both(plain)[0], "but not in the digest that leaves annotations out")
+check(both(typed)[1] == digest(typed) and both(plain)[0] != both(plain)[1], "the two digests are different things")
+retyped = plain.copy()
+retyped.expressions[0].type = exp.DataType.build("text")
+check(both(retyped)[0] == both(typed)[0] and both(retyped)[1] != both(typed)[1], "another annotation changes only the second")
+check(both(commented := plain.copy())[0] == both(plain)[0], "a copy keeps both")
 commented = plain.copy()
 commented.expressions[0].comments = ["x"]
 check(digest(commented) != digest(plain), "a comment counts")
@@ -143,16 +150,19 @@ pinned["u"].rows[0] = kept[0]
 nested = Tables({"db": {"t": pinned["t"]}})
 check(runner.memo_key("tpcds", "d", (), {"tables": nested}) is None, "nested tables are not recognised")
 # Query by query: a recorded result is used only when the query's own record touches nothing the patch changes.
-runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01)}
+runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01, ""), "t": (0b0110, 0b01, "typed")}
 runner.MEMO_BLOCK = None
-check(runner._query_untouched("k") and runner._query_untouched("unknown"), "nothing changed in the phase: every query keeps its result")
+check(runner._query_untouched("k", "anything"), "nothing changed in the phase: a query that never asks for a type keeps its result")
+check(runner._query_untouched("t", "typed"), "a query that asks for types keeps its result with the recorded annotations")
+check(not runner._query_untouched("t", "other"), "and is executed with other annotations")
+check(not runner._query_untouched("unknown", "typed"), "a query with no record of its own is executed")
 for block, expected in (((0b1000, 0), True), ((0b0100, 0), False), ((0, 0b01), False), ((0b1001, 0b10), True), ((0b0010, 0b10), False)):
     runner.MEMO_BLOCK = block
-    check(runner._query_untouched("k") is expected, f"lines and attributes {block}: kept is {expected}")
-check(not runner._query_untouched("unknown"), "a query with no record of its own is executed once anything changed")
+    check(runner._query_untouched("k", "x") is expected, f"lines and attributes {block}: kept is {expected}")
 runner.MEMO_BLOCK = None
 queries = runner.read_executor_queries("/repo/maps/execqueries.bin")
-check(len(queries) == 57 and all(type(a) is int and type(b) is int and a for a, b in queries.values()), "the per-query record reads back")
+check(len(queries) == 57 and all(type(a) is int and type(b) is int and type(c) is str and a for a, b, c in queries.values()), "the per-query record reads back")
+check(0 < sum(1 for entry in queries.values() if entry[2]) < len(queries), "some queries ask a node for its type, most do not")
 check(runner.read_executor_queries("/repo/maps/no-such-file") == {}, "a missing per-query record is an empty one")
 
 # Which class attributes can be watched for reads (state.watchable), and how a pair is looked up.
