@@ -23,6 +23,12 @@ maps = sys.argv[2]
 ids = json.load(open(os.path.join(maps, "tests.json")))
 os.environ["SKIP_INTEGRATION"] = "0"
 runner.warm_up("/sqlglot", list(dict.fromkeys(test["file"] for test in tests)))
+# As the coordinator does: what is imported is never collected again, and the
+# children collect with the runner's thresholds.
+import gc  # noqa: E402
+
+gc.collect()
+gc.freeze()
 EXECUTOR = "tests/test_executor.py::TestExecutor"
 
 
@@ -45,6 +51,8 @@ def measure(name, bits, prepare=None):
     pid = os.fork()
     if pid == 0:
         os.close(read_fd)
+        if runner.GC_THRESHOLD:
+            gc.set_threshold(*runner.GC_THRESHOLD)
         if prepare is not None:
             prepare()
         marks = {}
@@ -131,6 +139,9 @@ if EXECUTOR in groups and os.path.exists(os.path.join(maps, "ducksetup.json")):
     # Own class setup, DuckDB's answers reused: how the executor tests run after
     # a clean import, or when the patch touches something their setup runs.
     runner.load_duckdb_setups(os.path.join(maps, "ducksetup.json"))
+    if runner.DUCKDB_ANSWERS is None:
+        runner.load_duckdb_answers(os.path.join(maps, "duckdb.bin"))
+    runner.prepare_duck_probe()
     measured, answers["setup"] = measure(
         EXECUTOR + " (own setup, answers reused)", groups[EXECUTOR],
         lambda: runner._install_duck_probe(("/sqlglot",), set()),
