@@ -207,6 +207,22 @@ the patched code**, and selects the ones that fail.
      This holds for any patch, because it is decided by what the patched code
      really sends. The optimizer tests' small DuckDB database is held back the
      same way until a case executes a query.
+   - A patch that changes how a TPC query is written for DuckDB sends texts
+     the record does not have. The setup's views read gzip CSV files anew for
+     every query (15 CPU seconds for the 57 TPC-DS queries, 0.4 for the
+     queries themselves). So a plain SELECT with no recorded answer, sent
+     after a recognised setup, is run on tables that hold exactly what the
+     views show: made by the setup's own `READ_CSV` calls, same rows, same
+     order, same types. What DuckDB may vary between a view and a table is
+     the plan, hence the order of rows where the query leaves it open and the
+     last digits of floating-point sums. The query is therefore run a second
+     time on copies of the tables that store the rows in reverse, and the
+     answer is used only when both frames agree (exactly, sums to nine
+     digits); a result that depends on the order rows arrive in does not
+     pass that, and then, after any error, or for a text that could tell a
+     table from a view (`rowid`, the catalog), the views are asked as before.
+     This is an assumption, stated here: a result that survives reversing
+     every table is what the views give too.
    - `sqlglot.executor.execute` prepares the tables it was given, optimizes
      the query, plans it and runs the plan. The result of the last two steps
      depends on three things: the optimized query, the tables, and the code
