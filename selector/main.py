@@ -818,8 +818,12 @@ class Coordinator:
                 pass
 
     def allowance(self, bit: int) -> float:
-        """Wall-clock seconds a test may take before it counts as hung."""
-        return max(4.0, 8.0 * self.bit_seconds[bit] + 3.0)
+        """Wall-clock seconds a test may take before it counts as hung.
+
+        Generous: waiting costs nothing here, and a test that spins instead of
+        waiting is stopped by its CPU allowance long before.
+        """
+        return max(8.0, 12.0 * self.bit_seconds[bit] + 6.0)
 
     def cpu_allowance(self, job: Job, bit: int) -> float:
         """CPU seconds a test may burn before it counts as failing.
@@ -828,7 +832,7 @@ class Coordinator:
         reused): a patch that makes a test crawl would otherwise be paid for in
         CPU time until the wall-clock limit.
         """
-        return max(3.0, 1.6 * self.worst_cost(job, bit) * max(self.machine, 1.0) + 1.0)
+        return max(4.0, 2.2 * self.worst_cost(job, bit) * max(self.machine, 1.0) + 2.0)
 
     def feed(self, run: Run, data: bytes, now: float) -> None:
         run.buffer += data

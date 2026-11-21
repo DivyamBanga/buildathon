@@ -48,10 +48,10 @@ class Plan:
         self.rest_candidates = 0
         # False when an import-time change is outside sqlglot's own modules.
         self.probe_ok = True
-        # (path, code firstlineno, lines or None): changed functions that ran at
-        # import and are answered for by what they left behind. None for now: a
-        # function that ran at import may also be what imports a module on
-        # demand, and that is not something the state of the package shows.
+        # (path, code firstlineno, lines or None): changed functions that sqlglot
+        # runs while it is imported, in some test's process at least. Functions
+        # that import modules on demand are not among them (a change to one
+        # selects everything).
         self.warm_units: list = []
         # Every test that imported a file whose import-time code changed, before
         # any narrowing; `narrowed` says that some were left out as unable to
@@ -260,6 +260,17 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 # It already ran while the test modules were imported, so state
                 # built from the old version exists: only a fresh import is faithful.
                 hot = False
+            if covmap.has_test_time() and not covmap.is_loader(path, first):
+                themselves = covmap.test_time(path, first, lines)
+                if themselves != found:
+                    # Some tests "ran" it only because sqlglot ran it while being
+                    # imported in their process. What it did then is in the state
+                    # of the package (selector/state.py); the tests that run it
+                    # themselves are the least that can remain.
+                    at_import = True
+                    plan.warm_units.append((path, first, lines))
+                    if plan.import_floor is not None:
+                        plan.import_floor |= themselves
         plan.candidates |= found
         if at_import:
             plan.import_candidates |= found

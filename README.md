@@ -62,8 +62,21 @@ the patched code**, and selects the ones that fail.
    not mistaken for the test using it: that part is exactly what the state
    comparison accounts for. The comparison says "different" for anything it
    does not know how to compare, and the candidates fall back to the rule
-   above when it is inconclusive (a module no longer imports, too many
-   differences, state outside the package changed).
+   above when it is inconclusive (too many differences, state outside the
+   package changed). When a module no longer imports at all, every test that
+   imports it or a module that depends on it is a candidate, whether or not it
+   could "see" the changed class: the comparison is therefore always run
+   before tests are left out for that reason.
+
+   What the comparison takes for granted, each checked against the pinned
+   code: annotations, docstrings and what `typing` records about a TypedDict
+   are not read while tests run; nothing relies on the order of the entries of
+   a table keyed by classes, enum members or strings (sqlglot builds several
+   of them by looping over sets, so their order already differs from run to
+   run); a default or a closure value of a function matters only when the
+   function is called. A function that imports modules on demand (four in
+   sqlglot) is outside all of this: when it runs depends on which tests ran
+   before, so a change to one selects every test.
 
 4. **Run the candidates against the patch** (`selector/runner.py`). The
    coordinator imports sqlglot and the test modules once, then forks a child
