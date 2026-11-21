@@ -834,9 +834,11 @@ class Comparer:
         """True for a value whose appearance or disappearance has effects besides its name."""
         if isinstance(value, type):
             if value.__module__ != module_name:
-                # A class made elsewhere, only bound to a name here; except in a dialect module,
-                # where Dialect._try_load looks through dir(module) for the dialect's class.
-                return module_name.startswith(module_name.split(".", 1)[0] + ".dialects.")
+                # A class made elsewhere, only bound to a name here; except a dialect bound in a dialect
+                # module, where Dialect._try_load looks through dir(module) for the dialect's class.
+                return module_name.startswith(module_name.split(".", 1)[0] + ".dialects.") and any(
+                    base.__name__ == "Dialect" for base in value.__mro__
+                )
             if type(value) is not type:
                 return True  # a metaclass (the dialect registry, enum, abc) acts on creation
             package = module_name.split(".", 1)[0]

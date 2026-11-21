@@ -232,6 +232,18 @@ import types  # noqa: E402
 
 comparer_ = state.Comparer(world(BASE), world(BASE), "/root")
 expect("another module that is new to every namespace", comparer_._risky(types.ModuleType("zz_outside"), "pkg.mod", world(BASE)), True)
+
+class Dialect:
+    pass
+
+
+class Sub(Dialect):
+    pass
+
+
+expect("a dialect class bound in a dialect module", comparer_._risky(Sub, "pkg.dialects.zz", world(BASE)), True)
+expect("a plain class bound in a dialect module", comparer_._risky(textwrap.TextWrapper, "pkg.dialects.zz", world(BASE)), False)
+expect("a dialect class bound elsewhere", comparer_._risky(Sub, "pkg.zz", world(BASE)), False)
 expect("a standard-library module with effects", comparer_._risky(types.ModuleType("this"), "pkg.mod", world(BASE)), True)
 expect("a module another name binds", shapes(BASE + "\nimport enum as en\n"), [("en", "added", "")])
 expect("a standard-library module no namespace binds any more", shapes(BASE.replace("import functools\n", "").replace("half = functools.partial(helper, scale=0.5)", "half = helper")), [("functools", "removed", "")])

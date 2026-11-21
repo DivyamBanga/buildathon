@@ -206,7 +206,7 @@ the patched code**, and selects the ones that fail.
      classes that register themselves or are found by walking a namespace (any
      class defined in the module with a base from the package or a metaclass:
      `subclasses()` over `sqlglot.expressions`, `Dialect._try_load` over a
-     dialect module (also any class bound there, whoever defined it), serde's
+     dialect module (also a dialect class bound there, whoever defined it), serde's
      class lookup, the dialect registry, a new `Dialects` member); a module no other namespace binds (importing it may have effects), unless it belongs to the standard library and is not one that acts when imported (`this`, `antigravity`, `readline`, `site`; `outside_state` still catches changed environment, warning filters, logging);
      every attribute of a class with a base from outside the package (an
      enum, an exception, a `dict` subclass: their own machinery reads names);
