@@ -254,4 +254,18 @@ expect(
 )
 expect("an attribute added to a plain class", shapes(BASE.replace("FLAG = False", "FLAG = False\n    EXTRA = 1")), [("EXTRA", "added", "")])
 
+expect(
+    "a module that binds its own builtins",
+    differences(BASE.replace("LIMIT = 10\n", "LIMIT = 10\n__builtins__ = {**__builtins__, 'any': all}\n")),
+    [("", "__builtins__", "value")],
+)
+before = state.outside_state()
+import builtins  # noqa: E402
+
+builtins.any, kept = all, builtins.any
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+builtins.any = kept
+expect("a builtin replaced for everyone", changed, ["the builtins"])
+expect("and put back", state.outside_state(), before)
+
 print(f"{checks} checks passed")

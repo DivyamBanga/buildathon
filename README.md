@@ -149,7 +149,10 @@ the patched code**, and selects the ones that fail.
    comparison accounts for. The comparison says "different" for anything it
    does not know how to compare, and the candidates fall back to the rule
    above when it is inconclusive (too many differences, state outside the
-   package changed). When a module no longer imports at all, every test that
+   package changed: the environment, logging, warning filters, the recursion
+   limit, or any builtin). A module that binds a `__builtins__` of its own
+   counts as a difference every test importing it can see: the names its code
+   leaves to the builtins may mean something else. When a module no longer imports at all, every test that
    imports it or a module that depends on it is a candidate, whether or not it
    could "see" the changed class: the comparison is therefore always run
    before tests are left out for that reason.
@@ -363,8 +366,28 @@ the patched code**, and selects the ones that fail.
        lookup and an entry are the same key when `state.key_names` gives them
        a common name, and what a query looked up counts only if it ran the
        same lines with and without the recording dicts); any other constant
-       must not be named in any function it runs (`execnames.json`);
-       anything else (an attribute added or removed, other bases, a
+       must not be named by a statement it runs (`execnames.json`: a name or
+       attribute written in the code is read by the statement it stands in;
+       a name that only occurs in a string, an import or a `global` line
+       counts for its whole function); any other name of a module with
+       another value (a function replaced by a changed decorator, an object
+       made at import) is read the same way, by the statements that name it,
+       the names Python itself asks a module for (two underscores) excepted;
+       a name in capitals that appears or
+       vanishes (a constant renamed at its definition) is seen the same way,
+       by the statements that name it, as long as the lines of that code
+       that look a name up by a computed text or walk a namespace are the
+       ones reviewed at the pinned commit (the generator's `dir(cls)` for
+       names ending in `_sql`; `eval` of generated code in a dict built from
+       the executor's function table); that function table itself (`ENV` in
+       `executor/env.py`) is copied by every query, and a query uses of it
+       only the entries its code names, so a table that differs in some
+       entries concerns the queries whose evaluated code names one of them
+       (all names of every piece of code a query evaluates are recorded,
+       and the key of the one lookup by a computed name; used only while the
+       lines of the package that mention the table or a copy of it are the
+       ones this was read off);
+       anything else (other added or removed attributes, other bases, a
        difference on the classes the recorded results are made of) turns the
        reuse off, as does an inconclusive comparison or a patch outside
        `sqlglot/`. A patched module that is imported on demand is imported
@@ -381,7 +404,12 @@ the patched code**, and selects the ones that fail.
        result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
-     shared by the children.
+     shared by the children. A child that imports the patched tree afresh
+     cannot take the tables (their class may have changed), but for a patch
+     that touches no file outside `sqlglot/` the rows are what they were:
+     the files and the test code that parses them are untouched. Such a child
+     skips the parsing only and builds every table with the patched class
+     from the rows parsed at the pinned commit.
 
 6. **Weigh running against selecting** (`selector/main.py`). Running a test
    costs CPU seconds; selecting it costs its recorded seconds on a worker. A

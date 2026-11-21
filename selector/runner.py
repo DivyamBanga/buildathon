@@ -584,7 +584,17 @@ def build_executor_tables() -> None:
     global EXECUTOR_TABLES
     import duckdb
 
-    test_class = sys.modules["tests.test_executor"].TestExecutor
+    global _SETUP_USES
+    module = sys.modules["tests.test_executor"]
+    test_class = module.TestExecutor
+    _SETUP_USES = (
+        test_class.__dict__["setUpClass"].__func__.__code__,
+        module.csv,
+        module.csv.reader,
+        module.ast,
+        module.ast.literal_eval,
+        module.open_file,
+    )
     real_connect = duckdb.connect
     duckdb.connect = lambda *args, **kwargs: _NoConnection()
     try:
@@ -627,6 +637,107 @@ def _use_executor_tables() -> None:
                     setattr(cls, name, _AnsweringConnection(getattr(cls, name), answers))
 
     test_class.setUpClass = classmethod(setUpClass)
+
+
+# True in a child that imports the patched tree afresh and whose patch touches
+# nothing outside sqlglot/: the executor tests' class setup takes the rows the
+# pinned setup parsed (see _use_executor_rows).
+CLEAN_ROWS = False
+
+
+# What the pinned class setup of the executor tests uses to turn the fixture
+# files into rows: its own code, csv and its reader, ast and literal_eval, and
+# the test module's open_file (set by build_executor_tables).
+_SETUP_USES = None
+
+
+def _setup_as_pinned(module, test_class) -> bool:
+    """True when the class setup would parse the fixture files here with what it parsed them with at the pinned commit."""
+    try:
+        code, csv_module, csv_reader, ast_module, literal_eval, pinned_open = _SETUP_USES
+        opener = module.open_file
+        return (
+            test_class.__dict__["setUpClass"].__func__.__code__ == code
+            and module.csv is csv_module
+            and csv_module.reader is csv_reader
+            and module.ast is ast_module
+            and ast_module.literal_eval is literal_eval
+            and type(opener) is type(pinned_open)
+            and opener.__code__ == pinned_open.__code__
+            and opener.__defaults__ == pinned_open.__defaults__
+            and opener.__kwdefaults__ == pinned_open.__kwdefaults__
+            and opener.__closure__ is None
+            and pinned_open.__closure__ is None
+            # Every name its code leaves to its module is the same object in both, or missing in both.
+            and all(
+                opener.__globals__.get(name, _SETUP_USES) is pinned_open.__globals__.get(name, _SETUP_USES)
+                for name in pinned_open.__code__.co_names
+            )
+        )
+    except Exception:
+        return False
+
+
+class _HeaderOnlyCsv:
+    """Stands in for the csv module while a class setup runs: every file is a header and nothing else."""
+
+    @staticmethod
+    def reader(*args, **kwargs):
+        return iter([[]])
+
+
+def _use_executor_rows() -> None:
+    """After a clean import: have TestExecutor.setUpClass skip the CSV parsing, and nothing else.
+
+    The setup reads the TPC fixtures with the test module's own code and the
+    standard library, and hands the rows to sqlglot's Table. For a patch that
+    touches nothing outside sqlglot/ the files and the test code are what they
+    were at the pinned commit, and _setup_as_pinned checks that the code the
+    setup parses with (its own, the module's open_file, csv.reader,
+    ast.literal_eval) is too: then so are the rows. The tables themselves are
+    still made here, by the patched Table class, called as the setup calls it,
+    with a copy of the list of those rows: whatever the patch changed runs.
+    """
+    module = sys.modules.get("tests.test_executor")
+    test_class = getattr(module, "TestExecutor", None)
+    if test_class is None or EXECUTOR_TABLES is None or "_br_rows" in test_class.__dict__:
+        return
+    if not _setup_as_pinned(module, test_class):
+        return
+    rows_of: dict = {}
+    for tables in EXECUTOR_TABLES:
+        for table in tables.values():
+            columns = tuple(table.columns)
+            if columns in rows_of:
+                return  # two tables with the same columns cannot be told apart
+            rows_of[columns] = table.rows
+    original = test_class.__dict__["setUpClass"].__func__
+
+    def setUpClass(cls):
+        real_table = module.Table
+        unknown = []
+
+        def table(columns, rows):
+            pinned = rows_of.get(tuple(columns))
+            if pinned is None:
+                unknown.append(columns)
+                return real_table(columns=columns, rows=rows)
+            return real_table(columns=columns, rows=list(pinned))
+
+        saved = module.csv, module.Table, module.open_file
+        module.csv = _HeaderOnlyCsv
+        module.open_file = lambda name: ()
+        module.Table = table
+        try:
+            original(cls)
+        finally:
+            module.csv, module.Table, module.open_file = saved
+        if unknown:
+            # Not the tables that were parsed at the pinned commit: the setup does all of it.
+            original(cls)
+
+    test_class.setUpClass = classmethod(setUpClass)
+    test_class._br_rows = True
 
 
 # What sqlglot's own executor returns for the TPC queries at the pinned commit,
@@ -1401,6 +1512,8 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
             for index, _ in members:
                 emit(f"R {index} 1\n")
             continue
+        if CLEAN_ROWS and module_name == "tests.test_executor":
+            _use_executor_rows()
         cases = []
         for index, method in members:
             try:
@@ -1428,7 +1541,7 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
-    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK
+    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK, CLEAN_ROWS
     code = 0
     try:
         os.setpgid(0, 0)
@@ -1467,6 +1580,7 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             if changes:
                 _keep_resolved_paths_in(overlay, root)
             MEMO_AFTER_IMPORT = bool(job.get("executor_memo") and EXECUTOR_MEMO and EXECUTOR_TABLES is not None)
+            CLEAN_ROWS = bool(job.get("executor_rows") and EXECUTOR_TABLES is not None)
         else:
             lazy = list(job.get("lazy") or ())
             swaps = []

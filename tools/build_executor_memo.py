@@ -63,6 +63,8 @@ runner.build_executor_tables()
 runner.install_executor_memo()
 
 NAMES = list(runner.MEMO_TESTS)
+# The executor's function table, as one more "attribute" every query reads.
+ENV_PAIR = "sqlglot.executor.env:|ENV"
 ORDERS = (NAMES, NAMES[::-1], NAMES[:1], NAMES[1:])
 FIXTURES = {"tpch": "optimizer/tpc-h/tpc-h.sql", "tpcds": "optimizer/tpc-ds/tpc-ds.sql"}
 helpers = sys.modules["tests.helpers"]
@@ -225,6 +227,48 @@ def watch_and_record() -> None:
     runner.MEMO_RECORD = os.path.join(read_dir, "results")
     import recdict
 
+    # The executor's function table (ENV in sqlglot/executor/env.py) is copied
+    # into every namespace that generated code is evaluated in, so every query
+    # "reads" it. What a query uses of it are the entries its code names: the
+    # names of every piece of code it evaluates (all of them: a name the table
+    # does not hold falls through to the builtins, and a new entry of that
+    # name would be found instead), and the key of the one lookup by a
+    # computed name. That is a reading of the source, checked below (ENV_USES).
+    import types
+
+    import sqlglot.executor.context as context_module
+    import sqlglot.executor.python as python_module
+
+    env_names: set = set()
+    seen_code: set = set()
+
+    def code_names(code) -> set:
+        if isinstance(code, str):
+            code = compile(code, "<eval>", "eval")
+        found = set(code.co_names)
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                found |= code_names(const)
+        return found
+
+    real_eval = context_module.Context.eval
+
+    def noting_eval(self, code):
+        if recording[0] and code not in seen_code:
+            seen_code.add(code)
+            env_names.update(code_names(code))
+        return real_eval(self, code)
+
+    context_module.Context.eval = noting_eval
+    real_comparison = python_module.PythonExecutor._subquery_comparison
+
+    def noting_comparison(self, value, plan_name, scope, op, quantifier, *args):
+        if recording[0]:
+            env_names.add(op)
+        return real_comparison(self, value, plan_name, scope, op, quantifier, *args)
+
+    python_module.PythonExecutor._subquery_comparison = noting_comparison
+
     descriptors = {key: vars(cls)[attr] for key, (cls, attr) in watched.items()}
     del value, pending  # nothing here may still hold a table (see recdict.wrap)
     key_pairs: list = []
@@ -274,7 +318,10 @@ def watch_and_record() -> None:
             if names is not None:
                 keyed[pair] = sorted(names)
         with open(out, "w") as handle:
-            json.dump({"pid": os.getpid(), "keys": keys, "reads": sorted(reads | set(gone)), "keyed": keyed}, handle)
+            json.dump(
+                {"pid": os.getpid(), "keys": keys, "reads": sorted(reads | set(gone)), "keyed": keyed, "env": sorted(env_names)},
+                handle,
+            )
 
     if queries_path and hasattr(tracer, "_DIR"):
         # Once with the tables as they are: the lines each query runs here, to be
@@ -306,8 +353,26 @@ if attrs_path:
         for name in os.listdir(read_dir)
         if name.startswith("reads-")
     }
-    read = sorted(set().union(*(entry["reads"] for entry in recorded.values())))
-    json.dump({"read": read}, open(attrs_path, "w"), separators=(",", ":"))
+    read = sorted(set().union(*(entry["reads"] for entry in recorded.values())) | {ENV_PAIR})
+    # Every line of the package that mentions the function table or a copy of it:
+    # the selector uses the per-query entries only while this is the list it reviewed.
+    env_uses = []
+    for name in state.package_modules("/sqlglot"):
+        source_path = "/sqlglot/" + name.replace(".", "/") + ".py"
+        if not os.path.exists(source_path):
+            source_path = "/sqlglot/" + name.replace(".", "/") + "/__init__.py"
+        try:
+            module_tree = ast.parse(open(source_path, encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(module_tree):
+            if (isinstance(node, ast.Name) and node.id == "ENV") or (isinstance(node, ast.Attribute) and node.attr == "env"):
+                env_uses.append([source_path[len("/sqlglot/"):], node.lineno])
+            elif isinstance(node, ast.alias) and node.name == "ENV":
+                env_uses.append([source_path[len("/sqlglot/"):], node.lineno])
+    env_uses = sorted(map(list, {tuple(use) for use in env_uses}))
+    json.dump({"read": read, "env_uses": env_uses}, open(attrs_path, "w"), separators=(",", ":"))
+    print(f"lines that mention the executor's function table: {env_uses}")
     print(f"{json.load(open(os.path.join(read_dir, 'watched.json')))} class attributes watched, {len(read)} read in the phase")
     read_index = {key: index for index, key in enumerate(read)}
 
@@ -341,7 +406,7 @@ if queries_path and trace_dir and attrs_path:
             raise SystemExit(f"case {case}: keys {entry['keys']} and {watched_entry['keys']}")
         keyed = watched_entry.get("keyed", {})
         plain_file = os.path.join(read_dir, f"plain-case-{number}.json")
-        if keyed and entry["keys"]:
+        if entry["keys"]:
             # The stand-ins must not have changed what the query runs: the same
             # lines with and without them, or every table counts as read whole.
             plain_entry = json.load(open(plain_file)) if os.path.exists(plain_file) else None
@@ -349,14 +414,23 @@ if queries_path and trace_dir and attrs_path:
                 plain_entry is not None
                 and plain_entry["keys"] == watched_entry["keys"]
                 and plain_entry["reads"] == watched_entry["reads"]
+                and plain_entry.get("env") == watched_entry.get("env")
                 and phase_rows("rows-plain", plain_entry["pid"]) == phase_rows("rows-keyed", watched_entry["pid"])
             )
             if not same:
                 diverged += 1
                 keyed = {}
+            elif "env" in watched_entry:
+                # The entries of the function table the query's code names (see watch_and_record).
+                names = set()
+                for name in watched_entry["env"]:
+                    names |= state.key_names(name)
+                keyed = dict(keyed)
+                keyed[ENV_PAIR] = sorted(names)
         for key in entry["keys"]:
             lines_of.setdefault(key, set()).update(rows_of_pid.get(str(entry["pid"]), ()))
             reads_of.setdefault(key, set()).update(watched_entry["reads"])
+            reads_of[key].add(ENV_PAIR)
             if key in keyed_of:
                 # The same query twice: a table is keyed only if it was both times.
                 keyed_of[key] = {pair: sorted(set(names) | set(keyed[pair])) for pair, names in keyed_of[key].items() if pair in keyed}

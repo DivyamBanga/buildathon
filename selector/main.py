@@ -83,6 +83,36 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
+# The lines of the executor phase that look a name up by a computed text or walk
+# a namespace (maps/execnames.json "dynamic"), as reviewed at the pinned commit:
+# generator._build_dispatch walks dir(cls) and takes the names that end in
+# "_sql", which no name in capitals does; Context.eval (and its three callers)
+# evaluates generated code in a dict made from the table ENV, so the names it
+# looks up are entries of that table, not names of a module or a class.
+REVIEWED_DYNAMIC = frozenset(
+    (
+        ("sqlglot/generator.py", 79),
+        ("sqlglot/generator.py", 87),
+        ("sqlglot/executor/context.py", 46),
+        ("sqlglot/executor/context.py", 49),
+        ("sqlglot/executor/python.py", 257),
+        ("sqlglot/executor/python.py", 342),
+    )
+)
+# The executor's function table: ENV in sqlglot/executor/env.py, held under that
+# name by two more modules. Every query copies it; the entries a query uses are
+# recorded as the keys of a pseudo attribute (tools/build_executor_memo.py). That
+# rests on a reading of every line of the package that mentions the table or a
+# copy of it (two copies, eval of generated code in a copy, one lookup by a
+# computed key, writes of "scope" and of three entries of its own), so it is
+# used only while the map lists exactly these lines.
+ENV_PAIR = "sqlglot.executor.env:|ENV"
+ENV_HOLDERS = ("sqlglot.executor.env", "sqlglot.executor.context", "sqlglot.executor.python")
+REVIEWED_ENV_USES = frozenset(
+    [("sqlglot/executor/context.py", line) for line in (5, 43, 46, 73, 80, 99, 104, 109)]
+    + [("sqlglot/executor/python.py", line) for line in (9, 20, 26, 202, 223)]
+    + [("sqlglot/executor/env.py", 249)]
+)
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
 
@@ -203,6 +233,9 @@ class Coordinator:
         self.exec_phase: dict | None = None
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
         self.exec_names: dict | None = None
+        self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
+        self.env_reviewed = False
+        self.exec_every_name = False
         self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
         self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
@@ -437,8 +470,8 @@ class Coordinator:
         classes = {self.bit_class[bit] for bit in bits}
         setup = 0.0
         for name in classes:
-            if name == EXECUTOR_CLASS and self.executor_setup_untouched(job):
-                setup += self.fast_setup.get(name, 0.15)  # its tables come ready-made
+            if name == EXECUTOR_CLASS and (self.executor_setup_untouched(job) or self.rows_reusable(job)):
+                setup += self.fast_setup.get(name, 0.15)  # its tables, or their rows, come ready-made
             else:
                 setup += self.class_setup.get(name, 0.0)
         return setup + (0.45 if job.mode == "clean" else 0.05)
@@ -625,12 +658,19 @@ class Coordinator:
                 self.exec_phase = {}
             try:
                 # name -> [[path, first line, last line]]: the code of the phase that mentions it
-                self.exec_names = json.load(open(os.path.join(MAPS, "execnames.json")))["where"]
+                names = json.load(open(os.path.join(MAPS, "execnames.json")))
+                self.exec_names = names["where"]
+                # The lines of the phase that could see a name nobody wrote down.
+                self.exec_dynamic = {tuple(entry) for entry in names.get("dynamic", [["?", 0]])}
+                # Whether the map holds every name the phase's code mentions, or the names in capitals only.
+                self.exec_every_name = bool(names.get("every_name"))
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
-                read = json.load(open(os.path.join(MAPS, "execattrs.json")))["read"]
+                attrs = json.load(open(os.path.join(MAPS, "execattrs.json")))
+                read = attrs["read"]
                 self.exec_attrs = {name: index for index, name in enumerate(read)}
+                self.env_reviewed = {tuple(use) for use in attrs.get("env_uses", [["?", 0]])} == REVIEWED_ENV_USES
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_attrs = None
             # Every line of the phase has a number (its place in the file), and so
@@ -775,6 +815,18 @@ class Coordinator:
                 # What the recorded results are made of.
                 job.plan.note(f"no recorded results: {where} differs")
                 return None
+            if kind == "module" and attribute == "ENV" and module in ENV_HOLDERS and reason == "value":
+                # The executor's function table differs in some entries: a query
+                # sees that through the entries its code names.
+                number = self.exec_attrs.get(ENV_PAIR) if self.exec_attrs is not None and self.env_reviewed else None
+                entries = more[0] if more else None
+                if entries is not None and any("'__" in name and name.endswith("__'") for name in entries):
+                    # An entry such as "__builtins__" decides how every other name is
+                    # found, and no code names it: the table counts as a whole.
+                    entries = None
+                if number is not None and entries is not None:
+                    tables[number] = tables.get(number, frozenset()) | frozenset(entries)
+                    continue
             if reason in ("function-meta", "function-code") and path:
                 if self.covmap.is_loader(path, first):
                     job.plan.note(f"no recorded results: {where} imports on demand")
@@ -803,11 +855,44 @@ class Coordinator:
                         # A table that differs in these entries only: seen by looking one of them up.
                         tables[number] = frozenset(entries)
                 continue
+            if (
+                reason in ("added", "removed")
+                and self.exec_dynamic <= REVIEWED_DYNAMIC
+                and attribute.isidentifier()
+                and (attribute.isupper() or (kind == "module" and self.exec_every_name and not attribute.startswith("__")))
+            ):
+                # A name in capitals that appears or vanishes: seen by the code that
+                # names it (a new class attribute that hides one of a base class is
+                # read under the same name). Nothing in the phase looks a name in
+                # capitals up by a computed text or walks a namespace for one. The
+                # same holds for any other name of a module (a function renamed at
+                # its definition; a new one that hides a builtin is found by the
+                # statements that name the builtin), not for other attributes of
+                # classes: the generator looks its "_sql" methods up by a computed
+                # name.
+                rows |= self.lines_naming(attribute)
+                continue
             if reason != "value":
                 job.plan.note(f"no recorded results: {where} {reason}")
                 return None
             if attribute in known and attribute.isupper():
                 # Read by name: seen by the queries that run code mentioning it.
+                rows |= self.lines_naming(attribute)
+                continue
+            if (
+                kind == "module"
+                and self.exec_every_name
+                and self.exec_dynamic <= REVIEWED_DYNAMIC
+                and attribute.isidentifier()
+                and not attribute.startswith("__")
+            ):
+                # Any other name of a module with another value (a function replaced
+                # at import, an object made there): read by the statements that name
+                # it. Nothing in the phase looks a module's names up by a computed
+                # text or walks a module (the reviewed list above); the names Python
+                # itself asks a module for begin with two underscores and stay out.
+                # Attributes of classes are not taken this way: members of an enum
+                # are reached without being named.
                 rows |= self.lines_naming(attribute)
                 continue
             job.plan.note(f"no recorded results: {where} may be read by the executor")
@@ -898,6 +983,30 @@ class Coordinator:
             self.setup_map[EXECUTOR_CLASS] = None
             return False
         return True
+
+    def rows_reusable(self, job: Job) -> bool:
+        """After a clean import: are the rows the executor tests' class setup parses the pinned ones?
+
+        The setup reads the TPC fixtures with the test module's own code and
+        the standard library; only the tables it then builds are sqlglot's.
+        A patch that touches no file outside sqlglot/ leaves the fixtures and
+        the test code what they were; the child checks that what the setup
+        parses with is what it was (runner._setup_as_pinned) and still builds
+        the tables with the patched class.
+        """
+        if job.mode != "clean":
+            return False
+        for patch in job.plan.files:
+            for path in (patch.path, patch.old_path or patch.path):
+                if not path or not path.startswith("sqlglot/"):
+                    return False
+        return True
+
+    def executor_rows(self, job: Job, tests: list[int]) -> bool:
+        """Whether the child, after its clean import, may skip the CSV parsing of the executor tests' setup."""
+        if not any(self.bit_class[bit] == EXECUTOR_CLASS for bit in tests):
+            return False
+        return self.rows_reusable(job) and self.executor_record()
 
     def wants_probe(self, job: Job) -> bool:
         """Whether to compare import state before deciding what to run for the commit."""
@@ -1058,6 +1167,7 @@ class Coordinator:
             "cases": self.case_filter(job, tests),
             "imports": job.import_files if job.mode == "clean" else [],
             "executor_tables": self.executor_tables(job, tests),
+            "executor_rows": self.executor_rows(job, tests),
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
         spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None

@@ -18,6 +18,7 @@ how to compare are reported as a difference.
 
 from __future__ import annotations
 
+import builtins
 import enum
 import functools
 import importlib
@@ -238,6 +239,8 @@ def outside_state() -> dict:
         "warning filters": len(warnings.filters),
         "logging": (logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate),
         "switch interval": sys.getswitchinterval(),
+        # Every module finds the names it leaves to the builtins here.
+        "the builtins": sorted((name, id(value)) for name, value in vars(builtins).items()),
     }
 
 
@@ -917,6 +920,10 @@ class Comparer:
             if b is None:
                 self.report(("module", name, ""), "*", "removed")
                 continue
+            if vars(a).get("__builtins__") is not vars(b).get("__builtins__"):
+                # A module that binds its own builtins: every name its code leaves
+                # to them may mean something else, and no line reads "__builtins__".
+                self.report(("module", name, ""), "__builtins__", "value")
             self._namespace(("module", name, ""), dict(vars(a)), dict(vars(b)), name, "", _MODULE_NOISE)
         reported = {(row[6], row[7], row[4]) for row in self.differences}
         for function, reason in list(self.changed_functions.values()):
