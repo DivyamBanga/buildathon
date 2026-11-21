@@ -268,4 +268,203 @@ expect("map before", parsed.new_line(3), 3)
 expect("map after", parsed.new_line(7), 8)
 expect("insert point", parsed.pure_insert_after, [4])
 
+# ---- pairing by name when definitions are added, removed, moved or renamed ----
+
+
+def diff_of(old_text, new_text):
+    old_code = compile(old_text, "/x/m.py", "exec", dont_inherit=True)
+    new_code = compile(new_text, "/x/m.py", "exec", dont_inherit=True)
+    return pydiff.diff_code(old_code, new_code)
+
+
+def changed_of(diff):
+    """(qualified name, whether a partner exists) of every changed code object."""
+    return sorted((old.co_qualname, new is not None) for old, new in diff.changed)
+
+
+def pairing_of(diff):
+    """(qualified name, old first line, new first line) of every pair."""
+    return sorted((old.co_qualname, old.co_firstlineno, new.co_firstlineno) for old, new in diff.pairs)
+
+
+P_OLD = textwrap.dedent('''\
+    import os
+
+
+    def a(x):
+        return x + 1
+
+
+    def b(x):
+        return x * 2
+
+
+    class C:
+        def m(self):
+            return 1
+
+        def n(self):
+            return 2
+
+        def o(self):
+            return 3
+
+
+    def z(x):
+        return x - 1
+''')
+
+# inserted at the top, in the middle and at the end of a module: only the module body changes
+HELPER = "def helper(q):\n    return q\n\n\n"
+for label, anchor in (("top", "def a(x):"), ("middle", "def b(x):"), ("end", None)):
+    new = P_OLD + "\n\n" + HELPER.rstrip() + "\n" if anchor is None else P_OLD.replace(anchor, HELPER + anchor, 1)
+    diff = diff_of(P_OLD, new)
+    expect(f"insert def {label}", changed_of(diff), [("<module>", True)])
+    expect(f"insert def {label} shape", diff.isomorphic, False)
+    moved = {name: now - old for name, old, now in pairing_of(diff)}
+    expect(f"insert def {label} pairs every def", sorted(moved), sorted(["<module>", "a", "b", "C", "C.m", "C.n", "C.o", "z"]))
+    expect(f"insert def {label} shifts", moved["z"], 0 if anchor is None else 4)
+
+# a method inserted in a class: the class body, not the methods after it
+new = P_OLD.replace("    def n(self):", "    def extra(self):\n        return 9\n\n    def n(self):")
+diff = diff_of(P_OLD, new)
+expect("insert method", changed_of(diff), [("C", True)])
+expect("insert method pairs", {n: s for n, _, s in pairing_of(diff) if n.startswith("C.")} == {"C.m": 13, "C.n": 19, "C.o": 22}, True)
+
+# an import added changes the module body only
+expect("import added", changed_of(diff_of(P_OLD, P_OLD.replace("import os\n", "import os\nimport re\n"))), [("<module>", True)])
+
+# a function removed: it and the module body change; the others stay paired
+diff = diff_of(P_OLD, P_OLD.replace("def b(x):\n    return x * 2\n\n\n", ""))
+expect("remove def", changed_of(diff), [("<module>", True), ("b", False)])
+
+# a function renamed with its caller: removal plus addition
+CALLS = P_OLD + "\n\ndef caller(v):\n    return a(v)\n"
+new = CALLS.replace("def a(x):", "def a2(x):").replace("return a(v)", "return a2(v)")
+expect("rename", changed_of(diff_of(CALLS, new)), [("<module>", True), ("a", False), ("caller", True)])
+
+# two functions swapped: only the module body changes, and each pairs with itself
+SWAP = P_OLD.replace(
+    "def a(x):\n    return x + 1\n\n\ndef b(x):\n    return x * 2\n",
+    "def b(x):\n    return x * 2\n\n\ndef a(x):\n    return x + 1\n",
+)
+diff = diff_of(P_OLD, SWAP)
+expect("swap", changed_of(diff), [("<module>", True)])
+expect(
+    "swap pairs",
+    sorted({(o.co_qualname, n.co_qualname) for o, n in diff.pairs}),
+    sorted({(q, q) for q in ("<module>", "a", "b", "C", "C.m", "C.n", "C.o", "z")}),
+)
+expect("swap is not isomorphic", diff.isomorphic, False)
+expect("swap and edit", changed_of(diff_of(P_OLD, SWAP.replace("x * 2", "x * 3"))), [("<module>", True), ("b", True)])
+
+# a function moved into a class: a removal in the old scope
+new = P_OLD.replace("def z(x):\n    return x - 1\n", "").rstrip("\n") + "\n"
+new = new.replace("    def o(self):\n        return 3\n", "    def o(self):\n        return 3\n\n    def z(self, x):\n        return x - 1\n")
+expect("moved to another scope", changed_of(diff_of(P_OLD, new)), [("<module>", True), ("C", True), ("z", False)])
+
+# a def inserted before a nested one inside a function
+NEST = "def outer(n):\n    def inner(k):\n        return k + 1\n\n    return inner(n)\n"
+new = NEST.replace("    def inner(k):", "    def first(k):\n        return k\n\n    def inner(k):")
+expect("nested insert", changed_of(diff_of(NEST, new)), [("outer", True)])
+expect(
+    "nested insert and edit",
+    changed_of(diff_of(NEST, new.replace("return k + 1", "return k + 2"))),
+    [("outer", True), ("outer.<locals>.inner", True)],
+)
+
+# several definitions of one name: overloads, getter and setter
+STACK = textwrap.dedent('''\
+    from typing import overload
+
+
+    @overload
+    def parse(x: int) -> int: ...
+    @overload
+    def parse(x: str) -> str: ...
+    def parse(x):
+        return x
+
+
+    class P:
+        @property
+        def v(self):
+            return self._v
+
+        @v.setter
+        def v(self, value):
+            self._v = value
+
+        def w(self):
+            return 0
+''')
+expect("stack reformatted", changed_of(diff_of(STACK, STACK.replace("return x\n", "return x\n\n\n"))), [])
+expect("stack edit last", changed_of(diff_of(STACK, STACK.replace("return x\n", "return x or 1\n"))), [("parse", True)])
+expect("stack edit setter", changed_of(diff_of(STACK, STACK.replace("self._v = value", "self._v = value + 1"))), [("P.v", True)])
+# a third overload: every old definition of that name is changed, the rest is not
+new = STACK.replace("def parse(x):\n", "@overload\ndef parse(x: bytes) -> bytes: ...\ndef parse(x):\n")
+expect("stack grows", changed_of(diff_of(STACK, new)), [("<module>", True)] + [("parse", False)] * 3)
+# a setter removed
+new = STACK.replace("    @v.setter\n    def v(self, value):\n        self._v = value\n\n", "")
+expect("setter removed", changed_of(diff_of(STACK, new)), [("P", True), ("P.v", False), ("P.v", False)])
+
+# conditional definitions: the k-th pairs with the k-th while the count holds
+COND = "import sys\n\nif sys.version_info > (3,):\n    def f():\n        return 1\nelse:\n    def f():\n        return 2\n"
+expect("conditional edit second", changed_of(diff_of(COND, COND.replace("return 2", "return 3"))), [("f", True)])
+new = COND + "\nif sys:\n    def f():\n        return 4\n"
+expect("conditional third", changed_of(diff_of(COND, new)), [("<module>", True), ("f", False), ("f", False)])
+# a name defined twice, the later one winning, the earlier one edited
+TWICE = "def f():\n    return 1\n\n\ndef f():\n    return 2\n"
+expect("twice, first edited", changed_of(diff_of(TWICE, TWICE.replace("return 1", "return 0"))), [("f", True)])
+
+# class bodies: a new class between two others
+CLS = "class A:\n    X = 1\n\n\nclass B:\n    Y = 2\n"
+new = "class A:\n    X = 1\n\n\nclass Mid:\n    Z = 3\n\n\nclass B:\n    Y = 2\n"
+expect("class inserted", changed_of(diff_of(CLS, new)), [("<module>", True)])
+expect("class renamed", changed_of(diff_of(CLS, CLS.replace("class B:", "class B2:"))), [("<module>", True), ("B", False)])
+
+# decorated, async and generator functions pair by name like the rest
+DEC = "import functools\n\n\n@functools.cache\ndef d(x):\n    return x\n\n\nasync def e(x):\n    return x\n\n\ndef g(x):\n    yield x\n"
+new = DEC.replace("@functools.cache\n", "def pre():\n    pass\n\n\n@functools.cache\n")
+expect("decorated after insert", changed_of(diff_of(DEC, new)), [("<module>", True)])
+new = DEC.replace("async def e", "def pre():\n    pass\n\n\nasync def e").replace("yield x", "yield x + 1")
+expect("async and generator after insert", changed_of(diff_of(DEC, new)), [("<module>", True), ("g", True)])
+
+# lambdas in a class-level table: an entry inserted in the middle
+TAB = "class G:\n    T = {\n        1: lambda s, e: s.a(e),\n        2: lambda s, e: s.b(e),\n        3: lambda s, e: s.c(e),\n    }\n"
+diff = diff_of(TAB, TAB.replace("        2:", "        9: lambda s, e: s.z(e),\n        2:"))
+expect("lambda inserted", changed_of(diff), [("G", True)])
+expect(
+    "lambda inserted pairs with itself",
+    sorted(n.co_firstlineno - o.co_firstlineno for o, n in diff.pairs if o.co_name == "<lambda>"),
+    [0, 1, 1],
+)
+expect("lambda removed", changed_of(diff_of(TAB, TAB.replace("        2: lambda s, e: s.b(e),\n", ""))), [("G", True), ("G.<lambda>", False)])
+# one inserted and one edited: the untouched ones pair with themselves, the edited one has no safe partner
+new = TAB.replace("        2: lambda s, e: s.b(e),\n", "        9: lambda s, e: s.z(e),\n        2: lambda s, e: s.b(e) + 1,\n")
+expect("lambda inserted and edited", changed_of(diff_of(TAB, new)), [("G", True), ("G.<lambda>", False)])
+# edited in place, nothing added: by position, as before
+diff = diff_of(TAB, TAB.replace("s.b(e)", "s.b(e, 1)"))
+expect("lambda edited", changed_of(diff), [("G.<lambda>", True)])
+expect("lambda edited keeps the shape", diff.isomorphic, True)
+# two identical lambdas: interchangeable, so pairing order cannot matter
+TWIN = "class G:\n    T = {1: lambda s: 1, 2: lambda s: 1}\n"
+expect("identical lambdas", changed_of(diff_of(TWIN, TWIN.replace("{1:", "{0: lambda s: 5, 1:"))), [("G", True)])
+# a lambda holding another one
+NEST_L = "class G:\n    T = {\n        1: lambda s: (lambda t: t + 1),\n        2: lambda s: 2,\n    }\n"
+new = NEST_L.replace("        2:", "        0: lambda s: 0,\n        2:")
+expect("nested lambda, entry inserted", changed_of(diff_of(NEST_L, new)), [("G", True)])
+new = new.replace("t + 1", "t + 2")
+expect(
+    "nested lambda edited",
+    changed_of(diff_of(NEST_L, new)),
+    [("G", True), ("G.<lambda>", False), ("G.<lambda>.<locals>.<lambda>", False)],
+)
+# a lambda that is not in the table any more but whose twin elsewhere changed: count differs, all changed
+new = NEST_L.replace("        2: lambda s: 2,\n", "")
+expect("nested lambda removed", changed_of(diff_of(NEST_L, new)), [("G", True), ("G.<lambda>", False)])
+
+# a scope whose own code is unchanged but whose children do not line up is not trusted
+expect("last line", pydiff.last_line(compile("def f():\n    x = 1\n    return x\n", "m", "exec")), 3)
+
 print(f"{checks} checks passed")

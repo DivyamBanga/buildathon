@@ -169,6 +169,19 @@ def same_behaviour(old: CODE, new: CODE) -> bool:
         return False
 
 
+def last_line(code: CODE) -> int:
+    """The highest line any instruction of the code object, or of code inside it, is on."""
+    best = 0
+    stack = [code]
+    while stack:
+        current = stack.pop()
+        for _start, _end, line in current.co_lines():
+            if line is not None and line > best:
+                best = line
+        stack.extend(_children(current))
+    return best
+
+
 def is_function_like(code: CODE) -> bool:
     """def, lambda, generator expression: code that runs only when called."""
     return bool(code.co_flags & CO_NEWLOCALS)
@@ -183,6 +196,92 @@ class CodeDiff:
         # (old, new or None) where the code object's own behaviour differs.
         self.changed: list[tuple[CODE, CODE | None]] = []
         self.isomorphic = True
+
+
+_ANONYMOUS = ("<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>")
+
+
+def _children(code: CODE) -> list:
+    return [const for const in code.co_consts if isinstance(const, CODE)]
+
+
+def _deep_key(code: CODE):
+    """Everything that decides what a code object and all code inside it do, or
+    None when that cannot be worked out. Two code objects with the same key can
+    be exchanged for each other."""
+    try:
+        body = _normal_form(code)
+    except Exception:
+        return None
+    children = _children(code)
+    kids = []
+    for child in children:
+        key = _deep_key(child)
+        if key is None:
+            return None
+        kids.append(key)
+    # Which child each instruction that loads one refers to.
+    slot = {id(child): index for index, child in enumerate(children)}
+    loads = tuple(
+        slot[id(code.co_consts[instruction.arg])]
+        for instruction in dis.get_instructions(code)
+        if instruction.opcode == _LOAD_CONST and isinstance(code.co_consts[instruction.arg], CODE)
+    )
+    return (_shape(code), body, tuple(kids), loads)
+
+
+def _pair_children(old_children: list, new_children: list):
+    """Pair the code objects of two scopes whose children do not line up by position.
+
+    Returns (pairs, old children without a partner). A child pairs only within
+    its own scope, by name and kind (`def` or class body): a function that moved
+    to another scope or was renamed is a removal and an addition. A new child
+    with no partner needs no entry, the scope that creates it is reported
+    changed. Rules:
+
+    - A name defined once on each side pairs with itself, wherever it stands.
+    - A name defined several times (overloads, a property's getter and setter,
+      conditional definitions) pairs the k-th with the k-th only when it is
+      defined as often as before; otherwise every old definition is changed.
+    - Anonymous code (lambdas, generator expressions) first pairs with an
+      identical one anywhere in the scope (the same instructions, names and
+      code inside), in order; what is left pairs by position when as many are
+      left on each side, else the old ones are changed.
+    """
+    groups: dict = {}
+    for side, children in ((0, old_children), (1, new_children)):
+        for child in children:
+            groups.setdefault((child.co_name, is_function_like(child)), ([], []))[side].append(child)
+    pairs: list = []
+    lost: list = []
+    for (name, _), (olds, news) in groups.items():
+        if name in _ANONYMOUS:
+            waiting: dict = {}
+            for child in news:
+                key = _deep_key(child)
+                if key is not None:
+                    waiting.setdefault(key, []).append(child)
+            taken = set()
+            left_old = []
+            for child in olds:
+                key = _deep_key(child)
+                partners = waiting.get(key) if key is not None else None
+                if partners:
+                    partner = partners.pop(0)
+                    taken.add(id(partner))
+                    pairs.append((child, partner))
+                else:
+                    left_old.append(child)
+            left_new = [child for child in news if id(child) not in taken]
+            if len(left_old) == len(left_new):
+                pairs.extend(zip(left_old, left_new))
+            else:
+                lost.extend(left_old)
+        elif len(olds) == len(news):
+            pairs.extend(zip(olds, news))
+        else:
+            lost.extend(olds)
+    return pairs, lost
 
 
 def diff_code(old: CODE, new: CODE) -> CodeDiff:
@@ -204,9 +303,18 @@ def diff_code(old: CODE, new: CODE) -> CodeDiff:
         if same_shape:
             stack.extend(zip(old_children, new_children))
         else:
-            # Children cannot be paired, so every old child counts as changed.
+            # Definitions were added, removed, moved or renamed here. Children
+            # are paired by name (see _pair_children); an old child with no
+            # partner is changed, together with everything inside it. When the
+            # code itself is unchanged yet its children do not line up, nothing
+            # is trusted.
             result.isomorphic = False
-            pending = list(old_children)
+            if same_behaviour(old_code, new_code):
+                matched, lost = [], list(old_children)
+            else:
+                matched, lost = _pair_children(old_children, new_children)
+            stack.extend(matched)
+            pending = lost
             while pending:
                 child = pending.pop()
                 result.changed.append((child, None))
