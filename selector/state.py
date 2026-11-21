@@ -111,10 +111,75 @@ def _forget() -> None:
     importlib.invalidate_caches()
 
 
-def load_world(root: str, names: list[str], others: tuple = ()) -> tuple[dict, dict]:
+def _what(value) -> str:
+    if isinstance(value, type):
+        return f"class {value.__module__}.{value.__qualname__}"
+    if isinstance(value, types.ModuleType):
+        return f"module {value.__name__}"
+    if isinstance(value, types.FunctionType):
+        return f"function {value.__module__}.{value.__qualname__}"
+    if value is None:
+        return "None"
+    return f"a {type(value).__module__}.{type(value).__qualname__}"
+
+
+def on_demand() -> list:
+    """Ask for what sqlglot imports on demand, the way running code does, and note what comes back.
+
+    sqlglot loads most dialects when one is first named (attribute access on
+    the package, Dialect.get, Dialect[...], Dialect.get_or_raise) and some of
+    the optimizer the same way. Importing every module directly, as the rest of
+    load_world does, never goes through that machinery, so a change that
+    breaks it would leave two worlds that look alike. Here it is used on
+    modules that are not imported yet; a different answer in the patched
+    world (another class, None, an exception) shows in the returned list.
+    """
+    heard = []
+
+    def ask(label, call):
+        try:
+            heard.append((label, _what(call())))
+        except BaseException as error:  # noqa: BLE001 - what it raises is the answer
+            heard.append((label, "raises " + type(error).__name__))
+
+    dialects = sys.modules.get(PACKAGE + ".dialects.dialect")
+    registry = getattr(dialects, "Dialect", None)
+    names = [member.value for member in getattr(dialects, "Dialects", ()) if member.value]
+    for index, name in enumerate(sorted(names)):
+        if PACKAGE + ".dialects." + name in sys.modules or registry is None:
+            continue
+        # Each way of naming a dialect gets some that are not imported yet; a
+        # fourth of them is left for the attribute access below.
+        if index % 4 == 0:
+            ask(f"Dialect.get({name})", lambda: registry.get(name))
+        elif index % 4 == 1:
+            ask(f"Dialect[{name}]", lambda: registry[name])
+        elif index % 4 == 2:
+            ask(f"Dialect.get_or_raise({name})", lambda: registry.get_or_raise(name))
+    for module_name in sorted(name for name in sys.modules if name == PACKAGE or name.startswith(PACKAGE + ".")):
+        module = sys.modules.get(module_name)
+        if module is None or not callable(vars(module).get("__getattr__")):
+            continue
+        wanted = list(vars(module).get("__all__") or ())
+        for value in list(vars(module).values()):
+            # A table of names to the modules that hold them.
+            if isinstance(value, dict) and value and all(
+                isinstance(key, str) and key.isidentifier() and isinstance(target, (str, tuple))
+                for key, target in value.items()
+            ):
+                wanted.extend(value)
+        for attribute in dict.fromkeys(wanted):
+            ask(f"{module_name}.{attribute}", lambda: getattr(module, attribute))
+    return heard
+
+
+def load_world(root: str, names: list[str], first: int, others: tuple = ()) -> tuple[dict, dict, list]:
     """Import the modules `names` from the tree at `root`, from scratch.
 
-    Returns ({module name: module}, {module name: error type}). The modules stay
+    The first `first` of them are imported directly (they are what importing
+    the tests imports); then what sqlglot loads on demand is asked for
+    (on_demand); then the rest is imported directly. Returns ({module name:
+    module}, {module name: error type}, what on_demand heard). The modules stay
     alive in the returned dict after the next world replaces them in sys.modules.
     """
     _forget()
@@ -122,17 +187,22 @@ def load_world(root: str, names: list[str], others: tuple = ()) -> tuple[dict, d
     sys.path[:] = [entry for entry in sys.path if os.path.normpath(entry or ".") not in drop]
     sys.path.insert(0, root)
     failed = {}
-    for name in names:
+    heard: list = []
+    for index, name in enumerate(names):
+        if index == first:
+            heard = on_demand()
         try:
             importlib.import_module(name)
         except BaseException as error:  # noqa: BLE001 - whatever the module raises
             failed[name] = type(error).__name__
+    if first >= len(names):
+        heard = on_demand()
     modules = {
         name: module
         for name, module in sys.modules.items()
         if name == PACKAGE or name.startswith(PACKAGE + ".")
     }
-    return modules, failed
+    return modules, failed, heard
 
 
 def outside_state() -> dict:
@@ -617,13 +687,13 @@ def load_pinned(root: str) -> None:
     }
     path = list(sys.path)
     try:
-        modules, failed = load_world(root, names)
+        modules, failed, heard = load_world(root, names, len(loaded))
     finally:
         _forget()
         sys.modules.update(in_use)
         sys.path[:] = path
         importlib.invalidate_caches()
-    PINNED = (root, names, modules, failed)
+    PINNED = (root, names, modules, failed, heard, len(loaded))
 
 
 def compare_trees(old_root: str, new_root: str, loaded: list[str]) -> dict:
@@ -632,19 +702,25 @@ def compare_trees(old_root: str, new_root: str, loaded: list[str]) -> dict:
 
     clock = [time.process_time()]
     if PINNED is not None and PINNED[0] == old_root:
-        _, names, old, old_failed = PINNED
+        _, names, old, old_failed, old_heard, first = PINNED
     else:
         seen = set(loaded)
+        first = len(loaded)
         names = list(loaded) + [name for name in package_modules(old_root) if name not in seen]
-        old, old_failed = load_world(old_root, names, (new_root,))
+        old, old_failed, old_heard = load_world(old_root, names, first, (new_root,))
     before = outside_state()
     clock.append(time.process_time())
     seen = set(names)
     names = names + [name for name in package_modules(new_root) if name not in seen]
-    new, new_failed = load_world(new_root, names, (old_root,))
+    new, new_failed, new_heard = load_world(new_root, names, first, (old_root,))
     after = outside_state()
     clock.append(time.process_time())
-    result: dict = {"differences": [], "inconclusive": "", "cpu": clock, "failed": []}
+    result: dict = {"differences": [], "inconclusive": "", "cpu": clock, "failed": [], "widen": False}
+    if old_heard != new_heard:
+        # Naming a module that is imported on demand no longer gives what it gave.
+        result["inconclusive"] = "what is imported on demand changed"
+        result["widen"] = True
+        return result
     if old_failed != {name: kind for name, kind in new_failed.items() if name in seen}:
         result["inconclusive"] = "a module no longer imports"
         prefix = old_root.rstrip("/") + "/"

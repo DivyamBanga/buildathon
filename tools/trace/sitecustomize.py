@@ -126,6 +126,7 @@ if _DIR:
     def _preload():
         """Import the whole sqlglot package, so that nothing is imported lazily later on."""
         import importlib
+        import unittest  # noqa: F401 - sqlglot checks, when imported, whether tests are loaded
 
         base = os.path.join(_ROOT, "sqlglot")
         for directory, subdirs, files in os.walk(base):

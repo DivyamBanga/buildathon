@@ -386,6 +386,12 @@ class Coordinator:
         if plan.select_all:
             self.decisions[plan.commit] = list(self.numbers)
             return
+        if plan.narrowed and not (STATE_PROBE and plan.probe_ok and self.covmap.has_test_time()):
+            # Tests were left out as unable to see a changed class or module
+            # body, which holds only if the module still imports. Nothing will
+            # check that here, so they are candidates after all.
+            plan.candidates |= plan.import_wide
+            plan.narrowed = False
         bits = [
             bit
             for bit in self.covmap.bits(plan.candidates & ~plan.unverified)
@@ -753,7 +759,7 @@ class Coordinator:
             why = run.fatal or (result or {}).get("inconclusive") or "no narrower set"
             plan.note(f"import state: {why}")
             broken = (result or {}).get("failed") or []
-            if result is None or run.fatal is not None or broken:
+            if result is None or run.fatal is not None or broken or result.get("widen"):
                 # The patched package does not import as before (or that could
                 # not be found out): every test that imports a changed or a
                 # broken module is a candidate again.

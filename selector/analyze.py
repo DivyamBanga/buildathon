@@ -236,7 +236,9 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                     f"(of {found.bit_count()} that import it)"
                 )
                 plan.import_check |= found & ~narrowed
-                plan.narrowed = True
+                if path.startswith("sqlglot/"):
+                    # For a test file the import check above already covers this.
+                    plan.narrowed = True
                 found = narrowed
             else:
                 plan.note(f"{path}:{first} {old.co_name} import-time, {found.bit_count()} tests")
