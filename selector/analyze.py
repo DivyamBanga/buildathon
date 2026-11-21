@@ -19,6 +19,10 @@ from .covmap import CovMap
 # so a change to how pytest is configured cannot be reproduced by running.
 _PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py")
 _MAYBE_PYTEST_CONFIG = ("pyproject.toml", "setup.cfg")
+# Only these two trees are reproduced faithfully for a child: a test that
+# resolves the real location of its own file ends up in the pinned checkout
+# for anything else.
+_OWN_TREES = ("sqlglot/", "tests/")
 
 
 class Plan:
@@ -37,6 +41,31 @@ class Plan:
         self.units: dict[str, list] = {}
         # False when some change is not captured by `units` or a fixture edit.
         self.sliceable = True
+        # Candidates that come from code that runs at import (module and class
+        # bodies, functions already called by then) and from everything else.
+        # The first kind can be looked at more closely, see selector/state.py.
+        self.import_candidates = 0
+        self.rest_candidates = 0
+        # False when an import-time change is outside sqlglot's own modules.
+        self.probe_ok = True
+        # (path, code firstlineno, lines or None): changed functions that ran at
+        # import and are answered for by what they left behind. None for now: a
+        # function that ran at import may also be what imports a module on
+        # demand, and that is not something the state of the package shows.
+        self.warm_units: list = []
+        # Every test that imported a file whose import-time code changed, before
+        # any narrowing; `narrowed` says that some were left out as unable to
+        # see the change. That holds only while the file still imports: a class
+        # body that raises takes every importer of the module with it.
+        self.import_wide = 0
+        self.narrowed = False
+        # Tests selected without being run: what they read cannot be put in
+        # front of them faithfully (a file outside sqlglot/ and tests/ that a
+        # test finds through the real location of its own file).
+        self.unverified = 0
+        # The fewest tests a comparison of import state could leave for the
+        # import-time changes; None once that is unknown for one of them.
+        self.import_floor: int | None = 0
         # Tests that import a changed file but were ruled out as candidates. If the
         # patched file can no longer be imported they fail all the same, so the
         # runner must try importing their test files.
@@ -81,35 +110,62 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         if name in _PYTEST_CONFIG or name in ("__init__.py", "sitecustomize.py", "usercustomize.py"):
             plan.select_all = True
             plan.note(f"new {path}")
+        elif path.startswith("tests/") and (name.startswith("test_") or name.endswith("_test.py")):
+            # pytest collects it, so it is imported next to the existing tests.
+            if not pydiff.harmless_new_test_module(patch.new_text or ""):
+                plan.select_all = True
+                plan.note(f"new test file {path} does more than define tests")
         return
     if patch.new_text is None or old_path != path:
         plan.needs_clean = True
         plan.sliceable = False
-        plan.candidates |= covmap.file_any(old_path)
-        opened = covmap.opened(old_path)
-        if opened:
-            plan.candidates |= opened
+        plan.probe_ok = False
+        found = covmap.file_any(old_path) | (covmap.opened(old_path) or 0)
+        plan.candidates |= found
+        plan.rest_candidates |= found
+        if not old_path.startswith(_OWN_TREES):
+            plan.unverified |= found
         plan.note(f"removed or renamed {old_path}")
         return
     if os.path.basename(path) in _PYTEST_CONFIG:
         plan.select_all = True
         plan.note(f"pytest config {path}")
         return
+    if not path.startswith(_OWN_TREES):
+        # Python outside the two trees a child sees patched (sqlglotc/setup.py,
+        # which a test runs through the real location of its own file): the
+        # tests that execute or open it are selected as they are.
+        found = covmap.file_any(path) | (covmap.opened(path) or 0)
+        plan.candidates |= found
+        plan.rest_candidates |= found
+        plan.unverified |= found
+        plan.note(f"{path}: outside sqlglot/ and tests/, {found.bit_count()} tests selected unchecked")
+        return
     if not covmap.has_file(path):
         opened = covmap.opened(path)
         if opened:
             plan.candidates |= opened
+            plan.rest_candidates |= opened
             plan.needs_clean = True
             plan.sliceable = False
         plan.note(f"{path}: not executed by any test")
         return
     absolute = os.path.join(root, path)
     try:
-        new_code = compile(patch.new_text, absolute, "exec", dont_inherit=True)
+        if pydiff.coding_cookie(patch.new_text) != pydiff.coding_cookie(patch.old_text or ""):
+            # The file is read as other text than what is compared here.
+            raise ValueError("encoding declaration changed")
+        # Compiled from bytes, as the import system reads it (an encoding
+        # declaration in a comment counts).
+        new_code = compile(
+            patch.new_text.encode("utf-8", "surrogateescape"), absolute, "exec", dont_inherit=True
+        )
     except (SyntaxError, ValueError, RecursionError, MemoryError, OverflowError):
         plan.needs_clean = True
         plan.sliceable = False
+        plan.probe_ok = False
         plan.candidates |= covmap.file_any(path)
+        plan.rest_candidates |= plan.candidates
         plan.note(f"{path}: does not compile")
         return
     old_code = load_old_code(absolute, patch.old_text)
@@ -130,10 +186,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     units = plan.units.setdefault(path, [])
     for old, new in diff.changed:
         first = old.co_firstlineno
+        at_import = not pydiff.is_function_like(old)
         if not pydiff.is_function_like(old):
             # Module or class body: it ran at import, in every test that imported the file.
             hot = False
             found = covmap.code_any(path, first)
+            plan.import_wide |= found
             units.append((first, None))
             narrowed = None
             same_names = new is not None and old.co_names == new.co_names
@@ -152,16 +210,33 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                     patch.pure_insert_after,
                     same_names,
                 )
+            floor = covmap.best_case(
+                path,
+                "" if old.co_name == "<module>" else old.co_qualname,
+                found,
+                patch.old_lines_changed,
+                patch.pure_insert_after,
+            ) if new is not None and old.co_names == new.co_names else None
+            if floor is None or plan.import_floor is None:
+                plan.import_floor = None
+            else:
+                plan.import_floor |= floor
             if narrowed is not None:
                 plan.note(
                     f"{path}:{first} {old.co_qualname}: {narrowed.bit_count()} tests can see it "
                     f"(of {found.bit_count()} that import it)"
                 )
                 plan.import_check |= found & ~narrowed
+                plan.narrowed = True
                 found = narrowed
             else:
                 plan.note(f"{path}:{first} {old.co_name} import-time, {found.bit_count()} tests")
         else:
+            if covmap.is_loader(path, first):
+                # It imports modules on demand: when it runs depends on which
+                # tests ran before, so a test run on its own says nothing here.
+                plan.select_all = True
+                plan.note(f"{path}:{first} {old.co_name} imports modules on demand")
             lines = None
             if new is not None:
                 span = covmap.func_span(path, first)
@@ -186,6 +261,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 # built from the old version exists: only a fresh import is faithful.
                 hot = False
         plan.candidates |= found
+        if at_import:
+            plan.import_candidates |= found
+            if not path.startswith("sqlglot/"):
+                plan.probe_ok = False
+        else:
+            plan.rest_candidates |= found
     if hot:
         # Two different new versions for one old code object cannot be told apart in memory.
         seen: dict = {}
@@ -227,6 +308,9 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.note(f"{path}: no test opens it")
         return
     plan.candidates |= opened
+    plan.rest_candidates |= opened
+    if not old_path.startswith(_OWN_TREES):
+        plan.unverified |= opened
     plan.note(f"{path}: opened by {opened.bit_count()} tests")
     if patch.new_text is None or old_path != path:
         plan.needs_clean = True

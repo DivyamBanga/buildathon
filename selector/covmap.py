@@ -13,6 +13,7 @@ import re
 import zlib
 
 _FAMILY = re.compile(r"^sqlglot/(dialects|parsers|generators)/(\w+)\.py$")
+_CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 _NOT_A_DIALECT = ("dialect", "base", "__init__")
 
 
@@ -25,6 +26,9 @@ class CovMap:
         self._index: dict[str, list[int]] = self._json("cov.json")
         self._opens: dict[str, list[int]] = self._json("opens.json")
         self._funcs: dict | None = None
+        self._tindex: dict | None = None
+        self._tblob: bytes | None = None
+        self._tfiles: dict[str, dict[int, dict[int, int]]] = {}
         self._warm: dict | None = None
         self._blob: bytes | None = None
         self._files: dict[str, dict[int, dict[int, int]]] = {}
@@ -97,6 +101,45 @@ class CovMap:
                 result |= bitmap
         return result
 
+    # ---- what a test runs while the test itself runs (tcov.bin) -------------
+
+    def has_test_time(self) -> bool:
+        if self._tindex is None:
+            self._tindex = self._optional_json("tcov.json") or {}
+        return bool(self._tindex)
+
+    def _tfile(self, path: str) -> dict[int, dict[int, int]]:
+        cached = self._tfiles.get(path)
+        if cached is not None:
+            return cached
+        table: dict[int, dict[int, int]] = {}
+        entry = self._tindex.get(path) if self.has_test_time() else None
+        if entry is not None:
+            if self._tblob is None:
+                with open(os.path.join(self.directory, "tcov.bin"), "rb") as handle:
+                    self._tblob = handle.read()
+            offset, length = entry
+            firsts, lines, which, sets = marshal.loads(zlib.decompress(self._tblob[offset:offset + length]))
+            decoded = [int.from_bytes(raw, "little") for raw in sets]
+            for first, line, set_index in zip(firsts, lines, which):
+                table.setdefault(first, {})[line] = decoded[set_index]
+        self._tfiles[path] = table
+        return table
+
+    def test_time(self, path: str, first: int, lines=None) -> int:
+        """Tests that run the code object (or the given lines of it) after sqlglot is imported."""
+        table = self._tfile(path).get(first)
+        if not table:
+            return 0
+        result = 0
+        if lines is None:
+            for bitmap in table.values():
+                result |= bitmap
+        else:
+            for line in lines:
+                result |= table.get(line, 0)
+        return result
+
     def opened(self, path: str) -> int | None:
         numbers = self._opens.get(path)
         if numbers is None:
@@ -158,7 +201,7 @@ class CovMap:
         raw = table.get(key) if table else None
         return int.from_bytes(raw, "little") if raw else 0
 
-    def _changed_constants(self, path: str, qualname: str, changed, inserted) -> set | None:
+    def _changed_constants(self, path: str, qualname: str, changed, inserted, derived_ok=False) -> set | None:
         """Names of the class-level constants the changed lines assign, or None
         when the lines are not all plain `NAME = value` statements of the class."""
         if self._constants is None:
@@ -185,7 +228,9 @@ class CovMap:
         # Only constants by convention: lower-case names are fields and methods,
         # reached in other ways than by name. And a constant that another class or
         # module body reads feeds state built at import.
-        if not names or not all(name.isupper() for name in names) or names & self._read_at_import:
+        if not names or not all(name.isupper() for name in names):
+            return None
+        if names & self._read_at_import and not derived_ok:
             return None
         return names
 
@@ -214,6 +259,147 @@ class CovMap:
             reading |= self._named("readers.bin", name)
         return importers & reading
 
+    def _class_kind(self, path: str, qualname: str) -> str | None:
+        if self._classes is None:
+            self._classes = self._optional_json("classes.json") or {}
+            self._families = self._optional_json("families.json") or {}
+        if "<locals>" in qualname or self._pack("uses.bin") is None or self._pack("mentions.bin") is None:
+            return None
+        return self._classes.get(path, {}).get(qualname)
+
+    def _named_users(self, path: str, qualname: str) -> int:
+        """Tests that built an instance of the class (or of a subclass) or executed a line naming it.
+
+        A nested class is reached through the name of its outermost class.
+        """
+        return self._named("uses.bin", f"{path}:{qualname}") | self._named(
+            "mentions.bin", qualname.split(".", 1)[0]
+        )
+
+    def _reach(self, path: str, qualname: str, kind: str) -> int | None:
+        """Tests that can reach the class at all, or None when that is not known."""
+        if kind == "expr":
+            return self._named_users(path, qualname)
+        if kind == "dialect":
+            match = _FAMILY.match(path)
+            affected = self._families.get("affected", {}).get(match.group(2)) if match else None
+            if affected is not None:
+                tops = self._families.get("tops", {})
+                reach = 0
+                for family in affected:
+                    for folder in ("dialects", "parsers", "generators"):
+                        member = f"sqlglot/{folder}/{family}.py"
+                        for name in self._classes.get(member, {}):
+                            reach |= self._named("uses.bin", f"{member}:{name}")
+                    for name in tops.get(family, ()):
+                        reach |= self._named("mentions.bin", name)
+                return reach
+        return None
+
+    def is_loader(self, path: str, first: int) -> bool:
+        """True for a function that imports modules on demand (found by tools/build_extra.py)."""
+        if self._constants is None:
+            self._constants = self._optional_json("constants.json") or {}
+            self._read_at_import = set(self._constants.get("read_at_import", ()))
+        return first in self._constants.get("loaders", {}).get(path, ())
+
+    def best_case(self, path: str, qualname: str, importers: int, changed, inserted) -> int | None:
+        """The fewest tests that comparing import state could leave for a change
+        to the body of class `qualname` (or of the module, for ""), when that is
+        known before comparing: every changed line gives a constant a new value,
+        so at best the tests that read one of those constants remain. None when
+        it is not known (the comparison may then leave anything, even nothing).
+        """
+        if not self.has_test_time() or self._pack("treaders.bin") is None:
+            return None
+        if self._constants is None:
+            self._constants = self._optional_json("constants.json") or {}
+            self._read_at_import = set(self._constants.get("read_at_import", ()))
+        if qualname:
+            names = self._changed_constants(path, qualname, changed, inserted, derived_ok=True)
+            kind = self._class_kind(path, qualname)
+            reach = self._reach(path, qualname, kind) if kind in ("expr", "dialect") else None
+        else:
+            assigns = self._constants.get("modules", {}).get(path)
+            names = set()
+            for line in changed:
+                for start, end, name in assigns or ():
+                    if start <= line <= end:
+                        names.add(name)
+                        break
+                else:
+                    return None
+            if inserted or not names or not all(name.isupper() for name in names):
+                return None
+            reach = None
+        if not names:
+            return None
+        reading = 0
+        for name in names:
+            reading |= self._named("treaders.bin", name)
+        return (importers if reach is None else reach) & reading
+
+    def state_candidates(self, result: dict, own=frozenset()) -> int | None:
+        """Tests that can notice what an import-time change left behind.
+
+        `result` is what selector/state.py found: the (module or class,
+        attribute) pairs whose value differs once the patched package is
+        imported. A test notices such a difference only by reading that
+        attribute:
+
+        - a function that kept its code but has other defaults or another
+          closure: by calling it, so by executing its body;
+        - a constant (a name in capitals) of a module or class: by executing a
+          line that reads the name, in a test that imported the module, or
+          that can reach the class;
+        - anything else on a class: by reaching the class.
+
+        `own` names the changed code objects the caller answers for itself, as
+        (path, first line). None when the differences narrow nothing down.
+        """
+        if result.get("inconclusive") or not self.has_test_time() or self._pack("treaders.bin") is None:
+            return None
+        readers = self._pack("treaders.bin")
+        if self._constants is None:
+            self._constants = self._optional_json("constants.json") or {}
+            self._read_at_import = set(self._constants.get("read_at_import", ()))
+        loaders = self._constants.get("loaders", {})
+        found = 0
+        for kind, _module, qualname, attribute, reason, owner_path, path, first, *_ in result["differences"]:
+            if not owner_path or not self.has_file(owner_path):
+                return None
+            if reason in ("function-meta", "function-code") and path:
+                # A function is used by running it. What it did while sqlglot was
+                # imported is part of the differences already.
+                if reason == "function-meta" or (path, first) not in own:
+                    if first in loaders.get(path, ()):
+                        # It imports modules on demand: when it runs depends on what ran before.
+                        found |= self.code_any(path, first)
+                    else:
+                        found |= self.test_time(path, first)
+                continue
+            importers = self.code_any(owner_path, 1)
+            if not importers:
+                importers = self.file_any(owner_path)
+            if kind == "module":
+                if attribute == "*":
+                    return None
+                reach = importers
+            else:
+                class_kind = self._class_kind(owner_path, qualname)
+                reach = None
+                if class_kind in ("expr", "dialect"):
+                    reach = self._reach(owner_path, qualname, class_kind)
+                elif class_kind == "other" and attribute.startswith("__") and attribute != "*":
+                    # What Python calls on instances (__hash__, __init__, ...): needs an instance.
+                    reach = self._named_users(owner_path, qualname)
+                if reach is None:
+                    reach = importers
+            if reason == "value" and _CONSTANT_LIKE.match(attribute) and attribute in readers:
+                reach &= self._named("treaders.bin", attribute)
+            found |= reach
+        return found
+
     def class_candidates(
         self, path: str, qualname: str, importers: int, changed=(), inserted=(), same_names: bool = False
     ) -> int | None:
@@ -230,34 +416,11 @@ class CovMap:
         - when the change only gives constants (`NAME = value`) a new value, who
           executes a line that reads one of those names.
         """
-        if self._classes is None:
-            self._classes = self._optional_json("classes.json") or {}
-            self._families = self._optional_json("families.json") or {}
-        if "<locals>" in qualname or self._pack("uses.bin") is None or self._pack("mentions.bin") is None:
-            return None
-        kind = self._classes.get(path, {}).get(qualname)
+        kind = self._class_kind(path, qualname)
         if kind is None or kind == "enum":
             # Not a class of sqlglot's, or one whose members are reached without being named.
             return None
-        reach = None
-        if kind == "expr":
-            # Nested classes are reached through their outermost class's name.
-            reach = self._named("uses.bin", f"{path}:{qualname}") | self._named(
-                "mentions.bin", qualname.split(".", 1)[0]
-            )
-        elif kind == "dialect":
-            match = _FAMILY.match(path)
-            affected = self._families.get("affected", {}).get(match.group(2)) if match else None
-            if affected is not None:
-                tops = self._families.get("tops", {})
-                reach = 0
-                for family in affected:
-                    for folder in ("dialects", "parsers", "generators"):
-                        member = f"sqlglot/{folder}/{family}.py"
-                        for name in self._classes.get(member, {}):
-                            reach |= self._named("uses.bin", f"{member}:{name}")
-                    for name in tops.get(family, ()):
-                        reach |= self._named("mentions.bin", name)
+        reach = self._reach(path, qualname, kind)
         names = self._changed_constants(path, qualname, changed, inserted) if same_names else None
         if reach is None and not names:
             return None

@@ -24,7 +24,7 @@ import sys
 import time
 import types
 
-from . import runner, schedule
+from . import runner, schedule, state
 from .analyze import Plan, analyze
 from .covmap import CovMap
 
@@ -62,11 +62,21 @@ SETUP_ALLOWANCE = 40.0
 # CPU seconds a child may burn between tests (imports, class setup) before it
 # counts as stuck, and how far any of its processes may grow past this one.
 SETUP_CPU = 8.0
-MEMORY_ALLOWANCE = 1.2 * 1024**3
+# The largest test (test_max_nodes) peaks about 1.7 GiB above the process it is
+# forked from; the container has 4 GiB and children run one at a time at first.
+MEMORY_ALLOWANCE = 2.4 * 1024**3
+# A change to code that runs at import is first looked at by what it leaves
+# behind (selector/state.py), when running or selecting its candidates would
+# cost more than a few times what that look costs (in seconds of a plain test).
+STATE_PROBE = os.environ.get("BR_STATE_PROBE", "1") != "0"
+PROBE_COST = 0.8
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
 # For experiments only: pretend every CPU second a child uses costs this many,
 # to see what the selector decides on a slower machine than the one at hand.
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
+# For experiments only: run every candidate, whatever it costs, so that the
+# simulated time is what the failing tests alone come to.
+ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
@@ -135,6 +145,7 @@ class Job:
         self.setup_untouched: bool | None = None
         self.memo_ok: bool | None = None
         self.deadline = float("inf")  # wall-clock limit for checking this commit
+        self.probed = False  # the state left by its import-time changes has been compared
 
 
 class Run:
@@ -153,6 +164,8 @@ class Run:
         self.stopped = False  # the coordinator chose to end it
         self.overlay = ""
         self.current_cpu = 0.0  # CPU the child's process tree had used when the current test began
+        self.probe = False  # compares import state instead of running tests
+        self.state: dict | None = None  # what it found
         self.cpu_checked = now
 
 
@@ -316,6 +329,8 @@ class Coordinator:
         Checking a test is worth it when its CPU cost is below what selecting
         it would add to the commit, times the chance that it passes.
         """
+        if ALWAYS_CHECK:
+            return list(bits), []
         chosen = list(chosen)
         check: list[int] = []
         blind: list[int] = []
@@ -364,14 +379,18 @@ class Coordinator:
         if plan.select_all:
             self.decisions[plan.commit] = list(self.numbers)
             return
-        bits = [bit for bit in self.covmap.bits(plan.candidates) if self.bit_number[bit] >= 0]
+        bits = [
+            bit
+            for bit in self.covmap.bits(plan.candidates & ~plan.unverified)
+            if self.bit_number[bit] >= 0
+        ]
         importers = [
             bit
             for bit in self.covmap.bits(plan.import_check & ~plan.candidates)
             if self.bit_number[bit] >= 0
         ]
         if not bits and not importers:
-            self.decisions[plan.commit] = []
+            self.finish(plan, set())
             return
         mode = "clean" if plan.needs_clean else "hot"
         job = Job(plan, mode, [], set())
@@ -403,7 +422,7 @@ class Coordinator:
         check, blind = self.weigh(bits, job.estimates, [], PASS_QUIET)
         total = self.machine * (self.overhead(job, check) + sum(job.estimates[bit] for bit in check))
         saving = self.cost(bits) - self.cost(blind)
-        if not check or total >= saving:
+        if not check or (total >= saving and not ALWAYS_CHECK):
             plan.note(f"selected unchecked: checking {total:.1f}s vs saving {saving:.1f}s")
             if job.import_files:
                 # Nothing to run, but the files that only import the change must still load.
@@ -468,6 +487,7 @@ class Coordinator:
         return True
 
     def finish(self, plan: Plan, bits: set[int]) -> None:
+        bits = set(bits).union(self.covmap.bits(plan.unverified))
         numbers = sorted(self.bit_number[bit] for bit in bits if self.bit_number[bit] >= 0)
         if plan.candidates:
             numbers = sorted(set(numbers).union(self.unmapped))
@@ -617,6 +637,127 @@ class Coordinator:
                 return False
         return True
 
+    def wants_probe(self, job: Job) -> bool:
+        """Whether to compare import state before deciding what to run for the commit."""
+        plan = job.plan
+        if not STATE_PROBE or job.probed or job.mode != "clean":
+            return False
+        if not plan.import_candidates or not plan.probe_ok or not self.covmap.has_test_time():
+            return False
+        if plan.narrowed:
+            # Tests were left out as unable to see the change to a class or
+            # module body. That is only true if the module still imports, and
+            # importing it is what the comparison does first.
+            return True
+        bits = job.candidates
+        checking = self.machine * (self.overhead(job, bits) + sum(job.estimates[bit] for bit in bits))
+        now = min(checking, self.cost(job.everything))
+        # What would be left to pay if the comparison turned out as well as it can.
+        left = plan.rest_candidates | (plan.import_floor or 0)
+        fewer = [bit for bit in self.covmap.bits(left & plan.candidates) if self.bit_number[bit] >= 0]
+        checking = self.machine * (
+            self.overhead(job, fewer) + sum(job.estimates.get(bit, self.bit_cost[bit]) for bit in fewer)
+        )
+        then = min(checking, self.cost(fewer)) if fewer else 0.0
+        return now - then > 2.0 * PROBE_COST * self.machine
+
+    def spawn_probe(self, job: Job) -> None:
+        if state.PINNED is None:
+            state.load_pinned(ROOT)
+            gc.freeze()
+        self.sequence += 1
+        spec = {
+            "overlay": os.path.join(TMP, f"{job.plan.commit}-{self.sequence}"),
+            "changes": state.plan_changes(job.plan),
+        }
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(read_fd)
+                for other in self.running:
+                    os.close(other)
+            except OSError:
+                pass
+            state.probe_main(spec, write_fd, ROOT)
+            os._exit(1)
+        os.close(write_fd)
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
+        run = Run(pid, job, [], time.monotonic())
+        run.probe = True
+        run.overlay = spec["overlay"]
+        self.running[read_fd] = run
+
+    def finish_probe(self, run: Run, used: float) -> None:
+        """Replace the candidates of the import-time changes by the tests that can see what they left."""
+        job = run.job
+        plan = job.plan
+        job.probed = True
+        result = run.state
+        narrowed = None
+        if result is not None and run.fatal is None:
+            own = {(path, first) for path, entries in plan.units.items() for first, _ in entries}
+            try:
+                narrowed = self.covmap.state_candidates(result, own)
+            except Exception as error:
+                plan.note(f"import state: {error!r}")
+        if VERBOSE:
+            found = "nothing" if result is None else (
+                result.get("inconclusive") or f"{len(result['differences'])} differences"
+            )
+            log(f"{plan.commit}: import state compared using {used:.2f} CPU s: {found}")
+        if narrowed is None:
+            why = run.fatal or (result or {}).get("inconclusive") or "no narrower set"
+            plan.note(f"import state: {why}")
+            broken = (result or {}).get("failed") or []
+            if result is None or run.fatal is not None or broken:
+                # The patched package does not import as before (or that could
+                # not be found out): every test that imports a changed or a
+                # broken module is a candidate again.
+                wide = plan.candidates | plan.import_wide
+                for path in broken:
+                    wide |= self.covmap.file_any(path)
+                if wide != plan.candidates:
+                    plan.candidates = wide
+                    self.rebuild(job)
+                    return
+            self.queue.insert(0, job)
+            return
+        for path, first, lines in plan.warm_units:
+            narrowed |= self.covmap.test_time(path, first, lines)
+        before = plan.candidates.bit_count()
+        plan.candidates = plan.rest_candidates | narrowed
+        plan.import_check = 0
+        plan.note(
+            f"import state: {len(result['differences'])} differences, "
+            f"{plan.candidates.bit_count()} of {before} tests can see them"
+        )
+        job.import_files = []
+        self.rebuild(job)
+
+    def rebuild(self, job: Job) -> None:
+        """Queue the job again for the candidates its plan has now."""
+        plan = job.plan
+        bits = [
+            bit
+            for bit in self.covmap.bits(plan.candidates & ~plan.unverified)
+            if self.bit_number[bit] >= 0
+        ]
+        if not bits and not job.import_files:
+            self.finish(plan, set())
+            return
+        job.everything = set(bits)
+        job.followers = {}
+        job.estimates = {}
+        job.slices = {}
+        job.candidates = self.followers(plan, bits, job)
+        self.estimate(plan, job.candidates, job)
+        job.estimate = sum(job.estimates.values())
+        self.queue.insert(0, job)
+
     def spawn(self, job: Job) -> None:
         tests = job.pending
         job.pending = []
@@ -719,6 +860,11 @@ class Coordinator:
                     run.job.failed.add(bit)
                     if not run.job.replanned and self.replan(run):
                         return
+            elif kind == b"E":
+                try:
+                    run.state = json.loads(line[2:])
+                except ValueError:
+                    run.state = None
             elif kind == b"X":
                 run.fatal = line[2:].decode("utf-8", "replace")
             elif kind == b"D":
@@ -743,6 +889,9 @@ class Coordinator:
             # A child that was killed leaves its patched tree behind; /tmp is small.
             shutil.rmtree(run.overlay, ignore_errors=True)
         job = run.job
+        if run.probe:
+            self.finish_probe(run, used)
+            return
         left = [bit for bit in run.tests if bit not in run.done]
         if run.finished and not left and not job.failed and run.fatal is None:
             # A clean, complete run: compare what it cost with what was expected.
@@ -817,7 +966,9 @@ class Coordinator:
             limit = 1 if now - self.start < SEQUENTIAL_UNTIL else MAX_PARALLEL
             while self.queue and len(self.running) < limit:
                 job = self.queue.pop(0)
-                if job.decided or self.decide(job):
+                if not job.decided and self.wants_probe(job):
+                    self.spawn_probe(job)
+                elif job.decided or self.decide(job):
                     self.spawn(job)
             ready, _, _ = select.select(list(self.running), [], [], 0.05)
             now = time.monotonic()

@@ -30,11 +30,14 @@ POOL_WORKERS = 2
 # Process pools the tests start are replaced by work done in the test's own
 # process (see _InlinePool) unless this is switched off.
 INLINE_POOLS = os.environ.get("BR_POOL", "inline") == "inline"
-# The children collect cyclic garbage less often than Python's default (every
-# 700 new containers), which costs about 5% less CPU. Neither sqlglot nor its
-# tests depend on when a collection happens: the tests that care call
-# gc.collect() themselves.
-GC_THRESHOLD = tuple(int(part) for part in os.environ.get("BR_GC", "50000,10,10").split(",") if part)
+# The children collect cyclic garbage far less often than Python's default.
+# What costs time is not the young collections but the full ones, each walking
+# a heap that only grows while a test builds its trees (23 of them in
+# test_max_nodes by default, one with these thresholds: 14 CPU s instead of
+# 19-22). Collection stays on, so cyclic garbage does not pile up without
+# bound. Neither sqlglot nor its tests depend on when a collection happens:
+# the tests that care call gc.collect() themselves.
+GC_THRESHOLD = tuple(int(part) for part in os.environ.get("BR_GC", "500000,50,1000").split(",") if part)
 
 # (loader kind, fixture file as the test names it) -> the pinned file's case
 # numbers worth running. A fixture-driven test loops over independent cases;

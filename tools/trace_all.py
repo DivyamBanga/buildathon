@@ -33,10 +33,10 @@ def run(test):
     env["PYTHONPATH"] = "/sqlglot:" + os.path.join(HERE, "trace")
     env["SKIP_INTEGRATION"] = "0"
     started = time.time()
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", test["id"], "-q", "-p", "no:cacheprovider", "-x"],
-        cwd="/sqlglot", env=env, capture_output=True, text=True,
-    )
+    # With BR_TRACE_SPLIT=1 in the environment the tracer imports sqlglot in
+    # full first (L rows) and writes what runs after that as T rows.
+    command = [sys.executable, "-m", "pytest", test["id"], "-q", "-p", "no:cacheprovider", "-x"]
+    proc = subprocess.run(command, cwd="/sqlglot", env=env, capture_output=True, text=True)
     elapsed = time.time() - started
     lines = set()
     for name in os.listdir(work):

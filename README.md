@@ -38,6 +38,33 @@ the patched code**, and selects the ones that fail.
 
    No candidates means the commit selects nothing.
 
+   **A closer look at import-time changes** (`selector/state.py`). A module or
+   class body runs once, at import, and all it can do is leave the package in
+   another state: other module globals, class attributes, defaults or closures.
+   When the candidates above would be expensive, a child first imports the
+   whole package twice, pinned and patched, and compares the two results
+   object by object (functions by their resolved instructions, defaults and
+   closures; tables entry by entry; classes attribute by attribute). What comes
+   out is the list of (module or class, attribute) pairs that differ, including
+   whatever sqlglot itself derived from the changed value while importing.
+
+   - No difference: the change cannot be observed (a flag only the type checker
+     reads, a `not` on a value nothing uses), and it adds no candidate.
+   - A function that kept its code but got another default or closure value is
+     noticed only by calling it: the tests that run that function.
+   - A constant with a new value is noticed only by reading it: the tests that
+     can reach the module or class and execute a line reading that name.
+   - Anything else on a class: the tests that can reach the class, as above.
+
+   "Run" and "read" here mean while the test itself runs. A second line map
+   (`tcov.bin`) records each test with sqlglot imported in full beforehand, so
+   that what sqlglot executes while importing itself, whichever test runs, is
+   not mistaken for the test using it: that part is exactly what the state
+   comparison accounts for. The comparison says "different" for anything it
+   does not know how to compare, and the candidates fall back to the rule
+   above when it is inconclusive (a module no longer imports, too many
+   differences, state outside the package changed).
+
 4. **Run the candidates against the patch** (`selector/runner.py`). The
    coordinator imports sqlglot and the test modules once, then forks a child
    per commit:
@@ -109,6 +136,8 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
 | `readers.bin`, `constants.json` | `build_extra.py` | constant → tests that execute a line reading it |
+| `tcov.bin`, `tcov.json` | `trace_all.py` with `BR_TRACE_SPLIT=1`, `build_tcov.py` | (code object, line) → tests that execute it while the test itself runs, sqlglot being imported in full beforehand |
+| `treaders.bin` | `build_extra.py` | constant → tests that read it while the test itself runs |
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
@@ -134,7 +163,11 @@ observed failing on the patched code or could not be ruled out.
   development data only; nothing derived from them is in the image.
 - `tools/crosscheck_trace.py` compares the coverage tracer with `sys.settrace`
   line for line.
-- `tools/test_pydiff.py` holds the unit checks for the code comparison.
+- `tools/test_pydiff.py` holds the unit checks for the code comparison,
+  `tools/test_state.py` those for the comparison of import state;
+  `tools/state_probe.py` shows what a given patch changes at import (for the
+  unchanged tree: nothing). `tools/mutate_import.py` generates one-token
+  patches to code that runs at import, labeled like the others.
 - The runner was run on synthetic worst cases: infinite loops in tests, in
   imports and in class bodies, unbounded allocation, `os._exit`, stack
   overflow, and binary, renamed, deleted, new and non-applying files.

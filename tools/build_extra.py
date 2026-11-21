@@ -110,6 +110,22 @@ def cov_file(path):
     return {(first, line): decoded[index] for first, line, index in zip(firsts, lines, which)}
 
 
+# The same, counting only what a test runs while the test itself runs (build_tcov.py).
+tcov_index = None
+if os.path.exists(os.path.join(out_dir, "tcov.json")):
+    tcov_index = json.load(open(os.path.join(out_dir, "tcov.json")))
+    tcov_blob = open(os.path.join(out_dir, "tcov.bin"), "rb").read()
+
+
+def tcov_file(path):
+    entry = tcov_index.get(path) if tcov_index is not None else None
+    if entry is None:
+        return {}
+    firsts, lines, which, sets = marshal.loads(zlib.decompress(tcov_blob[entry[0]:entry[0] + entry[1]]))
+    decoded = [int.from_bytes(raw, "little") for raw in sets]
+    return {(first, line): decoded[index] for first, line, index in zip(firsts, lines, which)}
+
+
 mentions = {}
 family_names = {}  # family -> every identifier its files use
 
@@ -147,11 +163,33 @@ def named_assign(statement):
     return target.id if isinstance(target, ast.Name) else None
 
 
+def line_owners(text, path):
+    """line -> first lines of the function-like code objects with instructions on it.
+
+    Where a name is written and which code object reads it are two things: the
+    first iterable of a generator expression and the defaults of a lambda are
+    evaluated by the enclosing function. The compiled code says which.
+    """
+    owners = {}
+    pending = [compile(text, path, "exec", dont_inherit=True)]
+    while pending:
+        code = pending.pop()
+        if code.co_flags & 0x0002:  # CO_NEWLOCALS: a def, lambda or generator expression
+            for _start, _end, line in code.co_lines():
+                if line is not None:
+                    owners.setdefault(line, set()).add(code.co_firstlineno)
+        pending.extend(const for const in code.co_consts if hasattr(const, "co_code"))
+    return owners
+
+
 module_statements = {}  # path -> [[first, last, name]] for module-level `NAME = value`
 sources = {}
+owners_of = {}
 for path in sorted(cov_index):
     if path.endswith(".py"):
-        sources[path] = ast.parse(open(ROOT + path, encoding="utf-8").read())
+        text = open(ROOT + path, encoding="utf-8").read()
+        sources[path] = ast.parse(text)
+        owners_of[path] = line_owners(text, path)
         if path.startswith("sqlglot/"):
             index_classes(path, sources[path].body, "")
         # Module-level constants of the test helpers count too (the TPC schemas).
@@ -164,26 +202,68 @@ for path in sorted(cov_index):
         module_statements[path] = assigns
 
 readers = {}  # constant name -> tests that execute a line, inside a function, that reads it
+# constant name -> tests that read it once sqlglot is imported: a line inside a
+# function that the test itself runs, or any line of a test file (a test module
+# may keep what it read while it was imported).
+test_readers = {}
 read_at_import = set()  # constant names read by a class or module body
+# Names written like constants are tracked wherever they are assigned (a
+# metaclass sets `klass._QUOTES`, not a class body), so that every such name
+# has a reader set, possibly empty.
+CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
+IMPORTERS = {"import_module", "__import__", "entry_points"}
+loaders = {}  # path -> first lines of the functions that import modules on demand
+EVERY_TEST = (1 << len(tests)) - 1
 
 
 class Visitor(ast.NodeVisitor):
-    def __init__(self, table, family):
+    def __init__(self, table, family, test_table=None, test_file=False, path=""):
+        self.path = path
+        self.owners = owners_of.get(path, {})
         self.table = table
+        self.test_table = test_table or {}
+        self.test_file = test_file
         self.scope = None
+        self.scope_depth = 0
+        self.loader = False
+        self.body = 1  # first line of the module or class body being visited
         self.family = family
+
+    def ran(self, table, line):
+        """Tests that ran `line` as part of a function: under the code objects that
+        have instructions on it, or, when none has (the compiler put them on
+        another line), under the whole function it is written in."""
+        firsts = self.owners.get(line)
+        if firsts:
+            found = 0
+            for first in firsts:
+                found |= table.get((first, line), 0)
+            return found
+        found = 0
+        for (first, _line), bitmap in table.items():
+            if first == self.scope:
+                found |= bitmap
+        return found
 
     def note(self, name, line, reads=True):
         if self.family is not None:
             family_names.setdefault(self.family, set()).add(name)
-        found = self.table.get((self.scope, line)) if self.scope is not None else None
+        found = self.ran(self.table, line) if self.scope is not None else None
         if name in simple_names and found:
             mentions[name] = mentions.get(name, 0) | found
-        if reads and name in constant_names:
+        if name in constant_names or CONSTANT_LIKE.match(name):
+            readers.setdefault(name, 0)
+            test_readers.setdefault(name, 0)
+            if not reads:
+                return
             if self.scope is None:
                 read_at_import.add(name)
-            elif found:
-                readers[name] = readers.get(name, 0) | found
+                if self.test_file:
+                    test_readers[name] |= self.table.get((self.body, line), 0)
+            else:
+                if found:
+                    readers[name] = readers[name] | found
+                test_readers[name] |= EVERY_TEST if self.loader else self.ran(self.test_table, line)
 
     def visit_Name(self, node):
         self.note(node.id, node.lineno, isinstance(node.ctx, ast.Load))
@@ -194,11 +274,19 @@ class Visitor(ast.NodeVisitor):
         self.note(node.attr, node.lineno, reads)
         self.generic_visit(node)
 
-    def visit_Constant(self, node):
-        # getattr(x, "NAME") and "NAME" in vars(x) read it too.
-        if isinstance(node.value, str) and node.value in constant_names:
+    def visit_ImportFrom(self, node):
+        # `from module import NAME [as other]` reads NAME and keeps what it read.
+        for alias in node.names:
             for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
-                self.note(node.value, line)
+                self.note(alias.name, line)
+
+    def visit_Constant(self, node):
+        # getattr(x, "NAME"), "NAME" in vars(x) and patch("module.NAME") read it too.
+        if isinstance(node.value, str) and len(node.value) < 200:
+            for name in set(node.value.split(".")):
+                if name in constant_names or CONSTANT_LIKE.match(name):
+                    for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                        self.note(name, line)
 
     def scoped(self, node, first):
         saved, self.scope = self.scope, first
@@ -210,26 +298,61 @@ class Visitor(ast.NodeVisitor):
             self.visit(extra)
         first = min([node.lineno] + [d.lineno for d in node.decorator_list])
         saved, self.scope = self.scope, first
+        saved_loader = self.loader
+        # A function that imports modules on demand runs whenever a module is
+        # first needed, which depends on what ran before: what it reads is read
+        # by every test.
+        if any(
+            isinstance(inner, (ast.Name, ast.Attribute))
+            and (inner.id if isinstance(inner, ast.Name) else inner.attr) in IMPORTERS
+            for inner in ast.walk(node)
+        ) or (self.scope_depth == 0 and node.name == "__getattr__"):
+            self.loader = True
+            loaders.setdefault(self.path, []).append(first)
+        self.scope_depth += 1
         for statement in node.body:
             self.visit(statement)
+        self.scope_depth -= 1
         self.scope = saved
+        self.loader = saved_loader
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Lambda(self, node):
-        self.scoped(node, node.lineno)
+        # Defaults are evaluated where the lambda is written.
+        for extra in node.args.defaults + [d for d in node.args.kw_defaults if d]:
+            self.visit(extra)
+        saved, self.scope = self.scope, node.lineno
+        self.visit(node.body)
+        self.scope = saved
 
     def visit_GeneratorExp(self, node):
-        self.scoped(node, node.lineno)
+        # So is the first iterable of a generator expression.
+        self.visit(node.generators[0].iter)
+        saved, self.scope = self.scope, node.lineno
+        self.visit(node.elt)
+        for index, generator in enumerate(node.generators):
+            self.visit(generator.target)
+            if index:
+                self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        self.scope = saved
 
     def visit_ClassDef(self, node):
         saved, self.scope = self.scope, None
-        self.generic_visit(node)
+        saved_body = self.body
+        for extra in node.decorator_list + node.bases + [keyword.value for keyword in node.keywords]:
+            self.visit(extra)
+        self.body = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        for statement in node.body:
+            self.visit(statement)
         self.scope = saved
+        self.body = saved_body
 
 
 for path, tree in sources.items():
-    Visitor(cov_file(path), family_of(path)).visit(tree)
+    Visitor(cov_file(path), family_of(path), tcov_file(path), path.startswith("tests/"), path).visit(tree)
 
 # A dialect reaches another when its files name one of the other's classes.
 reach = {family: {family} for family in top_names}
@@ -258,7 +381,10 @@ def pack(table):
 open(os.path.join(out_dir, "uses.bin"), "wb").write(pack(uses))
 open(os.path.join(out_dir, "mentions.bin"), "wb").write(pack(mentions))
 open(os.path.join(out_dir, "readers.bin"), "wb").write(pack(readers))
-json.dump({"classes": class_statements, "modules": module_statements, "read_at_import": sorted(read_at_import)},
+if tcov_index is not None:
+    open(os.path.join(out_dir, "treaders.bin"), "wb").write(pack(test_readers))
+json.dump({"classes": class_statements, "modules": module_statements, "read_at_import": sorted(read_at_import),
+           "loaders": {path: sorted(set(firsts)) for path, firsts in sorted(loaders.items())}},
           open(os.path.join(out_dir, "constants.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump(classes, open(os.path.join(out_dir, "classes.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump({"affected": affected, "tops": {k: sorted(v) for k, v in top_names.items()}},

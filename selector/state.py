@@ -1,0 +1,705 @@
+"""What an import-time change leaves behind: compare the patched package with the pinned one.
+
+A change to a module or class body runs once, when the module is imported.
+Whatever it does, it does by leaving the program in a different state: other
+module globals, other class attributes, other defaults or closures on the
+functions. A test can only notice the change through that state.
+
+So this module imports the whole sqlglot package twice in one process, once
+from the pinned tree and once from the patched one, and compares the two
+results object by object. Every difference is reported as a (module or class,
+attribute) pair. No difference means the change cannot be observed. A few
+differences tell which attributes a test would have to read to notice it; the
+coordinator turns those into candidate tests (CovMap.state_candidates).
+
+The comparison errs on the side of "different": two objects it does not know
+how to compare are reported as a difference.
+"""
+
+from __future__ import annotations
+
+import enum
+import functools
+import importlib
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import types
+import typing
+import warnings
+import weakref
+
+from . import pydiff
+
+PACKAGE = "sqlglot"
+# More differences than this are not worth narrowing by.
+MAX_DIFFERENCES = 60
+
+_MODULE_NOISE = frozenset(
+    (
+        "__builtins__",
+        "__cached__",
+        "__file__",
+        "__spec__",
+        "__loader__",
+        "__path__",
+        "__doc__",
+        "__annotations__",
+        "__warningregistry__",
+    )
+)
+# Class attributes Python fills in from the source text or keeps for its own
+# bookkeeping; none of them is read by sqlglot or its tests (see pydiff).
+_CLASS_NOISE = frozenset(
+    (
+        "__module__",
+        "__qualname__",
+        "__doc__",
+        "__dict__",
+        "__weakref__",
+        "__firstlineno__",
+        "__static_attributes__",
+        "__annotations__",
+        "__classcell__",
+        "_abc_impl",
+    )
+)
+# What typing records about a TypedDict; such a class is a plain dict at run time.
+_TYPED_DICT_NOISE = frozenset(
+    ("__total__", "__required_keys__", "__optional_keys__", "__readonly_keys__", "__mutable_keys__")
+)
+_PLAIN = (int, float, complex, str, bytes, bool, type(None), type(Ellipsis), type(NotImplemented))
+_BUILTIN_CALLABLES = (
+    types.BuiltinFunctionType,
+    types.MethodDescriptorType,
+    types.WrapperDescriptorType,
+    types.MethodWrapperType,
+    types.ClassMethodDescriptorType,
+    types.GetSetDescriptorType,
+    types.MemberDescriptorType,
+)
+_LRU = type(functools.lru_cache(lambda: None))
+_MISSING = object()
+_STATELESS = frozenset(("lock", "RLock", "_local", "local", "count", "object"))
+
+
+def package_modules(root: str) -> list[str]:
+    """Every module of the package found under `root`, as dotted names."""
+    names = []
+    for directory, subdirs, files in os.walk(os.path.join(root, PACKAGE), followlinks=True):
+        subdirs[:] = sorted(name for name in subdirs if name != "__pycache__")
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            parts = os.path.relpath(os.path.join(directory, name), root)[:-3].split(os.sep)
+            if parts[-1] == "__main__":
+                continue
+            if parts[-1] == "__init__":
+                parts.pop()
+            names.append(".".join(parts))
+    return names
+
+
+def _forget() -> None:
+    for name in list(sys.modules):
+        if name.split(".", 1)[0] in (PACKAGE, "tests", "sqlglotc"):
+            del sys.modules[name]
+    sys.path_importer_cache.clear()
+    importlib.invalidate_caches()
+
+
+def load_world(root: str, names: list[str], others: tuple = ()) -> tuple[dict, dict]:
+    """Import the modules `names` from the tree at `root`, from scratch.
+
+    Returns ({module name: module}, {module name: error type}). The modules stay
+    alive in the returned dict after the next world replaces them in sys.modules.
+    """
+    _forget()
+    drop = {os.path.normpath(entry) for entry in (root,) + tuple(others)}
+    sys.path[:] = [entry for entry in sys.path if os.path.normpath(entry or ".") not in drop]
+    sys.path.insert(0, root)
+    failed = {}
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except BaseException as error:  # noqa: BLE001 - whatever the module raises
+            failed[name] = type(error).__name__
+    modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == PACKAGE or name.startswith(PACKAGE + ".")
+    }
+    return modules, failed
+
+
+def outside_state() -> dict:
+    """State an import can change that is not part of the package itself."""
+    logger = logging.getLogger(PACKAGE)
+    return {
+        "recursion limit": sys.getrecursionlimit(),
+        "environment": sorted(os.environ.items()),
+        "warning filters": len(warnings.filters),
+        "logging": (logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate),
+        "switch interval": sys.getswitchinterval(),
+    }
+
+
+class Comparer:
+    def __init__(self, old: dict, new: dict, old_root: str) -> None:
+        self.old = old
+        self.new = new
+        self.old_root = old_root.rstrip("/") + "/"
+        self.memo: dict = {}
+        self.active: dict = {}
+        self.low = 1 << 60
+        self.keep: list = []
+        self.differences: list = []
+        self.changed_functions: dict = {}
+        self.explain = False  # offline: remember where two values first differed
+        self.why = ""
+
+    # ---- reporting -------------------------------------------------------
+
+    def report(self, owner: tuple, attribute: str, reason: str, function=None) -> None:
+        kind, module, qualname = owner
+        path = ""
+        first = 0
+        origin = getattr(self.old.get(module), "__file__", None) or ""
+        owner_path = origin[len(self.old_root):] if origin.startswith(self.old_root) else ""
+        if function is not None:
+            code = function.__code__
+            if code.co_filename.startswith(self.old_root):
+                path = code.co_filename[len(self.old_root):]
+                first = code.co_firstlineno
+        self.differences.append([kind, module, qualname, attribute, reason, owner_path, path, first])
+        if self.explain:
+            self.differences[-1].append(self.why)
+            self.why = ""
+
+    # ---- twins: the same thing in the two worlds ---------------------------
+
+    @staticmethod
+    def _resolve(world: dict, module_name: str, qualname: str):
+        found = world.get(module_name)
+        if found is None:
+            return None
+        for part in qualname.split("."):
+            try:
+                found = vars(found)[part]
+            except (KeyError, TypeError):
+                return None
+        return found
+
+    def twins(self, a, b) -> bool:
+        """True for one class as the pinned and as the patched package define it."""
+        if a is b:
+            return True
+        if not isinstance(a, type) or not isinstance(b, type):
+            return False
+        if a.__module__ != b.__module__ or a.__qualname__ != b.__qualname__:
+            return False
+        home_a = self._resolve(self.old, a.__module__, a.__qualname__) is a
+        home_b = self._resolve(self.new, b.__module__, b.__qualname__) is b
+        if home_a and home_b:
+            # Each is what its module calls by that name; their bodies are compared there.
+            return True
+        if home_a or home_b:
+            return False
+        # Classes made on the fly: compared by what they are made of.
+        return (
+            self.same(type(a), type(b))
+            and self._pairs(a.__bases__, b.__bases__)
+            and self._mapping(self._class_dict(a), self._class_dict(b), ordered=False)
+        )
+
+    @staticmethod
+    def _class_dict(cls) -> dict:
+        return {key: value for key, value in vars(cls).items() if key not in _CLASS_NOISE}
+
+    def _no(self, a, b, what: str) -> bool:
+        if self.explain and not self.why:
+            self.why = f"{what}: {type(a).__module__}.{type(a).__qualname__} {str(a)[:70]!r} / {str(b)[:70]!r}"
+        return False
+
+    # ---- equality across the two worlds ------------------------------------
+
+    def same(self, a, b) -> bool:
+        if a is b:
+            return True
+        ta, tb = type(a), type(b)
+        if ta is not tb and not self.same(ta, tb):
+            return self._no(a, b, "types")
+        if ta in _PLAIN:
+            return repr(a) == repr(b) if ta is float or ta is complex else a == b
+        key = (id(a), id(b))
+        known = self.memo.get(key)
+        if known is not None:
+            return known
+        depth = self.active.get(key)
+        if depth is not None:
+            # Already being compared further up: equal unless that comparison says otherwise.
+            self.low = min(self.low, depth)
+            return True
+        depth = len(self.active)
+        self.active[key] = depth
+        outer, self.low = self.low, 1 << 60
+        try:
+            result = self._same(a, b)
+        except RecursionError:
+            raise
+        except Exception:
+            result = False
+        del self.active[key]
+        if not result:
+            self._no(a, b, "differ")
+        if not result or self.low >= depth:
+            # A verdict that rests on no comparison still under way can be reused.
+            self.memo[key] = result
+            self.keep.append((a, b))
+        self.low = min(outer, self.low)
+        return result
+
+    def _pairs(self, items_a, items_b) -> bool:
+        return len(items_a) == len(items_b) and all(self.same(x, y) for x, y in zip(items_a, items_b))
+
+    def _mapping(self, a, b, ordered: bool = True) -> bool:
+        """Two dicts hold the same things under the same keys.
+
+        The order of the entries is not compared when the keys can be matched
+        up by what they are: sqlglot builds some of its tables by looping over
+        sets of classes, so their order already differs from run to run.
+        """
+        if len(a) != len(b):
+            return False
+        if not ordered:
+            return all(key in b and self.same(value, b[key]) for key, value in a.items())
+        right: dict = {}
+        for key, value in b.items():
+            token = self._token(key)
+            if token is None:
+                right = None
+                break
+            right[token] = value
+        if right is not None and len(right) == len(b):
+            for key, value in a.items():
+                other = right.get(self._token(key), _MISSING)
+                if other is _MISSING or not self.same(value, other):
+                    return False
+            return True
+        return all(
+            self.same(ka, kb) and self.same(va, vb) for (ka, va), (kb, vb) in zip(a.items(), b.items())
+        )
+
+    def _token(self, value):
+        """A hashable stand-in that is equal for equal members of the two worlds, or None."""
+        kind = type(value)
+        if kind in _PLAIN:
+            return (kind.__name__, repr(value))
+        if isinstance(value, enum.Enum):
+            return ("enum", kind.__module__, kind.__qualname__, value.name)
+        if isinstance(value, type):
+            return ("class", value.__module__, value.__qualname__)
+        if kind is tuple or kind is frozenset:
+            parts = [self._token(item) for item in value]
+            if any(part is None for part in parts):
+                return None
+            return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
+        return None
+
+    def _members(self, a, b) -> bool:
+        if len(a) != len(b):
+            return False
+        left: dict = {}
+        for item in a:
+            token = self._token(item)
+            if token is None:
+                return False
+            left[token] = item
+        if len(left) != len(a):
+            return False
+        for item in b:
+            other = left.pop(self._token(item), _MISSING)
+            if other is _MISSING or not self.same(other, item):
+                return False
+        return True
+
+    def _same(self, a, b) -> bool:
+        if isinstance(a, type):
+            return self.twins(a, b)
+        if isinstance(a, enum.Enum):
+            return a.name == b.name and self.same(a.value, b.value)
+        if isinstance(a, (tuple, list)):
+            if not self._attributes(a, b, optional=True):
+                return False
+            if self._pairs(a, b):
+                return True
+            # A sequence of classes made from a set (for isinstance and the like)
+            # comes out in a different order every run: compare what is in it.
+            return (
+                len(a) == len(b)
+                and all(isinstance(item, type) for item in a)
+                and all(isinstance(item, type) for item in b)
+                and sorted(map(self._token, a)) == sorted(map(self._token, b))
+            )
+        if isinstance(a, dict):
+            return self._mapping(a, b) and self._attributes(a, b, optional=True)
+        if isinstance(a, types.MappingProxyType):
+            return self._mapping(dict(a), dict(b))
+        if isinstance(a, (set, frozenset)):
+            return self._members(a, b)
+        if isinstance(a, types.FunctionType):
+            reason = self.function_difference(a, b)
+            if reason in ("code", "defaults", "closure"):
+                # Held somewhere (a table entry, a partial, a closure): whoever
+                # uses it runs it, so it is reported as a changed function and
+                # not as a changed value of whatever holds it.
+                self.changed_functions[id(a)] = (a, "function-code" if reason == "code" else "function-meta")
+                return True
+            return reason is None
+        if isinstance(a, types.MethodType):
+            return self.same(a.__func__, b.__func__) and self.same(a.__self__, b.__self__)
+        if isinstance(a, _BUILTIN_CALLABLES):
+            return (
+                getattr(a, "__name__", None) == getattr(b, "__name__", None)
+                and self.same(getattr(a, "__self__", None), getattr(b, "__self__", None))
+                and self.same(getattr(a, "__objclass__", None), getattr(b, "__objclass__", None))
+            )
+        if isinstance(a, (staticmethod, classmethod)):
+            return self.same(a.__func__, b.__func__)
+        if isinstance(a, property):
+            return self.same(a.fget, b.fget) and self.same(a.fset, b.fset) and self.same(a.fdel, b.fdel)
+        if isinstance(a, functools.partial):
+            return self.same(a.func, b.func) and self.same(a.args, b.args) and self.same(a.keywords, b.keywords)
+        if isinstance(a, functools.cached_property):
+            return self.same(a.func, b.func) and a.attrname == b.attrname
+        if isinstance(a, _LRU):
+            # What the cache holds cannot be seen, so a filled cache is "different".
+            return (
+                self.same(a.__wrapped__, b.__wrapped__)
+                and a.cache_parameters() == b.cache_parameters()
+                and a.cache_info().currsize == 0
+                and b.cache_info().currsize == 0
+            )
+        if isinstance(a, types.ModuleType):
+            return a.__name__ == b.__name__
+        if isinstance(a, types.CodeType):
+            return self.codes_same(a, b)
+        if isinstance(a, types.CellType):
+            return self._cells((a,), (b,))
+        if isinstance(a, re.Pattern):
+            return a.pattern == b.pattern and a.flags == b.flags
+        if isinstance(a, logging.Logger):
+            return a.name == b.name
+        if isinstance(a, weakref.ref):
+            return self.same(a(), b())
+        if isinstance(a, (range, slice, bytearray)):
+            return a == b
+        if isinstance(a, (type({}.keys()), type({}.values()), type({}.items()))):
+            return self._pairs(list(a), list(b))
+        if type(a).__name__ == "_tuplegetter":
+            # The descriptor behind a namedtuple field.
+            return a.__reduce__()[1] == b.__reduce__()[1]
+        if type(a).__module__ == "operator":
+            return repr(a) == repr(b)
+        if type(a).__module__ in ("datetime", "decimal", "fractions", "uuid", "pathlib", "ipaddress"):
+            # Values: equal when they compare equal and print alike.
+            return a == b and repr(a) == repr(b)
+        if type(a).__module__ in ("typing", "types", "collections.abc", "_collections_abc"):
+            # Type variables, generic aliases and the like: their text names what they are.
+            return repr(a) == repr(b)
+        if isinstance(a, typing.TypeVar):
+            return repr(a) == repr(b)
+        return self._attributes(a, b, optional=False)
+
+    def _state(self, value):
+        state = {}
+        found = False
+        try:
+            state.update(vars(value))
+            found = True
+        except TypeError:
+            pass
+        for cls in type(value).__mro__:
+            slots = cls.__dict__.get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot in ("__dict__", "__weakref__"):
+                    continue
+                found = True
+                state[slot] = getattr(value, slot, _MISSING)
+        return state if found else None
+
+    def _attributes(self, a, b, optional: bool) -> bool:
+        """Compare what two instances hold. `optional`: a plain container has nothing more."""
+        if optional and type(a) in (tuple, list, dict):
+            return True
+        state_a, state_b = self._state(a), self._state(b)
+        if state_a is None or state_b is None:
+            if optional and state_a is None and state_b is None:
+                return True
+            if state_a is None and state_b is None and type(a).__name__ in _STATELESS:
+                return True
+            return False
+        if type(a).__name__ == "Field" and type(a).__module__ == "dataclasses":
+            # The annotation a field was declared with is kept for introspection only.
+            state_a = {key: value for key, value in state_a.items() if key != "type"}
+            state_b = {key: value for key, value in state_b.items() if key != "type"}
+        return self._mapping(state_a, state_b, ordered=False)
+
+    def _cells(self, cells_a, cells_b) -> bool:
+        if len(cells_a or ()) != len(cells_b or ()):
+            return False
+        for cell_a, cell_b in zip(cells_a or (), cells_b or ()):
+            try:
+                value_a = cell_a.cell_contents
+            except ValueError:
+                value_a = _MISSING
+            try:
+                value_b = cell_b.cell_contents
+            except ValueError:
+                value_b = _MISSING
+            if (value_a is _MISSING) != (value_b is _MISSING):
+                return False
+            if value_a is not _MISSING and not self.same(value_a, value_b):
+                return False
+        return True
+
+    def codes_same(self, a, b) -> bool:
+        if a == b:
+            return True
+        if not pydiff.same_behaviour(a, b):
+            return False
+        inner_a = [const for const in a.co_consts if isinstance(const, types.CodeType)]
+        inner_b = [const for const in b.co_consts if isinstance(const, types.CodeType)]
+        return len(inner_a) == len(inner_b) and all(self.codes_same(x, y) for x, y in zip(inner_a, inner_b))
+
+    def function_difference(self, a, b) -> str | None:
+        """None when the two functions behave alike, else what sets them apart."""
+        if a.__name__ != b.__name__ or a.__qualname__ != b.__qualname__ or a.__module__ != b.__module__:
+            return "name"
+        if not self.codes_same(a.__code__, b.__code__):
+            return "code"
+        if not self.same(a.__defaults__, b.__defaults__) or not self.same(a.__kwdefaults__, b.__kwdefaults__):
+            return "defaults"
+        if not self._cells(a.__closure__, b.__closure__):
+            return "closure"
+        if not self._mapping(a.__dict__, b.__dict__, ordered=False):
+            return "attributes"
+        return None
+
+    # ---- walking the namespaces --------------------------------------------
+
+    @staticmethod
+    def _function_of(value):
+        if isinstance(value, (staticmethod, classmethod)):
+            value = value.__func__
+        return value if isinstance(value, types.FunctionType) else None
+
+    def _difference(self, a, b):
+        """(reason, function) when the two values differ, else None."""
+        if isinstance(a, property) and isinstance(b, property):
+            if self.same(a.fset, b.fset) and self.same(a.fdel, b.fdel):
+                a, b = a.fget, b.fget
+        elif isinstance(a, functools.cached_property) and isinstance(b, functools.cached_property):
+            if a.attrname == b.attrname:
+                a, b = a.func, b.func
+        function_a, function_b = self._function_of(a), self._function_of(b)
+        if function_a is not None and function_b is not None and type(a) is type(b):
+            reason = self.function_difference(function_a, function_b)
+            if reason is None:
+                return None
+            if reason == "code":
+                return ("function-code", function_a)
+            if reason in ("defaults", "closure"):
+                # Only a call reads these.
+                return ("function-meta", function_a)
+            # Another name, or other attributes set on it: those can be read without calling it.
+            return ("value", None)
+        return None if self.same(a, b) else ("value", None)
+
+    def _namespace(self, owner: tuple, a: dict, b: dict, module_name: str, prefix: str, noise) -> None:
+        for key in list(a) + [key for key in b if key not in a]:
+            if key in noise:
+                continue
+            if key not in a or key not in b:
+                self.report(owner, key, "added" if key in b else "removed")
+                continue
+            value_a, value_b = a[key], b[key]
+            if value_a is value_b:
+                continue
+            if (
+                isinstance(value_a, type)
+                and isinstance(value_b, type)
+                and value_a.__module__ == module_name == value_b.__module__
+                and value_a.__qualname__ == prefix + key == value_b.__qualname__
+            ):
+                self._class(value_a, value_b, module_name)
+                continue
+            found = self._difference(value_a, value_b)
+            if found is not None:
+                self.report(owner, key, found[0], found[1])
+
+    def _class(self, a: type, b: type, module_name: str) -> None:
+        owner = ("class", module_name, a.__qualname__)
+        if type(a) is not type(b) and not self.twins(type(a), type(b)):
+            self.report(owner, "*", "metaclass")
+        if not self._pairs(a.__bases__, b.__bases__):
+            self.report(owner, "*", "bases")
+        noise = _CLASS_NOISE
+        if typing.is_typeddict(a) and typing.is_typeddict(b):
+            noise = noise | _TYPED_DICT_NOISE
+        self._namespace(owner, dict(vars(a)), dict(vars(b)), module_name, a.__qualname__ + ".", noise)
+
+    def run(self) -> list:
+        for name in list(self.old) + [name for name in self.new if name not in self.old]:
+            a, b = self.old.get(name), self.new.get(name)
+            if a is None:
+                # A module only the patch has: nothing at the pinned commit imports it.
+                continue
+            if b is None:
+                self.report(("module", name, ""), "*", "removed")
+                continue
+            self._namespace(("module", name, ""), dict(vars(a)), dict(vars(b)), name, "", _MODULE_NOISE)
+        reported = {(row[6], row[7], row[4]) for row in self.differences}
+        for function, reason in list(self.changed_functions.values()):
+            code = function.__code__
+            if not code.co_filename.startswith(self.old_root):
+                # Code made at run time: nothing says who runs it.
+                self.report(("module", function.__module__, ""), function.__qualname__, "value")
+                continue
+            key = (code.co_filename[len(self.old_root):], code.co_firstlineno, reason)
+            if key not in reported:
+                reported.add(key)
+                self.report(("module", function.__module__, ""), function.__qualname__, reason, function)
+        return self.differences
+
+
+def plan_changes(plan) -> dict:
+    """path -> new text (None: removed) for every file the plan's patch changes."""
+    changes: dict = {}
+    for patch in plan.files:
+        if patch.unapplied or patch.old_text == patch.new_text and patch.old_path in (None, patch.path):
+            continue
+        if patch.old_path and patch.old_path != patch.path:
+            changes[patch.old_path] = None
+        if patch.new_text is None:
+            changes[patch.old_path or patch.path] = None
+        else:
+            changes[patch.path] = patch.new_text
+    return changes
+
+
+# The pinned package imported in full, kept by the coordinator for its children:
+# (root, module names in import order, {name: module}, {name: error type}).
+PINNED = None
+
+
+def load_pinned(root: str) -> None:
+    """Import the pinned package in full, a second time, next to the modules in use.
+
+    The modules the process already uses are put back afterwards; the fresh
+    copies are only ever compared against.
+    """
+    global PINNED
+    if PINNED is not None and PINNED[0] == root:
+        return
+    loaded = [name for name in sys.modules if name == PACKAGE or name.startswith(PACKAGE + ".")]
+    seen = set(loaded)
+    names = loaded + [name for name in package_modules(root) if name not in seen]
+    in_use = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.split(".", 1)[0] in (PACKAGE, "tests", "sqlglotc")
+    }
+    path = list(sys.path)
+    try:
+        modules, failed = load_world(root, names)
+    finally:
+        _forget()
+        sys.modules.update(in_use)
+        sys.path[:] = path
+        importlib.invalidate_caches()
+    PINNED = (root, names, modules, failed)
+
+
+def compare_trees(old_root: str, new_root: str, loaded: list[str]) -> dict:
+    """Import both trees and compare them. `loaded`: the modules to import first, in order."""
+    import time
+
+    clock = [time.process_time()]
+    if PINNED is not None and PINNED[0] == old_root:
+        _, names, old, old_failed = PINNED
+    else:
+        seen = set(loaded)
+        names = list(loaded) + [name for name in package_modules(old_root) if name not in seen]
+        old, old_failed = load_world(old_root, names, (new_root,))
+    before = outside_state()
+    clock.append(time.process_time())
+    seen = set(names)
+    names = names + [name for name in package_modules(new_root) if name not in seen]
+    new, new_failed = load_world(new_root, names, (old_root,))
+    after = outside_state()
+    clock.append(time.process_time())
+    result: dict = {"differences": [], "inconclusive": "", "cpu": clock, "failed": []}
+    if old_failed != {name: kind for name, kind in new_failed.items() if name in seen}:
+        result["inconclusive"] = "a module no longer imports"
+        prefix = old_root.rstrip("/") + "/"
+        for name in new_failed:
+            origin = getattr(old.get(name), "__file__", None) or ""
+            if name not in old_failed and origin.startswith(prefix):
+                result["failed"].append(origin[len(prefix):])
+        return result
+    for key in before:
+        if before[key] != after[key]:
+            result["inconclusive"] = f"the import changed {key}"
+            return result
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    comparer = Comparer(old, new, old_root)
+    comparer.explain = bool(os.environ.get("BR_STATE_EXPLAIN"))
+    try:
+        result["differences"] = comparer.run()
+    except RecursionError:
+        result["inconclusive"] = "state too deep to compare"
+    if len(result["differences"]) > MAX_DIFFERENCES:
+        result["inconclusive"] = f"{len(result['differences'])} differences"
+        result["differences"] = []
+    clock.append(time.process_time())
+    result["cpu"] = [round(later - earlier, 2) for earlier, later in zip(clock, clock[1:])]
+    return result
+
+
+def probe_main(job: dict, write_fd: int, root: str) -> None:
+    """Runs in a forked child and never returns: one `E <json>` line, then `D`."""
+    try:
+        os.setpgid(0, 0)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        try:
+            with open("/proc/self/oom_score_adj", "w") as handle:
+                handle.write("1000")
+        except OSError:
+            pass
+        from . import runner
+
+        overlay = job["overlay"]
+        runner.build_overlay(root, overlay, job["changes"])
+        sys.dont_write_bytecode = True
+        loaded = [name for name in sys.modules if name == PACKAGE or name.startswith(PACKAGE + ".")]
+        result = compare_trees(root, overlay, loaded)
+        os.write(write_fd, ("E " + json.dumps(result, separators=(",", ":")) + "\nD\n").encode())
+    except BaseException as error:  # noqa: BLE001 - the coordinator decides what to do
+        try:
+            os.write(write_fd, f"X {type(error).__name__}: {error}\n".encode()[:500])
+        except OSError:
+            pass
+    finally:
+        try:
+            shutil.rmtree(job.get("overlay", ""), ignore_errors=True)
+        except BaseException:
+            pass
+        os._exit(0)

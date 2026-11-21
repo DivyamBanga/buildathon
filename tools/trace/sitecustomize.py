@@ -123,6 +123,33 @@ if _DIR:
             for entry in rows:
                 handle.write(entry + "\n")
 
+    def _preload():
+        """Import the whole sqlglot package, so that nothing is imported lazily later on."""
+        import importlib
+
+        base = os.path.join(_ROOT, "sqlglot")
+        for directory, subdirs, files in os.walk(base):
+            subdirs[:] = sorted(name for name in subdirs if name != "__pycache__")
+            for name in sorted(files):
+                if name.endswith(".py") and name != "__main__.py":
+                    parts = os.path.relpath(os.path.join(directory, name), _ROOT)[:-3].split(os.sep)
+                    if parts[-1] == "__init__":
+                        parts.pop()
+                    try:
+                        importlib.import_module(".".join(parts))
+                    except BaseException:
+                        pass
+
+    def _enter_test_phase():
+        """Import sqlglot in full (`L` rows), then write every later row as `T`.
+
+        `T` rows are then what a test makes run beyond sqlglot importing itself:
+        the import of its own test module, its setup and the test. Processes the
+        test starts inherit BR_TRACE_SPLIT and do the same.
+        """
+        _preload()
+        _phase("T")
+
     _events = _mon.events.LINE | _mon.events.PY_START
     _mon.use_tool_id(_TOOL, "blast-radius-trace")
     _mon.register_callback(_TOOL, _mon.events.LINE, _on_line)
@@ -145,3 +172,5 @@ if _DIR:
         _util.register_after_fork(_dump, _arm)
     except Exception:
         pass
+    if os.environ.get("BR_TRACE_SPLIT"):
+        _enter_test_phase()

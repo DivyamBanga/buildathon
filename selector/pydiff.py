@@ -14,6 +14,7 @@ needed for a test to notice the change.
 from __future__ import annotations
 
 import ast
+import re
 import dis
 import types
 
@@ -375,6 +376,8 @@ def changed_lines_in_function(
     return {line + shift for line in lines}
 
 
+_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
 # Module-level names pytest or unittest treat as fixtures for every test of the file.
 _MODULE_HOOKS = ("setup", "teardown", "pytest_", "pytestmark")
 
@@ -445,6 +448,58 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
             if not _plain_function(statement) or name.lower().startswith(_MODULE_HOOKS):
                 return False
     return position == len(old_body)
+
+
+_KNOWN_PACKAGES = ("sqlglot", "tests", "pytest", "unittest", "duckdb", "pandas", "numpy")
+
+
+def harmless_new_test_module(text: str) -> bool:
+    """True when a brand-new test file can only add tests of its own.
+
+    pytest imports every test file it finds, so a new one runs at collection.
+    This accepts a file made of imports of the standard library, of sqlglot,
+    of the existing tests or of the installed test tools, plus plain classes
+    and functions. Importing those modules does nothing a test file of the
+    pinned commit does not already do, and defining classes and functions does
+    nothing at all. Anything else at module level could change what the
+    existing tests see.
+    """
+    import sys
+
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    body = []
+    for statement in tree.body:
+        if _is_docstring(statement) or isinstance(statement, ast.Pass):
+            continue
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            if isinstance(statement, ast.ImportFrom):
+                if statement.level or not statement.module:
+                    return False
+                modules = [statement.module]
+            else:
+                modules = [alias.name for alias in statement.names]
+            for module in modules:
+                top = module.split(".", 1)[0]
+                if top not in _KNOWN_PACKAGES and top not in sys.stdlib_module_names:
+                    return False
+            continue
+        body.append(statement)
+    return _only_new_definitions([], body, set(), "")
+
+
+def coding_cookie(text: str) -> str:
+    """The encoding a source file declares in its first two lines, "" for none."""
+    for line in text.split("\n", 2)[:2]:
+        match = _COOKIE.match(line)
+        if match:
+            name = match.group(1).lower().replace("_", "-")
+            return "" if name in ("utf-8", "utf8") else name
+        if line.strip() and not line.lstrip().startswith("#"):
+            break
+    return ""
 
 
 def only_new_definitions(old_text: str, new_text: str, known: set) -> bool:
