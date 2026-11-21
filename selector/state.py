@@ -451,7 +451,7 @@ class Comparer:
             return self._members(a, b)
         if isinstance(a, types.FunctionType):
             reason = self.function_difference(a, b)
-            if reason in ("code", "defaults", "closure"):
+            if reason in ("code", "defaults", "closure", "code+defaults", "code+closure"):
                 # Held somewhere (a table entry, a partial, a closure): whoever
                 # uses it runs it, so it is reported as a changed function and
                 # not as a changed value of whatever holds it.
@@ -577,18 +577,24 @@ class Comparer:
         return len(inner_a) == len(inner_b) and all(self.codes_same(x, y) for x, y in zip(inner_a, inner_b))
 
     def function_difference(self, a, b) -> str | None:
-        """None when the two functions behave alike, else what sets them apart."""
+        """None when the two functions behave alike, else what sets them apart.
+
+        "code" means the code and nothing else: a function whose code differs
+        and whose defaults, closure or attributes differ as well is
+        "code+defaults", "code+closure" or "code+attributes". The lines of a
+        changed body say who runs the change; another default or captured
+        value is seen by every call, whatever lines it runs.
+        """
         if a.__name__ != b.__name__ or a.__qualname__ != b.__qualname__ or a.__module__ != b.__module__:
             return "name"
-        if not self.codes_same(a.__code__, b.__code__):
-            return "code"
+        prefix = "" if self.codes_same(a.__code__, b.__code__) else "code+"
         if not self.same(a.__defaults__, b.__defaults__) or not self.same(a.__kwdefaults__, b.__kwdefaults__):
-            return "defaults"
+            return prefix + "defaults"
         if not self._cells(a.__closure__, b.__closure__):
-            return "closure"
+            return prefix + "closure"
         if not self._mapping(a.__dict__, b.__dict__, ordered=False):
-            return "attributes"
-        return None
+            return prefix + "attributes"
+        return "code" if prefix else None
 
     # ---- walking the namespaces --------------------------------------------
 
@@ -613,8 +619,8 @@ class Comparer:
                 return None
             if reason == "code":
                 return ("function-code", function_a)
-            if reason in ("defaults", "closure"):
-                # Only a call reads these.
+            if reason in ("defaults", "closure", "code+defaults", "code+closure"):
+                # Only a call reads these, and any call does.
                 return ("function-meta", function_a)
             # Another name, or other attributes set on it: those can be read without calling it.
             return ("value", None)

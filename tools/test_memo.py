@@ -63,12 +63,48 @@ typed = plain.copy()
 typed.expressions[0].type = exp.DataType.build("int")
 check(digest(typed) != digest(plain), "a type annotation counts")
 both = runner.tree_digests
-check(both(typed)[0] == both(plain)[0], "but not in the digest that leaves annotations out")
-check(both(typed)[1] == digest(typed) and both(plain)[0] != both(plain)[1], "the two digests are different things")
+check(runner.SLOTS == ("_type", "comments", "_meta"), "the three slots, in the order of the digests")
+check(both(typed)[0] == both(plain)[0], "but not in the key")
+check(both(typed)[1][0] != both(plain)[1][0] and both(typed)[1][1:] == both(plain)[1][1:], "an annotation changes its own digest only")
 retyped = plain.copy()
 retyped.expressions[0].type = exp.DataType.build("text")
-check(both(retyped)[0] == both(typed)[0] and both(retyped)[1] != both(typed)[1], "another annotation changes only the second")
-check(both(commented := plain.copy())[0] == both(plain)[0], "a copy keeps both")
+check(both(retyped)[0] == both(typed)[0] and both(retyped)[1][0] != both(typed)[1][0], "another annotation changes only the annotation digest")
+moved = plain.copy()
+moved.args["from_"].type = exp.DataType.build("int")
+check(both(moved)[1][0] != both(typed)[1][0], "the same annotation on another node is another digest")
+check(both(plain.copy()) == both(plain), "a copy keeps them all")
+noted = plain.copy()
+noted.expressions[0].comments = ["a note"]
+check(both(noted)[0] == both(plain)[0] and both(noted)[1][1] != both(plain)[1][1], "comments: out of the key, in their digest")
+check(both(noted)[1][0] == both(plain)[1][0] and both(noted)[1][2] == both(plain)[1][2], "and in no other")
+placed = plain.copy()
+placed.expressions[0].meta["line"] = 3
+check(both(placed)[0] == both(plain)[0] and both(placed)[1][2] != both(plain)[1][2], "meta: out of the key, in its digest")
+elsewhere = plain.copy()
+elsewhere.expressions[0].meta["line"] = 4
+check(both(elsewhere)[1][2] != both(placed)[1][2], "another position is another meta digest")
+odd = plain.copy()
+odd.expressions[0].comments = [object]
+check(both(odd)[0] != both(plain)[0], "comments that are not a list of strings stay in the key")
+odd = plain.copy()
+odd.expressions[0].comments = ("a note",)
+check(both(odd)[0] != both(plain)[0], "comments in a tuple stay in the key")
+odd = plain.copy()
+odd.expressions[0].meta["node"] = exp.column("x")
+check(both(odd)[0] != both(plain)[0], "a meta dictionary that holds more than plain values stays in the key")
+odd = plain.copy()
+odd.expressions[0]._type = odd.expressions[0]
+check(both(odd)[0] != both(plain)[0], "a node annotated with itself is told apart by the key")
+odd = plain.copy()
+odd.expressions[0]._type = object
+check(both(odd)[0] != both(plain)[0], "an annotation that is not an expression stays in the key")
+looped = plain.copy()
+looped.expressions[0].meta["self"] = [looped.expressions[0]]
+try:
+    both(looped)
+    check(False, "a slot that leads back to its node must be refused")
+except ValueError:
+    checks += 1
 commented = plain.copy()
 commented.expressions[0].comments = ["x"]
 check(digest(commented) != digest(plain), "a comment counts")
@@ -150,19 +186,21 @@ pinned["u"].rows[0] = kept[0]
 nested = Tables({"db": {"t": pinned["t"]}})
 check(runner.memo_key("tpcds", "d", (), {"tables": nested}) is None, "nested tables are not recognised")
 # Query by query: a recorded result is used only when the query's own record touches nothing the patch changes.
-runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01, ""), "t": (0b0110, 0b01, "typed")}
+runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01, ("", "", "")), "t": (0b0110, 0b01, ("typed", "", "")), "c": (1, 1, ("", "noted", ""))}
 runner.MEMO_BLOCK = None
-check(runner._query_untouched("k", "anything"), "nothing changed in the phase: a query that never asks for a type keeps its result")
-check(runner._query_untouched("t", "typed"), "a query that asks for types keeps its result with the recorded annotations")
-check(not runner._query_untouched("t", "other"), "and is executed with other annotations")
-check(not runner._query_untouched("unknown", "typed"), "a query with no record of its own is executed")
+check(runner._query_untouched("k", ("x", "y", "z")), "nothing changed in the phase: a query that reads no slot keeps its result")
+check(runner._query_untouched("t", ("typed", "y", "z")), "a query that asks for types keeps its result with the recorded annotations")
+check(not runner._query_untouched("t", ("other", "y", "z")), "and is executed with other annotations")
+check(runner._query_untouched("c", ("x", "noted", "z")) and not runner._query_untouched("c", ("x", "y", "z")), "the same for comments")
+check(not runner._query_untouched("unknown", ("typed", "", "")), "a query with no record of its own is executed")
 for block, expected in (((0b1000, 0), True), ((0b0100, 0), False), ((0, 0b01), False), ((0b1001, 0b10), True), ((0b0010, 0b10), False)):
     runner.MEMO_BLOCK = block
-    check(runner._query_untouched("k", "x") is expected, f"lines and attributes {block}: kept is {expected}")
+    check(runner._query_untouched("k", ("x", "y", "z")) is expected, f"lines and attributes {block}: kept is {expected}")
 runner.MEMO_BLOCK = None
 queries = runner.read_executor_queries("/repo/maps/execqueries.bin")
-check(len(queries) == 57 and all(type(a) is int and type(b) is int and type(c) is str and a for a, b, c in queries.values()), "the per-query record reads back")
-check(0 < sum(1 for entry in queries.values() if entry[2]) < len(queries), "some queries ask a node for its type, most do not")
+check(len(queries) == 57 and all(type(a) is int and type(b) is int and len(c) == 3 and a for a, b, c in queries.values()), "the per-query record reads back")
+asking = [sum(1 for entry in queries.values() if entry[2][position]) for position in range(3)]
+check(0 < asking[0] < 57 and 0 < asking[1] < 57 and asking[2] < 57, f"only some queries read a slot: {asking}")
 check(runner.read_executor_queries("/repo/maps/no-such-file") == {}, "a missing per-query record is an empty one")
 
 # Which class attributes can be watched for reads (state.watchable), and how a pair is looked up.

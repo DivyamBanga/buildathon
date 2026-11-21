@@ -116,6 +116,16 @@ expect(
     differences(BASE.replace("return value * scale", "return value + scale")),
     [("", "helper", "function-code")],
 )
+expect(
+    "body and default of a function: every call sees the default, whatever lines it runs",
+    differences(BASE.replace("def helper(value, scale=2)", "def helper(value, scale=3)").replace("return value * scale", "return value + scale")),
+    [("", "helper", "function-meta")],
+)
+expect(
+    "body and closure of a function",
+    differences(BASE.replace("add_one = make(1)", "add_one = make(2)").replace("return value + offset", "return value - offset")),
+    [("", "add_one", "function-meta"), ("", "make", "function-code")],
+)
 changed = {row[:2] for row in differences(BASE.replace("TWO = 2", "TWO = 3"))}
 expect("enum value", ("Kind", "TWO") in changed, True)
 expect("enum value reaches what holds the member", ("Base", "MEMBERS") in changed, True)
