@@ -19,6 +19,7 @@ _CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 _NOT_A_DIALECT = ("dialect", "base", "__init__")
 # What the import system takes for a module in a directory.
 _MODULE_SUFFIXES = (".py", ".pyc", ".so", ".pyd")
+_DISTRIBUTIONS = (".dist-info", ".egg-info", ".egg-link", ".egg", ".pth")
 
 
 class CovMap:
@@ -202,6 +203,14 @@ class CovMap:
         directory = "/".join(parts[:depth])
         for number in table["explicit"].get(directory, ()):
             found |= 1 << number
+        # importlib.metadata scans each sys.path entry for distributions: only an entry
+        # named like one is looked at (standard library code, not a map of any patch).
+        if parts[depth].lower().endswith(_DISTRIBUTIONS):
+            for number in table.get("metadata", {}).get(directory, ()):
+                found |= 1 << number
+        # A test whose trace did not end cleanly is taken to list and ask for everything.
+        for number in table.get("broken", ()):
+            found |= 1 << number
         for number in table["unchecked"].get(directory, ()):
             unchecked |= 1 << number
         if table["names"] is None:
@@ -222,6 +231,10 @@ class CovMap:
                     if not part.endswith(_MODULE_SUFFIXES):
                         break
                     part = part.split(".", 1)[0]
+                    if part == "__init__":
+                        # `a/b/__init__.py` is the module `a.b`, the one that is asked for.
+                        part = below[index - 1] if index else part
+                        index -= 1
                 name = ".".join(below[:index] + [part])
                 if name in table["everywhere"]:
                     return everything

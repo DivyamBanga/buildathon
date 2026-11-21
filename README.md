@@ -119,18 +119,34 @@ the patched code**, and selects the ones that fail.
    `finally` or `tearDown` only undoes what it did itself. Of one that is
    removed as a whole, only the stores still count.
 
-   **A file that appears or vanishes** changes what its directory lists. The
-   tests that listed that directory in their own run (`dirs.json`, from the
-   `D` rows of the per-test traces: `os.listdir`, `os.scandir`, `glob`) are
-   candidates; so is everything that could notice a new module, because which
-   names the tests ask the import system for is not recorded: a new or removed
-   `.py` file or directory counts for every test, a data file only for the
-   tests that listed its directory. The import system's own listings are among
-   the rows, so for `sqlglot/` and `tests/` that is nearly every test. A new
-   test file under `tests/` keeps its own rule above. The candidates run in a
-   clean child that holds the new file, except where the listing code reaches
-   the checkout past the overlay (`sqlglotc/setup.py`) or the file is outside
-   `sqlglot/` and `tests/`; those are selected unchecked.
+   **A file that appears or vanishes** changes what its directory lists. Two
+   kinds of test can notice (`dirs.json`, from a run of every test alone under
+   `tools/trace_names/sitecustomize.py` and one run of the whole suite):
+   those that listed the directory themselves (`os.listdir`, `os.scandir`,
+   `glob`, `pkgutil`, `pathlib`: `explicit`; in all, `sqlglot/typing` by one
+   test and three directories by the tests of `sqlglotc/setup.py`), and those
+   whose process asked the import system for a module name the new file would
+   answer to (`names`: every name that was not yet in `sys.modules`, found or
+   not, including the interpreter's start-up modules). The import system's own
+   listing is not counted: it looks up only the names it is asked for, and
+   pytest's collection lists directories but keeps only what its arguments
+   name. `importlib.metadata` scans every `sys.path` entry on each run and
+   looks at nothing but `*.dist-info` and `*.egg-info` entries, so those alone
+   count for the root. A name asked in the whole-suite run and by no single
+   test counts for every test. `__init__.py` is the name of its package. A
+   new module that nobody asks for selects nothing, a name asked by few
+   selects those; a file that pytest finds by name (`pytest.toml`, `pytest.ini`,
+   `conftest.py`, a `pyproject.toml` or `setup.cfg` under `tests/`) selects
+   everything, as do new `__init__.py`, `sitecustomize.py` and
+   `usercustomize.py`. A test whose trace did not end cleanly is taken to list
+   everything (`broken`; none). A new test file under `tests/` keeps its own
+   rule above. The candidates run in a clean child that holds the new file,
+   except where the listing code reaches the checkout past the overlay
+   (`sqlglotc/setup.py`) or the file is outside `sqlglot/` and `tests/`; those
+   are selected unchecked. Not seen by the tracer: processes that are not
+   Python (`ls` run by a test), and existence tests by name (`os.path.exists`,
+   `isdir`; the two in the tests look for `sqlglot-integration-tests/`, which
+   only unittest's `load_tests` hooks use and pytest does not call).
 
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
