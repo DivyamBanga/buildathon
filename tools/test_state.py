@@ -227,9 +227,14 @@ expect("added function", shapes(BASE + "\ndef extra():\n    return 1\n"), [("ext
 expect("added plain class", shapes(BASE + "\nclass Plain:\n    pass\n"), [("Plain", "added", "")])
 expect("added class with a base of the package", shapes(BASE + "\nclass Sub(Base):\n    pass\n"), [("Sub", "added", "R")])
 expect("added class with a metaclass (an enum)", shapes(BASE + "\nclass Other(enum.Enum):\n    A = 1\n"), [("Other", "added", "R")])
-expect("a module that is new to every namespace", shapes(BASE + "\nimport textwrap\n"), [("textwrap", "added", "R")])
+expect("a standard-library module that is new to every namespace", shapes(BASE + "\nimport textwrap\n"), [("textwrap", "added", "")])
+import types  # noqa: E402
+
+comparer_ = state.Comparer(world(BASE), world(BASE), "/root")
+expect("another module that is new to every namespace", comparer_._risky(types.ModuleType("zz_outside"), "pkg.mod", world(BASE)), True)
+expect("a standard-library module with effects", comparer_._risky(types.ModuleType("this"), "pkg.mod", world(BASE)), True)
 expect("a module another name binds", shapes(BASE + "\nimport enum as en\n"), [("en", "added", "")])
-expect("a module no namespace binds any more", shapes(BASE.replace("import functools\n", "").replace("half = functools.partial(helper, scale=0.5)", "half = helper")), [("functools", "removed", "R")])
+expect("a standard-library module no namespace binds any more", shapes(BASE.replace("import functools\n", "").replace("half = functools.partial(helper, scale=0.5)", "half = helper")), [("functools", "removed", "")])
 expect(
     "an attribute added to a class with a base from outside",
     shapes(BASE + ERR.replace("pass", "EXTRA = 1"), BASE + ERR),

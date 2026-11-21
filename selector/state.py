@@ -225,6 +225,10 @@ def load_world(root: str, names: list[str], first: int, others: tuple = ()) -> t
     return modules, failed, heard
 
 
+# Modules of the standard library whose import does something (prints, opens a browser, hooks the terminal, runs site code).
+_STDLIB_WITH_EFFECTS = frozenset(("this", "antigravity", "readline", "rlcompleter", "site", "sitecustomize", "usercustomize"))
+
+
 def outside_state() -> dict:
     """State an import can change that is not part of the package itself."""
     logger = logging.getLogger(PACKAGE)
@@ -838,6 +842,10 @@ class Comparer:
             package = module_name.split(".", 1)[0]
             return any(base.__module__.split(".", 1)[0] == package for base in value.__mro__[1:])
         if isinstance(value, types.ModuleType):
+            top = value.__name__.split(".", 1)[0]
+            if top in sys.stdlib_module_names and top not in _STDLIB_WITH_EFFECTS:
+                # Importing it changes nothing a test can see but what outside_state() checks.
+                return False
             return id(value) not in self._bound_modules(other)
         return False
 
