@@ -664,6 +664,10 @@ class CovMap:
             if not owner_path or not self.has_file(owner_path):
                 return None
             if self.unobservable(kind, owner_path, qualname, attribute, reason, rest[0] if rest else None):
+                # Nothing reads the name. A test that reads the file as text sees the edit all the same
+                # (analyze keeps those tests as candidates of every change to the file; said here too,
+                # so that this answer does not depend on it).
+                found |= self.source_readers(owner_path)
                 continue
             if kind == "class" and reason == "value":
                 exact = self.attribute_readers(module, qualname, attribute)

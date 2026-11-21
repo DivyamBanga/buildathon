@@ -294,6 +294,15 @@ the patched code**, and selects the ones that fail.
    An all-capitals name that is added or removed is seen by the tests that run a
    line reading that name (`treaders.bin`), as a changed value of it would be.
 
+   A test that opens the changed file as text (`maps/sources.json`: the one
+   that parses the `sqlglot/typing` modules) sees an added import or
+   definition whether or not anything reads the name. Such tests are
+   candidates of every change to the file's text and are never among what the
+   comparison narrows (`Plan.rest_candidates`); `state_candidates` names them
+   again for a difference it drops as unread. Seed: `B_typing_alias` (an
+   import of another module's `EXPRESSION_METADATA` under an unread alias,
+   placed before the one the test looks for).
+
    Anything the map cannot show is unread stays as before (every test that
    imports the module, or every test that can reach the class). Docstring
    tests (`tests/test_docs.py`) are not collected by pytest, so an added

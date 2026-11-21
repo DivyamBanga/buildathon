@@ -175,6 +175,26 @@ expect("an unknown class", klass("ZZ_FLAG", qualname="Nope"), False)
 expect("a class defined in a function", klass("ZZ_FLAG", qualname="f.<locals>.C"), False)
 expect("class owner outside the package", klass("ZZ_FLAG", file="tests/test_x.py"), False)
 
+# A file some test reads as text (maps/sources.json): a name nothing reads is still seen by that test.
+covmap._sources = {"sqlglot/alpha.py": [3]}
+covmap._index = {"sqlglot/alpha.py": [0, 0], "sqlglot/beta.py": [0, 0]}
+covmap._tindex = {"sqlglot/alpha.py": [0, 0]}
+
+
+def seen_by(*rows):
+    return covmap.state_candidates({"differences": [list(row) for row in rows], "inconclusive": ""})
+
+
+ALPHA = ("module", "sqlglot.alpha", "", "ZZ_ADDED", "added", "sqlglot/alpha.py", "", 0, "")
+BETA = ("module", "sqlglot.beta", "", "ZZ_ADDED", "added", "sqlglot/beta.py", "", 0, "")
+THING = ("class", "sqlglot.alpha", "Thing", "ZZ_FLAG", "added", "sqlglot/alpha.py", "", 0, "")
+expect("the rule still calls the name unread", module("m", "ZZ_ADDED"), True)
+expect("an unread name in a file read as text: its readers", seen_by(ALPHA), 0b1000)
+expect("an unread name removed from it: its readers", seen_by(ALPHA[:3] + ("UNREAD", "removed") + ALPHA[5:]), 0b1000)
+expect("an unread class attribute in it: its readers", seen_by(THING), 0b1000)
+expect("an unread name in a file nobody reads as text: nobody", seen_by(BETA), 0)
+expect("both: the readers of the one", seen_by(BETA, ALPHA), 0b1000)
+
 # who reads a class attribute that is removed, or added under the name of an inherited one
 import types  # noqa: E402
 

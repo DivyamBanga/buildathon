@@ -562,6 +562,19 @@ for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith("B_"):
         expect("seed " + name[:-6], selected(seed(name[:-6]), TYPING), True)
 
+# seed B_typing_alias adds an import under a name nothing reads, before the import the test looks for in the
+# text. The comparison of import state reports that one added name (the row below), CovMap.unobservable calls
+# it unread and the 1114 importers go. The test that reads the file must stay: in what the comparison leaves
+# and in the plan (main.finish_probe: rest_candidates | what the comparison leaves).
+plan = seed("B_typing_alias")
+ALIAS_ROW = ["module", "sqlglot.typing.duckdb", "", "_zz", "added", "sqlglot/typing/duckdb.py", "", 0, ""]
+expect("seed B_typing_alias: nothing reads the name", covmap.unobservable("module", "sqlglot/typing/duckdb.py", "", "_zz", "added", ""), True)
+left = covmap.state_candidates({"differences": [ALIAS_ROW], "inconclusive": ""})
+expect("seed B_typing_alias: the comparison leaves the test that reads the file", left, 1 << ID[TYPING])
+expect("seed B_typing_alias: the plan keeps it apart from the importers", plan.rest_candidates, 1 << ID[TYPING])
+expect("seed B_typing_alias: the importers are import-time candidates", plan.import_candidates & ~plan.rest_candidates != 0, True)
+expect("seed B_typing_alias: candidates after the comparison", plan.rest_candidates | left, 1 << ID[TYPING])
+
 
 def new_file_patch(path, text):
     lines = text.splitlines()
