@@ -677,7 +677,10 @@ class Coordinator:
     def wants_probe(self, job: Job) -> bool:
         """Whether to compare import state before deciding what to run for the commit."""
         plan = job.plan
-        if not STATE_PROBE or job.probed or job.mode != "clean":
+        # Whatever way the commit will be checked: a clean import, or a child that
+        # imports the patched module on demand. A plan with nothing but function
+        # bodies to swap has no import-time candidates and stops at the next test.
+        if not STATE_PROBE or job.probed:
             return False
         if not plan.import_candidates or not plan.probe_ok or not self.covmap.has_test_time():
             return False

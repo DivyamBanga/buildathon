@@ -108,6 +108,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     if readers:
         # Tests that read or run this source as a file see any change to its text.
         plan.candidates |= readers
+        plan.rest_candidates |= readers
         plan.note(f"{old_path}: read as a file by {readers.bit_count()} tests")
     if patch.old_text is None:
         # A new module. Nothing at the pinned commit imports it, so on its own it
