@@ -19,9 +19,16 @@ import types
 
 CODE = types.CodeType
 CO_NEWLOCALS = 0x0002
+CO_FUTURE_ANNOTATIONS = 0x1000000
+# Names a module or class body stores that nothing in sqlglot or its tests reads.
+_INERT_NAMES = ("__firstlineno__", "__doc__", "__static_attributes__")
+_CACHE = dis.opmap.get("CACHE", 0)
 _STORE_NAME = dis.opmap["STORE_NAME"]
 _LOAD_CONST = dis.opmap["LOAD_CONST"]
 _EXTENDED_ARG = dis.opmap["EXTENDED_ARG"]
+_MAKE_FUNCTION = dis.opmap["MAKE_FUNCTION"]
+_SET_FUNCTION_ATTRIBUTE = dis.opmap.get("SET_FUNCTION_ATTRIBUTE", -1)
+_ANNOTATIONS_ATTRIBUTE = 4
 
 
 def _canon(value):
@@ -34,39 +41,73 @@ def _canon(value):
     return (type(value).__name__, repr(value))
 
 
-def _firstlineno_const(code: CODE) -> int:
-    """Index of the constant a class body stores as `__firstlineno__`, or -1.
-
-    Python 3.13 records each class's first line in its body, so moving a class
-    down a line changes a constant without changing what the class does.
-    """
-    names = code.co_names
-    if "__firstlineno__" not in names:
-        return -1
-    target = names.index("__firstlineno__")
+def _instructions(code: CODE):
+    """(opcode, argument) with EXTENDED_ARG folded in and inline caches skipped."""
     raw = code.co_code
     extended = 0
-    previous = (-1, 0)
-    for offset in range(0, min(len(raw), 96), 2):
+    for offset in range(0, len(raw), 2):
         opcode = raw[offset]
+        if opcode == _CACHE:
+            continue
         argument = raw[offset + 1] | extended
         if opcode == _EXTENDED_ARG:
             extended = argument << 8
             continue
         extended = 0
-        if opcode == _STORE_NAME and argument == target:
-            return previous[1] if previous[0] == _LOAD_CONST else -1
-        previous = (opcode, argument)
-    return -1
+        yield opcode, argument
 
 
-def own_key(code: CODE):
-    """Everything that decides what this code object does, apart from its children."""
-    masked = -1 if code.co_flags & CO_NEWLOCALS else _firstlineno_const(code)
+def _inert_consts(code: CODE) -> set[int]:
+    """Constants of `code` that no test of this project can observe.
+
+    - `__firstlineno__`: Python 3.13 stores each class's first line in its body,
+      so moving a class down a line changes a constant and nothing else.
+    - `__static_attributes__`: Python 3.13 lists the `self.x` names a class's
+      methods assign; an edit inside a method can change it.
+    - Docstrings: nothing in sqlglot or its tests reads `__doc__`.
+    - Function annotations in a module under `from __future__ import annotations`:
+      they are stored as strings, never evaluated, and nothing reads them.
+    """
+    inert: set[int] = set()
+    consts = code.co_consts
+    if code.co_flags & CO_NEWLOCALS:
+        # A def keeps its docstring as its first constant, None when it has none.
+        # (A generator expression has no such slot, so only real defs qualify.)
+        if consts and isinstance(consts[0], str) and not code.co_name.startswith("<"):
+            inert.add(0)
+    else:
+        names = code.co_names
+        targets = {names.index(name) for name in _INERT_NAMES if name in names}
+        if targets:
+            previous = (-1, 0)
+            for opcode, argument in _instructions(code):
+                if opcode == _STORE_NAME and argument in targets and previous[0] == _LOAD_CONST:
+                    inert.add(previous[1])
+                previous = (opcode, argument)
+    if code.co_flags & CO_FUTURE_ANNOTATIONS and _SET_FUNCTION_ATTRIBUTE >= 0:
+        # LOAD_CONST <annotations>; LOAD_CONST <code>; MAKE_FUNCTION; SET_FUNCTION_ATTRIBUTE 4
+        window = [(-1, 0), (-1, 0), (-1, 0)]
+        for opcode, argument in _instructions(code):
+            if (
+                opcode == _SET_FUNCTION_ATTRIBUTE
+                and argument == _ANNOTATIONS_ATTRIBUTE
+                and window[2][0] == _MAKE_FUNCTION
+                and window[1][0] == _LOAD_CONST
+                and window[0][0] == _LOAD_CONST
+                and isinstance(consts[window[1][1]], CODE)
+                and isinstance(consts[window[0][1]], tuple)
+                and all(isinstance(item, str) for item in consts[window[0][1]])
+            ):
+                inert.add(window[0][1])
+            window = [window[1], window[2], (opcode, argument)]
+    return inert
+
+
+def _key(code: CODE, inert=()):
     return (
         code.co_code,
         tuple(
-            "<firstlineno>" if index == masked else _canon(const)
+            "<inert>" if index in inert else _canon(const)
             for index, const in enumerate(code.co_consts)
         ),
         code.co_names,
@@ -81,6 +122,18 @@ def own_key(code: CODE):
         code.co_name,
         code.co_qualname,
     )
+
+
+def own_key(code: CODE):
+    """Everything that decides what this code object does, apart from its children."""
+    return _key(code, _inert_consts(code))
+
+
+def same_behaviour(old: CODE, new: CODE) -> bool:
+    """True when the two code objects differ at most in line numbers, children and inert constants."""
+    if _key(old) == _key(new):
+        return True
+    return own_key(old) == own_key(new)
 
 
 def is_function_like(code: CODE) -> bool:
@@ -111,7 +164,7 @@ def diff_code(old: CODE, new: CODE) -> CodeDiff:
             a.co_name == b.co_name and is_function_like(a) == is_function_like(b)
             for a, b in zip(old_children, new_children)
         )
-        if own_key(old_code) != own_key(new_code):
+        if not same_behaviour(old_code, new_code):
             result.changed.append((old_code, new_code))
         elif not same_shape:
             result.changed.append((old_code, new_code))
@@ -222,6 +275,9 @@ def _compare_statement(old, new, lines: set[int]) -> None:
                 header_differs = True
     if not block_fields:
         # A simple statement: every line it spans.
+        if _is_docstring(old) and _is_docstring(new):
+            # An edited docstring (or a bare string that does nothing).
+            return
         if isinstance(old, _NO_LINE_EVENT) or _is_docstring(old) or _is_docstring(new):
             # No bytecode of its own, so its execution cannot be observed.
             raise _Structural

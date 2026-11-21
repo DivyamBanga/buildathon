@@ -32,6 +32,15 @@ class Plan:
         self.swaps: list[tuple[str, list]] = []
         # absolute path -> new text, for data files read while a test runs.
         self.redirects: dict[str, str] = {}
+        # source path -> [(code firstlineno, old lines or None)]: the changed code,
+        # for working out which fixture cases reach it.
+        self.units: dict[str, list] = {}
+        # False when some change is not captured by `units` or a fixture edit.
+        self.sliceable = True
+        # Tests that import a changed file but were ruled out as candidates. If the
+        # patched file can no longer be imported they fail all the same, so the
+        # runner must try importing their test files.
+        self.import_check = 0
         self.notes: list[str] = []
 
     def note(self, text: str) -> None:
@@ -67,6 +76,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         # A new module. Nothing at the pinned commit imports it, so on its own it
         # reaches a test only through other changed files or through pytest.
         plan.needs_clean = True
+        plan.sliceable = False
         name = os.path.basename(path)
         if name in _PYTEST_CONFIG or name in ("__init__.py", "sitecustomize.py", "usercustomize.py"):
             plan.select_all = True
@@ -74,6 +84,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         return
     if patch.new_text is None or old_path != path:
         plan.needs_clean = True
+        plan.sliceable = False
         plan.candidates |= covmap.file_any(old_path)
         opened = covmap.opened(old_path)
         if opened:
@@ -89,6 +100,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         if opened:
             plan.candidates |= opened
             plan.needs_clean = True
+            plan.sliceable = False
         plan.note(f"{path}: not executed by any test")
         return
     absolute = os.path.join(root, path)
@@ -96,6 +108,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         new_code = compile(patch.new_text, absolute, "exec", dont_inherit=True)
     except (SyntaxError, ValueError, RecursionError, MemoryError, OverflowError):
         plan.needs_clean = True
+        plan.sliceable = False
         plan.candidates |= covmap.file_any(path)
         plan.note(f"{path}: does not compile")
         return
@@ -108,13 +121,33 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     new_lines = patch.new_text.splitlines(keepends=True)
     warm = covmap.warm(path)
     hot = diff.isomorphic and absolute in loaded
+    units = plan.units.setdefault(path, [])
     for old, new in diff.changed:
         first = old.co_firstlineno
         if not pydiff.is_function_like(old):
             # Module or class body: it ran at import, in every test that imported the file.
             hot = False
             found = covmap.code_any(path, first)
-            plan.note(f"{path}:{first} {old.co_name} import-time, {found.bit_count()} tests")
+            units.append((first, None))
+            narrowed = None
+            if old.co_name != "<module>":
+                narrowed = covmap.class_candidates(
+                    path,
+                    old.co_qualname,
+                    found,
+                    patch.old_lines_changed,
+                    patch.pure_insert_after,
+                    new is not None and old.co_names == new.co_names,
+                )
+            if narrowed is not None:
+                plan.note(
+                    f"{path}:{first} class {old.co_qualname}: {narrowed.bit_count()} tests use it "
+                    f"(of {found.bit_count()} that import it)"
+                )
+                plan.import_check |= found & ~narrowed
+                found = narrowed
+            else:
+                plan.note(f"{path}:{first} {old.co_name} import-time, {found.bit_count()} tests")
         else:
             lines = None
             if new is not None:
@@ -126,6 +159,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                         lines = pydiff.changed_lines_in_function(
                             old_lines, new_lines, (first, span[1]), (new_first, new_last)
                         )
+            units.append((first, lines))
             if lines is None:
                 found = covmap.code_any(path, first)
                 plan.note(f"{path}:{first} {old.co_name} whole function, {found.bit_count()} tests")
@@ -172,6 +206,7 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         return
     if patch.old_text is None and patch.new_file:
         plan.needs_clean = True
+        plan.sliceable = False
         plan.note(f"new data file {path}")
         return
     opened = covmap.opened(old_path)
@@ -182,6 +217,7 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
     plan.note(f"{path}: opened by {opened.bit_count()} tests")
     if patch.new_text is None or old_path != path:
         plan.needs_clean = True
+        plan.sliceable = False
     else:
         plan.redirects[os.path.join(root, path)] = patch.new_text
 

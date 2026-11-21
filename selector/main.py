@@ -3,8 +3,8 @@
 For every patch:
   1. analyze.py names the tests that could notice the change (dependency map).
   2. Those tests are run against the patched code in forked children
-     (runner.py) and the ones that fail are selected. Tests that cost more to
-     check than to hand to a worker are selected without being run.
+     (runner.py) and the ones that fail are selected. A test is selected
+     without being run when running it would cost more CPU than selecting it.
   3. schedule.py splits the selection across workers.
 
 Whatever goes wrong, every commit still gets a line: an unverified candidate
@@ -38,13 +38,21 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 # checked is selected unchecked.
 HARD_DEADLINE = float(os.environ.get("BR_DEADLINE", "135"))
 MAX_PARALLEL = 2
-# CPU seconds this machine needs per recorded test second, to weigh checking
-# a test against simply selecting it.
-RATIO = float(os.environ.get("BR_RATIO", "1.0"))
-# Tests longer than this are selected rather than run when they are candidates.
-BLIND_SECONDS = float(os.environ.get("BR_BLIND", "2.5"))
+# CPU seconds on the scoring machine per CPU second measured where
+# maps/runcost.json was made.
+MACHINE = float(os.environ.get("BR_MACHINE", "1.35"))
+# Running a test is worth it when its CPU cost is under this share of what
+# selecting it would add. A test that fails stops early and costs little, so
+# the share stays high while nothing has failed on the commit (the change may
+# be harmless and the whole selection avoidable) and drops once something has.
+PASS_QUIET = float(os.environ.get("BR_PASS_QUIET", "0.9"))
+PASS_LIVE = float(os.environ.get("BR_PASS_LIVE", "0.5"))
+# Tests cheaper than this to check are weighed together, not one by one.
+CHEAP = 0.5
 SETUP_ALLOWANCE = 40.0
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
+FIXTURES = "tests/fixtures/"
+EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
 
 def log(*parts) -> None:
@@ -55,13 +63,24 @@ class Job:
     def __init__(self, plan: Plan, mode: str, pending: list[int], blind: set[int]) -> None:
         self.plan = plan
         self.mode = mode
-        self.pending = pending  # map bits still to run, in test order
+        self.pending = pending  # map bits still to run
         self.blind = blind  # selected without running
         self.failed: set[int] = set()
+        self.estimates: dict[int, float] = {}
+        self.slices: dict = {}  # (bit, fixture) -> case numbers worth running
+        # representative test -> tests of its class that fail exactly when it does
+        self.followers: dict[int, list[int]] = {}
         self.strikes = 0
         self.timeouts = 0
         self.spawned = 0
         self.estimate = 0.0
+        self.replanned = False
+        self.candidates: list[int] = []  # every test still to be decided
+        self.everything: set[int] = set()  # every candidate, followers included
+        self.decided = False
+        # Test files of non-candidates that import a changed module: the child
+        # imports them first, and a file that fails takes all its tests with it.
+        self.import_files: list[str] = []
 
 
 class Run:
@@ -77,6 +96,7 @@ class Run:
         self.finished = False
         self.fatal: str | None = None
         self.started = now
+        self.stopped = False  # the coordinator chose to end it
 
 
 class Coordinator:
@@ -91,6 +111,24 @@ class Coordinator:
         self.bit_seconds = [
             self.ms[number] / 1000.0 if number >= 0 else 0.0 for number in self.bit_number
         ]
+        self.bit_class = [test_id.rsplit("::", 1)[0] for test_id in self.covmap.ids]
+        # What a test costs to run here, measured with this runner; the recorded
+        # seconds stand in for a test that was never measured.
+        self.bit_cost = list(self.bit_seconds)
+        self.class_setup: dict[str, float] = {}
+        try:
+            runcost = json.load(open(os.path.join(MAPS, "runcost.json")))
+            for bit, value in enumerate(runcost["tests"][: len(self.bit_cost)]):
+                if value is not None:
+                    self.bit_cost[bit] = value
+            self.class_setup = runcost.get("setup", {})
+        except (OSError, ValueError, KeyError):
+            pass
+        # CPU seconds here per CPU second where runcost.json was measured. It
+        # starts at the configured guess and follows what the children really use.
+        self.machine = MACHINE
+        self.observed_cpu = 0.0
+        self.observed_base = 0.0
         mapped = set(self.covmap.ids)
         # Tests the map has never seen cannot be reasoned about: always selected.
         self.unmapped = [test["number"] for test in tests if test["id"] not in mapped]
@@ -101,33 +139,191 @@ class Coordinator:
         self.function_index: dict = {}
         self.sequence = 0
         self.ran_seconds = 0.0
+        self._opens: dict[int, list[str]] = {}
+        self.setup_map: dict | None = None
 
     # ---- deciding -------------------------------------------------------
 
     def cost(self, bits) -> float:
         return schedule.cost_ms([self.ms[self.bit_number[bit]] for bit in bits]) / 1000.0
 
+    def opens_of(self, bit: int) -> list[str]:
+        found = self._opens.get(bit)
+        if found is None:
+            found = self._opens[bit] = self.covmap.opens_of(bit)
+        return found
+
+    def changed_fixtures(self, plan: Plan) -> set[str]:
+        return {
+            path[len(ROOT) + 1:][len(FIXTURES):]
+            for path in plan.redirects
+            if path[len(ROOT) + 1:].startswith(FIXTURES)
+        }
+
+    def followers(self, plan: Plan, bits: list[int], job: Job) -> list[int]:
+        """Drop tests that only share a class-level fixture load with a representative.
+
+        When a patch edits nothing but fixture files, a test that reads the file
+        but runs the same code whatever its cases are (the map knows which) can
+        only fail if loading the file fails, and then every such test of the
+        class fails with it. One of them is run for the lot.
+        """
+        changed = self.changed_fixtures(plan)
+        if not plan.sliceable or plan.units or not changed:
+            return bits
+        groups: dict[str, list[int]] = {}
+        for bit in bits:
+            relevant = [fixture for fixture in self.opens_of(bit) if fixture in changed]
+            if relevant and all(self.covmap.case_independent(bit, fixture) for fixture in relevant):
+                groups.setdefault(self.bit_class[bit], []).append(bit)
+        dropped: set[int] = set()
+        for members in groups.values():
+            if len(members) > 1:
+                lead = min(members, key=lambda bit: (self.bit_cost[bit], bit))
+                job.followers[lead] = [bit for bit in members if bit != lead]
+                dropped.update(job.followers[lead])
+        return [bit for bit in bits if bit not in dropped]
+
+    def estimate(self, plan: Plan, bits: list[int], job: Job) -> None:
+        """What checking each candidate should cost, and which fixture cases it needs."""
+        changed = self.changed_fixtures(plan)
+        for bit in bits:
+            share = 1.0
+            if plan.sliceable:
+                shares = []
+                for fixture in dict.fromkeys(self.opens_of(bit) + self.covmap.sliced_fixtures(bit)):
+                    info = self.covmap.case_info(bit, fixture)
+                    if info is None:
+                        if not self.covmap.case_independent(bit, fixture):
+                            shares.append(1.0)
+                        continue
+                    # With no code change, only the cases the patch edits can differ.
+                    keep = self.covmap.case_slice(bit, fixture, plan.units) if plan.units else set()
+                    if keep is None:
+                        shares.append(1.0)
+                        continue
+                    job.slices[(bit, fixture)] = keep
+                    weight = info["weight"]
+                    part = sum(weight[index] for index in keep if index < len(weight))
+                    if fixture in changed:
+                        part += 2.0 / max(1, info["count"])
+                    shares.append(min(1.0, part))
+                if shares:
+                    share = max(0.03, max(shares))
+            # In seconds of the machine runcost.json was measured on.
+            job.estimates[bit] = self.bit_cost[bit] * share
+
+    def weigh(self, bits: list[int], estimates: dict, chosen: list[int], passing: float):
+        """Split `bits` into (worth checking, selected unchecked), given `chosen` is selected anyway.
+
+        Checking a test is worth it when its CPU cost is below what selecting
+        it would add to the commit, times the chance that it passes.
+        """
+        chosen = list(chosen)
+        check: list[int] = []
+        blind: list[int] = []
+        scale = self.machine
+        big = sorted((bit for bit in bits if estimates[bit] * scale > CHEAP), key=estimates.get, reverse=True)
+        cheap = [bit for bit in bits if estimates[bit] * scale <= CHEAP]
+        base = self.cost(chosen)
+        for bit in big:
+            with_bit = self.cost(chosen + [bit])
+            if estimates[bit] * scale < passing * (with_bit - base):
+                check.append(bit)
+            else:
+                blind.append(bit)
+                chosen.append(bit)
+                base = with_bit
+        if cheap:
+            marginal = self.cost(chosen + cheap) - base
+            if sum(estimates[bit] for bit in cheap) * scale < passing * marginal:
+                check.extend(cheap)
+            else:
+                blind.extend(cheap)
+        return check, blind
+
+    def order(self, bits: list[int], estimates: dict) -> list[int]:
+        """Cheapest classes first, so a failure shows up early; a class stays together."""
+        totals: dict[str, float] = {}
+        for bit in bits:
+            totals[self.bit_class[bit]] = totals.get(self.bit_class[bit], 0.0) + estimates[bit]
+        return sorted(bits, key=lambda bit: (totals[self.bit_class[bit]], self.bit_class[bit], bit))
+
     def plan_commit(self, plan: Plan) -> None:
         if plan.select_all:
             self.decisions[plan.commit] = list(self.numbers)
             return
         bits = [bit for bit in self.covmap.bits(plan.candidates) if self.bit_number[bit] >= 0]
-        if not bits:
+        importers = [
+            bit
+            for bit in self.covmap.bits(plan.import_check & ~plan.candidates)
+            if self.bit_number[bit] >= 0
+        ]
+        if not bits and not importers:
             self.decisions[plan.commit] = []
             return
-        blind = [bit for bit in bits if self.bit_seconds[bit] > BLIND_SECONDS]
-        rest = [bit for bit in bits if self.bit_seconds[bit] <= BLIND_SECONDS]
         mode = "clean" if plan.needs_clean else "hot"
-        overhead = 0.5 if mode == "clean" else 0.05
-        check = overhead + RATIO * sum(self.bit_seconds[bit] for bit in rest)
-        saving = self.cost(bits) - self.cost(blind)
-        if not rest or check >= saving:
-            plan.note(f"selected unchecked: checking {check:.1f}s >= saving {saving:.1f}s")
-            self.finish(plan, set(bits))
-            return
-        job = Job(plan, mode, rest, set(blind))
-        job.estimate = check
+        job = Job(plan, mode, [], set())
+        job.import_files = sorted({self.covmap.ids[bit].split("::", 1)[0] for bit in importers})
+        job.everything = set(bits)
+        job.candidates = self.followers(plan, bits, job)
+        self.estimate(plan, job.candidates, job)
+        # Cheap commits go first: by the time a close call comes up, the real
+        # cost of running tests on this machine has been measured.
+        job.estimate = sum(job.estimates.values())
         self.queue.append(job)
+
+    def overhead(self, job: Job, bits) -> float:
+        """Base seconds a child spends outside the tests themselves."""
+        classes = {self.bit_class[bit] for bit in bits}
+        setup = 0.0
+        for name in classes:
+            if name == EXECUTOR_CLASS and self.executor_setup_untouched(job):
+                setup += 0.15  # its tables come ready-made
+            else:
+                setup += self.class_setup.get(name, 0.0)
+        return setup + (0.45 if job.mode == "clean" else 0.05)
+
+    def decide(self, job: Job) -> bool:
+        """Choose what to run for a commit. False when nothing is worth running."""
+        job.decided = True
+        plan = job.plan
+        bits = job.candidates
+        check, blind = self.weigh(bits, job.estimates, [], PASS_QUIET)
+        total = self.machine * (self.overhead(job, check) + sum(job.estimates[bit] for bit in check))
+        saving = self.cost(bits) - self.cost(blind)
+        if not check or total >= saving:
+            plan.note(f"selected unchecked: checking {total:.1f}s vs saving {saving:.1f}s")
+            if job.import_files:
+                # Nothing to run, but the files that only import the change must still load.
+                job.pending = []
+                job.blind = set(bits)
+                return True
+            self.finish(plan, job.everything)
+            return False
+        plan.note(f"checking {len(check)} (~{total:.1f}s), {len(blind)} selected unchecked")
+        job.pending = self.order(check, job.estimates)
+        job.blind = set(blind)
+        return True
+
+    def replan(self, run: Run) -> bool:
+        """Something failed, so the change is real: recheck what is still worth running.
+
+        Returns True when the child should be stopped.
+        """
+        job = run.job
+        job.replanned = True
+        remaining = [bit for bit in run.tests if bit not in run.done]
+        if not remaining:
+            return False
+        check, blind = self.weigh(remaining, job.estimates, list(job.blind | job.failed), PASS_LIVE)
+        if not blind:
+            return False
+        job.blind.update(blind)
+        keep = set(check)
+        job.pending = [bit for bit in remaining if bit in keep]
+        run.stopped = True
+        return True
 
     def finish(self, plan: Plan, bits: set[int]) -> None:
         numbers = sorted(self.bit_number[bit] for bit in bits if self.bit_number[bit] >= 0)
@@ -136,7 +332,15 @@ class Coordinator:
         self.decisions[plan.commit] = numbers
 
     def finish_job(self, job: Job, unchecked=()) -> None:
-        self.finish(job.plan, job.blind | job.failed | set(unchecked))
+        if not job.decided:
+            # Never got as far as choosing what to run: every candidate is selected.
+            self.finish(job.plan, job.everything)
+            return
+        selected = job.blind | job.failed | set(unchecked)
+        for lead, members in job.followers.items():
+            if lead in selected:
+                selected.update(members)
+        self.finish(job.plan, selected)
 
     # ---- running --------------------------------------------------------
 
@@ -158,6 +362,78 @@ class Coordinator:
             self.function_index = index
         gc.collect()
         gc.freeze()
+
+    def case_filter(self, job: Job, tests: list[int]) -> dict:
+        """One filter per fixture for the whole child: the union of what its tests need."""
+        if not job.slices:
+            return {}
+        inside = set(tests)
+        by_fixture: dict[str, list] = {}
+        for (bit, fixture), keep in job.slices.items():
+            if bit in inside:
+                by_fixture.setdefault(fixture, []).append((bit, keep))
+        cases = {}
+        for fixture, entries in by_fixture.items():
+            sliced = {bit for bit, _ in entries}
+            # Every other test here that reads the fixture must not care about its cases.
+            if any(
+                bit not in sliced
+                and fixture in self.opens_of(bit)
+                and not self.covmap.case_independent(bit, fixture)
+                for bit in tests
+            ):
+                continue
+            allowed: set[int] = set()
+            kinds = set()
+            for bit, keep in entries:
+                allowed |= keep
+                kinds.add(self.covmap.case_info(bit, fixture)["kind"])
+            for kind in kinds:
+                cases[(kind, fixture)] = frozenset(allowed)
+        return cases
+
+    def executor_setup_untouched(self, job: Job) -> bool:
+        """True when the patch touches nothing the executor tests' class setup executes or reads."""
+        if job.mode != "hot" or not job.plan.sliceable:
+            return False
+        if self.setup_map is None:
+            try:
+                self.setup_map = json.load(open(os.path.join(MAPS, "setup.json")))
+            except (OSError, ValueError):
+                self.setup_map = {}
+        setup = self.setup_map.get(EXECUTOR_CLASS)
+        if not setup:
+            return False
+        for path, entries in job.plan.units.items():
+            ran = setup["units"].get(path)
+            if not ran:
+                continue
+            for first, lines in entries:
+                if any(first == ran_first and (lines is None or line in lines) for ran_first, line in ran):
+                    return False
+        # The .sql fixtures are read again by the child itself; the data files are not.
+        changed = {path[len(ROOT) + 1:] for path in job.plan.redirects}
+        return not any(path in changed and not path.endswith(".sql") for path in setup["opens"])
+
+    def executor_tables(self, job: Job, tests: list[int]) -> bool:
+        """Whether the child may take the executor tests' tables ready-made.
+
+        Then the tables built here at the pinned commit are exactly what the
+        child's own class setup would build.
+        """
+        if not any(self.bit_class[bit] == EXECUTOR_CLASS for bit in tests):
+            return False
+        if not self.executor_setup_untouched(job):
+            return False
+        if runner.EXECUTOR_TABLES is None:
+            try:
+                runner.build_executor_tables()
+                gc.freeze()
+            except Exception as error:
+                log(f"could not prebuild the executor tables: {error!r}")
+                self.setup_map[EXECUTOR_CLASS] = None
+                return False
+        return True
 
     def spawn(self, job: Job) -> None:
         tests = job.pending
@@ -182,6 +458,9 @@ class Coordinator:
             "swaps": plan.swaps if job.mode == "hot" else [],
             "redirects": plan.redirects if job.mode == "hot" else {},
             "tests": [(bit, self.covmap.ids[bit]) for bit in tests],
+            "cases": self.case_filter(job, tests),
+            "imports": job.import_files if job.mode == "clean" else [],
+            "executor_tables": self.executor_tables(job, tests),
         }
         read_fd, write_fd = os.pipe()
         pid = os.fork()
@@ -219,19 +498,29 @@ class Coordinator:
             if kind == b"S":
                 run.current = int(line[2:])
                 run.current_started = now
+                run.job.import_files = []
+            elif kind == b"B":
+                # A test file that can no longer be imported: all its tests fail.
+                prefix = line[2:].decode("utf-8", "replace") + "::"
+                broken = [bit for bit, test_id in enumerate(self.covmap.ids) if test_id.startswith(prefix)]
+                run.job.failed.update(bit for bit in broken if self.bit_number[bit] >= 0)
+                log(f"{run.job.plan.commit}: {prefix[:-2]} cannot be imported ({len(broken)} tests)")
             elif kind == b"R":
                 _, bit, status = line.split()
                 bit = int(bit)
-                if status == b"1":
-                    run.job.failed.add(bit)
                 if bit not in run.done:
                     run.done.add(bit)
                     self.ran_seconds += self.bit_seconds[bit]
                 run.current = None
+                if status == b"1":
+                    run.job.failed.add(bit)
+                    if not run.job.replanned and self.replan(run):
+                        return
             elif kind == b"X":
                 run.fatal = line[2:].decode("utf-8", "replace")
             elif kind == b"D":
                 run.finished = True
+                run.job.import_files = []
             run.last_event = now
 
     def close(self, fd: int) -> None:
@@ -241,18 +530,39 @@ class Coordinator:
         except OSError:
             pass
         self.kill(run)
+        used = 0.0
         try:
-            os.waitpid(run.pid, 0)
+            _, _, usage = os.wait4(run.pid, 0)
+            used = usage.ru_utime + usage.ru_stime
         except OSError:
             pass
         job = run.job
         left = [bit for bit in run.tests if bit not in run.done]
+        if run.finished and not left and not job.failed and run.fatal is None:
+            # A clean, complete run: compare what it cost with what was expected.
+            expected = self.overhead(job, run.tests) + sum(job.estimates[bit] for bit in run.tests)
+            if expected > 0.2:
+                self.observed_cpu += used
+                self.observed_base += expected
+                prior = 3.0  # seconds of evidence the configured guess is worth
+                self.machine = min(
+                    4.0, max(0.3, (prior * MACHINE + self.observed_cpu) / (prior + self.observed_base))
+                )
         if VERBOSE:
             log(
                 f"{job.plan.commit}: {job.mode} child ran {len(run.done)}/{len(run.tests)} tests "
                 f"({sum(self.bit_seconds[bit] for bit in run.done):.2f} recorded s) in "
-                f"{time.monotonic() - run.started:.2f}s, {len(job.failed)} failed"
+                f"{time.monotonic() - run.started:.2f}s using {used:.2f} CPU s, {len(job.failed)} failed"
+                + (", stopped early" if run.stopped else "")
+                + f" [machine {self.machine:.2f}]"
             )
+        if run.stopped:
+            # replan() already split what was left into job.blind and job.pending.
+            if job.pending:
+                self.queue.insert(0, job)
+            else:
+                self.finish_job(job)
+            return
         if run.fatal is not None:
             log(f"{job.plan.commit}: child failed in {job.mode} mode: {run.fatal}")
             if job.mode == "hot":
@@ -292,13 +602,16 @@ class Coordinator:
                         os.close(fd)
                     except OSError:
                         pass
-                    self.finish_job(run.job, [bit for bit in run.tests if bit not in run.done])
+                    left = [bit for bit in run.tests if bit not in run.done]
+                    self.finish_job(run.job, left + run.job.pending)
                 for job in self.queue:
                     self.finish_job(job, job.pending)
                 self.queue = []
                 return
             while self.queue and len(self.running) < MAX_PARALLEL:
-                self.spawn(self.queue.pop(0))
+                job = self.queue.pop(0)
+                if job.decided or self.decide(job):
+                    self.spawn(job)
             ready, _, _ = select.select(list(self.running), [], [], 0.05)
             now = time.monotonic()
             for fd in ready:
@@ -309,7 +622,7 @@ class Coordinator:
                     data = b""
                 if data:
                     self.feed(run, data, now)
-                if not data or run.finished or run.fatal is not None:
+                if not data or run.finished or run.fatal is not None or run.stopped:
                     self.close(fd)
             for fd, run in list(self.running.items()):
                 if run.current is not None:
@@ -343,7 +656,11 @@ class Coordinator:
                 self.plan_commit(plan)
             except Exception as error:
                 plan.note(f"planning raised {error!r}")
-                self.decisions[commit] = list(self.numbers)
+                self.queue = [job for job in self.queue if job.plan is not plan]
+                if plan.select_all:
+                    self.decisions[commit] = list(self.numbers)
+                else:
+                    self.finish(plan, set(self.covmap.bits(plan.candidates)))
         analysed = time.monotonic()
         if self.queue:
             self.queue.sort(key=lambda job: job.estimate)
@@ -357,7 +674,7 @@ class Coordinator:
                 for run in self.running.values():
                     self.kill(run)
                     if run.job.plan.commit not in self.decisions:
-                        self.finish_job(run.job, run.tests)
+                        self.finish_job(run.job, run.tests + run.job.pending)
                 for job in self.queue:
                     if job.plan.commit not in self.decisions:
                         self.finish_job(job, job.pending)

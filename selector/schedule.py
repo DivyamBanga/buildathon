@@ -57,31 +57,33 @@ def _best_for(items: list[tuple[int, int]], worker_count: int) -> tuple[int, lis
     return best_load, best
 
 
+def _plan(items: list[tuple[int, int]]) -> tuple[int, list[list[int]]]:
+    """items sorted longest first. Returns (cost in ms, workers)."""
+    longest = items[0][0]
+    best_cost = -1
+    best_workers: list[list[int]] = []
+    for worker_count in range(1, min(MAX_WORKERS, len(items)) + 1):
+        load, workers = _best_for(items, worker_count)
+        occupied = [worker for worker in workers if worker]
+        cost = load + WORKER_COST_MS * len(occupied)
+        if best_cost < 0 or cost < best_cost:
+            best_cost = cost
+            best_workers = occupied
+        if load - longest <= WORKER_COST_MS:
+            # Another worker costs 2 s and cannot take the busiest one below
+            # the single longest test.
+            break
+    return best_cost, best_workers
+
+
 def cost_ms(durations: list[int]) -> int:
     if not durations:
         return 0
-    items = sorted(((d, i) for i, d in enumerate(durations)), reverse=True)
-    return min(
-        _best_for(items, w)[0] + WORKER_COST_MS * w
-        for w in range(1, min(MAX_WORKERS, len(items)) + 1)
-    )
+    return _plan(sorted(((d, i) for i, d in enumerate(durations)), reverse=True))[0]
 
 
 def split(tests: list[tuple[int, int]]) -> list[list[int]]:
     """tests: (duration in ms, test number). Returns the workers' test numbers."""
     if not tests:
         return []
-    items = sorted(tests, reverse=True)
-    best_cost = None
-    best_workers: list[list[int]] = []
-    for worker_count in range(1, min(MAX_WORKERS, len(items)) + 1):
-        load, workers = _best_for(items, worker_count)
-        occupied = [worker for worker in workers if worker]
-        cost = load + WORKER_COST_MS * len(occupied)
-        if best_cost is None or cost < best_cost:
-            best_cost = cost
-            best_workers = occupied
-        if load == items[0][0]:
-            # The busiest worker is already down to the single longest test.
-            break
-    return best_workers
+    return _plan(sorted(tests, reverse=True))[1]

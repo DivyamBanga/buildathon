@@ -28,12 +28,53 @@ import unittest
 
 POOL_WORKERS = 2
 
+# (loader kind, fixture file as the test names it) -> the pinned file's case
+# numbers worth running. A fixture-driven test loops over independent cases;
+# a case the patch cannot reach behaves as it did at the pinned commit, where
+# it passed, so it is left out. Cases the patch itself adds or edits always run.
+CASE_FILTER: dict = {}
+# Calls made to the fixture loaders, for the offline tracer: (kind, file, cases).
+LOADER_CALLS: list = []
+# Called with (kind, file, index) just before a case is handed to the test.
+CASE_HOOK = None
+
+_redirects: dict = {}
+_bypass_redirects = False
+_pinned_fixtures = ""
+_changed_fixtures: set = set()
+
+
+def _cap_duckdb_threads() -> None:
+    """Keep DuckDB to two threads per connection.
+
+    It otherwise starts one per core of the host, and threads count against
+    the container's limit of 256 processes.
+    """
+    try:
+        import duckdb
+    except Exception:
+        return
+    original = duckdb.connect
+    if getattr(original, "_br_capped", False):
+        return
+
+    def connect(*args, **kwargs):
+        if len(args) < 3:
+            config = dict(kwargs.get("config") or {})
+            config.setdefault("threads", 2)
+            kwargs["config"] = config
+        return original(*args, **kwargs)
+
+    connect._br_capped = True
+    duckdb.connect = connect
+
 
 def warm_up(root: str, test_files: list[str]) -> None:
     """Import every test module, as pytest's collection does before any test runs."""
     if root not in sys.path:
         sys.path.insert(0, root)
     os.chdir(root)
+    _cap_duckdb_threads()
     for path in test_files:
         importlib.import_module(path[:-3].replace("/", "."))
 
@@ -87,19 +128,21 @@ def build_overlay(root: str, destination: str, changes: dict) -> None:
 
 def _install_redirects(redirects: dict) -> None:
     real_open = builtins.open
+    _redirects.update(redirects)
 
     def patched_open(file, *args, **kwargs):
-        if type(file) is str:
-            target = redirects.get(os.path.abspath(file))
-            if target is not None:
-                file = target
-        elif isinstance(file, (bytes, os.PathLike)):
-            try:
-                target = redirects.get(os.path.abspath(os.fsdecode(file)))
-            except Exception:
-                target = None
-            if target is not None:
-                file = target
+        if not _bypass_redirects:
+            if type(file) is str:
+                target = _redirects.get(os.path.abspath(file))
+                if target is not None:
+                    file = target
+            elif isinstance(file, (bytes, os.PathLike)):
+                try:
+                    target = _redirects.get(os.path.abspath(os.fsdecode(file)))
+                except Exception:
+                    target = None
+                if target is not None:
+                    file = target
         return real_open(file, *args, **kwargs)
 
     builtins.open = patched_open
@@ -127,11 +170,157 @@ def _purge(root: str) -> None:
     importlib.invalidate_caches()
 
 
-def _patch_pools() -> None:
-    """Make the tests' process pools fork from this (patched) process.
+def _case_key(item):
+    if isinstance(item, tuple):
+        return tuple(tuple(sorted(part.items())) if isinstance(part, dict) else part for part in item)
+    return item
 
-    The tests ask for spawned workers, which would import the unpatched tree in
-    hot mode and cost a fresh interpreter each either way.
+
+def _wrap_loader(kind: str, original, helpers):
+    def loader(filename):
+        global _bypass_redirects
+        allowed = CASE_FILTER.get((kind, filename))
+        if allowed is None and CASE_HOOK is None:
+            yield from original(filename)
+            return
+        items = list(original(filename))
+        LOADER_CALLS.append((kind, filename, len(items)))
+        if "tests/fixtures/" + filename in _changed_fixtures:
+            # Number the cases as the pinned file has them; edited or added
+            # cases have no number there and always run.
+            saved = helpers.FIXTURES_DIR
+            helpers.FIXTURES_DIR = _pinned_fixtures
+            _bypass_redirects = True
+            try:
+                pinned = list(original(filename))
+            finally:
+                helpers.FIXTURES_DIR = saved
+                _bypass_redirects = False
+            numbers: dict = {}
+            for index, item in enumerate(pinned):
+                numbers.setdefault(_case_key(item), []).append(index)
+            twins = [numbers.get(_case_key(item)) for item in items]
+        else:
+            twins = [[index] for index in range(len(items))]
+        for item, indexes in zip(items, twins):
+            if allowed is None or indexes is None or not allowed.isdisjoint(indexes):
+                if CASE_HOOK is not None and indexes:
+                    CASE_HOOK(kind, filename, indexes[0])
+                yield item
+
+    loader._br_wrapped = True
+    return loader
+
+
+# The TPC-H and TPC-DS tables TestExecutor.setUpClass parses from CSV, built
+# once by the coordinator at the pinned commit (see build_executor_tables).
+EXECUTOR_TABLES = None
+
+
+class _NoConnection:
+    def execute(self, *args, **kwargs):
+        return self
+
+    def close(self) -> None:
+        pass
+
+
+def build_executor_tables() -> None:
+    """Run the executor tests' class setup once, without DuckDB, and keep its tables.
+
+    Parsing the CSVs costs more than most executor tests. A child reuses these
+    tables only for a patch that touches nothing the setup executes or reads
+    (maps/setup.json), so they are exactly what its own setup would have built.
+    """
+    global EXECUTOR_TABLES
+    import duckdb
+
+    test_class = sys.modules["tests.test_executor"].TestExecutor
+    real_connect = duckdb.connect
+    duckdb.connect = lambda *args, **kwargs: _NoConnection()
+    try:
+        test_class.setUpClass()
+    finally:
+        duckdb.connect = real_connect
+    EXECUTOR_TABLES = (test_class.tpch_tables, test_class.tpcds_tables)
+    for name in ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"):
+        if name in test_class.__dict__:
+            delattr(test_class, name)
+
+
+def _use_executor_tables() -> None:
+    """Make TestExecutor.setUpClass skip the CSV parsing and take the prebuilt tables."""
+    module = sys.modules["tests.test_executor"]
+    test_class = module.TestExecutor
+    original = test_class.__dict__["setUpClass"].__func__
+    tpch_tables, tpcds_tables = EXECUTOR_TABLES
+
+    class _HeaderOnly:
+        @staticmethod
+        def reader(*args, **kwargs):
+            return iter([[]])
+
+    def setUpClass(cls):
+        saved = module.csv, module.Table, module.open_file
+        module.csv = _HeaderOnly
+        module.open_file = lambda name: ()
+        module.Table = lambda columns, rows: None
+        try:
+            original(cls)
+        finally:
+            module.csv, module.Table, module.open_file = saved
+        cls.tpch_tables = dict(tpch_tables)
+        cls.tpcds_tables = dict(tpcds_tables)
+
+    test_class.setUpClass = classmethod(setUpClass)
+
+
+# (module, attribute, case name): module-level collections a test loops over,
+# each member an independent case, sliced like fixture cases (kind "members").
+ENUMERATIONS = (("tests.test_generator", "Dialects", "Dialects@tests/test_generator.py"),)
+
+
+class _Members:
+    """Stands in for a collection a test loops over, leaving out filtered members."""
+
+    def __init__(self, original, name: str) -> None:
+        self._original = original
+        self._name = name
+
+    def __iter__(self):
+        allowed = CASE_FILTER.get(("members", self._name))
+        members = list(self._original)
+        LOADER_CALLS.append(("members", self._name, len(members)))
+        for index, member in enumerate(members):
+            if allowed is None or index in allowed:
+                if CASE_HOOK is not None:
+                    CASE_HOOK("members", self._name, index)
+                yield member
+
+    def __getattr__(self, attribute):
+        return getattr(self._original, attribute)
+
+    def __call__(self, *args, **kwargs):
+        return self._original(*args, **kwargs)
+
+    def __getitem__(self, key):
+        return self._original[key]
+
+    def __contains__(self, item):
+        return item in self._original
+
+    def __len__(self):
+        return len(self._original)
+
+
+def _patch_test_modules() -> None:
+    """Adapt the test modules' helpers to this process.
+
+    Process pools: the tests ask for spawned workers, which would import the
+    unpatched tree in hot mode and cost a fresh interpreter each either way, so
+    they get workers forked from this (patched) process instead.
+
+    Fixture loaders: wrapped so that CASE_FILTER can leave out cases.
     """
     import concurrent.futures
     import multiprocessing
@@ -141,17 +330,48 @@ def _patch_pools() -> None:
     def get_context(method=None):
         return fork
 
-    def pool(max_workers=None, mp_context=None, *args, **kwargs):
-        return concurrent.futures.ProcessPoolExecutor(
-            max_workers or POOL_WORKERS, fork, *args, **kwargs
-        )
+    class Pool(concurrent.futures.ProcessPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None, *args, **kwargs):
+            super().__init__(max_workers or POOL_WORKERS, fork, *args, **kwargs)
 
+        def __exit__(self, exc_type, exc_value, traceback):
+            if exc_type is not None:
+                # The test has already failed: do not wait for the queued work.
+                processes = list((self._processes or {}).values())
+                self.shutdown(wait=False, cancel_futures=True)
+                for process in processes:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                return False
+            return super().__exit__(exc_type, exc_value, traceback)
+
+    loaders = (("pairs", "load_sql_fixture_pairs"), ("lines", "load_sql_fixtures"))
+    helpers = sys.modules.get("tests.helpers")
+    if helpers is not None:
+        for _kind, attribute in loaders:
+            if not hasattr(helpers, "_br_" + attribute) and hasattr(helpers, attribute):
+                setattr(helpers, "_br_" + attribute, getattr(helpers, attribute))
     for name, module in list(sys.modules.items()):
-        if name.startswith("tests.") and module is not None:
-            if getattr(module, "get_context", None) is not None:
-                module.get_context = get_context
-            if getattr(module, "ProcessPoolExecutor", None) is not None:
-                module.ProcessPoolExecutor = pool
+        if module is None or not (name == "tests" or name.startswith("tests.")):
+            continue
+        if getattr(module, "get_context", None) is not None:
+            module.get_context = get_context
+        if getattr(module, "ProcessPoolExecutor", None) is not None:
+            module.ProcessPoolExecutor = Pool
+        if helpers is not None:
+            for kind, attribute in loaders:
+                original = getattr(helpers, "_br_" + attribute, None)
+                if original is not None and getattr(module, attribute, None) is original:
+                    setattr(module, attribute, _wrap_loader(kind, original, helpers))
+    for module_name, attribute, name in ENUMERATIONS:
+        module = sys.modules.get(module_name)
+        current = getattr(module, attribute, None) if module is not None else None
+        if current is None or isinstance(current, _Members):
+            continue
+        if ("members", name) in CASE_FILTER or CASE_HOOK is not None:
+            setattr(module, attribute, _Members(current, name))
 
 
 class _Result(unittest.TestResult):
@@ -207,7 +427,7 @@ class _Result(unittest.TestResult):
         pass
 
 
-def _run_tests(tests: list[tuple[int, str]], emit) -> None:
+def run_tests(tests: list[tuple[int, str]], emit) -> None:
     groups: list[tuple[str, str, list[tuple[int, str]]]] = []
     for index, test_id in tests:
         path, class_name, method = test_id.split("::")
@@ -236,7 +456,7 @@ def _run_tests(tests: list[tuple[int, str]], emit) -> None:
             cases.append(case)
         if not cases:
             continue
-        _patch_pools()
+        _patch_test_modules()
         result = _Result(emit)
         unittest.TestSuite(cases).run(result)
         started = set(result.started)
@@ -251,6 +471,7 @@ def _run_tests(tests: list[tuple[int, str]], emit) -> None:
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
+    global _pinned_fixtures, _changed_fixtures
     code = 0
     try:
         os.setpgid(0, 0)
@@ -273,6 +494,10 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             # Any Python a test starts must see the patched tree too.
             os.environ["PYTHONPATH"] = overlay
         sys.dont_write_bytecode = True
+        _pinned_fixtures = os.path.join(root, "tests", "fixtures")
+        _changed_fixtures = set(changes)
+        CASE_FILTER.clear()
+        CASE_FILTER.update(job.get("cases") or {})
         if job["mode"] == "clean":
             _purge(root)
             sys.path.insert(0, overlay)
@@ -283,7 +508,15 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
                 _install_redirects(
                     {path: os.path.join(overlay, os.path.relpath(path, root)) for path in job["redirects"]}
                 )
-        _run_tests(job["tests"], emit)
+            if job.get("executor_tables") and EXECUTOR_TABLES is not None:
+                _use_executor_tables()
+        for path in job.get("imports") or ():
+            # pytest fails every test of a file it cannot import.
+            try:
+                importlib.import_module(path[:-3].replace("/", "."))
+            except BaseException:
+                emit(f"B {path}\n")
+        run_tests(job["tests"], emit)
         emit("D\n")
     except BaseException as error:  # noqa: BLE001 - the coordinator decides what to do
         code = 1

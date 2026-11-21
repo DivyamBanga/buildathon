@@ -1,11 +1,13 @@
-"""Offline tracer used to build the dependency map (never shipped in the image's
-runtime path). Auto-imported by every Python process whose PYTHONPATH holds this
-directory. When BR_TRACE_DIR is set, it records, for the whole life of the
-process:
+"""Offline tracer used to build the dependency map (never part of the image).
+
+Auto-imported by every Python process whose PYTHONPATH holds this directory.
+When BR_TRACE_DIR is set, it records, for the whole life of the process:
 
   L <file> <code firstlineno> <line>   every (code object, line) executed in sqlglot's tree
   O <path>                             every file opened under the sqlglot checkout
   D <path>                             every directory listed under the sqlglot checkout
+  C <file> <qualname>                  every class of sqlglot's tree that was instantiated,
+                                       and each of its base classes (BR_TRACE_CLASSES=1)
 
 Each process appends to its own file, so the union of the files in the
 directory is everything one isolated test run touched, child processes included.
@@ -24,13 +26,30 @@ if _DIR:
     _DISABLE = _mon.DISABLE
     _seen = []
     _files = set()
-    _path = os.path.join(_DIR, f"{os.getpid()}.txt")
+    _classes = set()
+    _getframe = sys._getframe
 
     def _on_line(code, line):
         filename = code.co_filename
         if filename.startswith(_ROOT):
             _seen.append((filename, code.co_firstlineno, line))
         return _DISABLE
+
+    def _on_start(code, offset):
+        # Only constructors stay monitored; `self` tells which class was built.
+        if code.co_name != "__init__" or not code.co_argcount:
+            return _DISABLE
+        try:
+            _classes.add(type(_getframe(1).f_locals[code.co_varnames[0]]))
+        except Exception:
+            pass
+        return None
+
+    def _on_call(code, offset, target, argument):
+        # A class called directly (covers classes with no Python-level __init__).
+        if isinstance(target, type):
+            _classes.add(target)
+        return None
 
     def _audit(event, args):
         if event == "open":
@@ -52,28 +71,64 @@ if _DIR:
                 if path.startswith(_ROOT) and "__pycache__" not in path:
                     _files.add("D " + path)
 
+    _kind = "L"
+
+    def _mark():
+        """From here on, lines are recorded afresh and written as `P` rows.
+
+        Used when tracing one fixture case: everything that runs after the case
+        is handed to the test belongs to that case.
+        """
+        global _kind
+        if _kind == "L":
+            _dump()
+            _kind = "P"
+            _mon.restart_events()
+
     def _dump():
         global _seen
         seen, _seen = _seen, []
-        files = sorted(_files)
+        rows = sorted(_files)
         _files.clear()
-        if not seen and not files:
+        classes = list(_classes)
+        _classes.clear()
+        for cls in classes:
+            try:
+                bases = cls.__mro__
+            except Exception:
+                continue
+            for base in bases:
+                module = sys.modules.get(getattr(base, "__module__", None) or "")
+                origin = getattr(module, "__file__", None) or ""
+                if origin.startswith(_ROOT):
+                    rows.append(f"C {origin} {base.__qualname__}")
+        if not seen and not rows:
             return
-        with open(_path, "a", encoding="utf-8") as handle:
+        with open(os.path.join(_DIR, f"{os.getpid()}.txt"), "a", encoding="utf-8") as handle:
             for filename, first, line in seen:
-                handle.write(f"L {filename} {first} {line}\n")
-            for entry in files:
+                handle.write(f"{_kind} {filename} {first} {line}\n")
+            for entry in rows:
                 handle.write(entry + "\n")
 
+    _events = _mon.events.LINE
     _mon.use_tool_id(_TOOL, "blast-radius-trace")
     _mon.register_callback(_TOOL, _mon.events.LINE, _on_line)
-    _mon.set_events(_TOOL, _mon.events.LINE)
+    if os.environ.get("BR_TRACE_CLASSES"):
+        _mon.register_callback(_TOOL, _mon.events.PY_START, _on_start)
+        _mon.register_callback(_TOOL, _mon.events.CALL, _on_call)
+        _events |= _mon.events.PY_START | _mon.events.CALL
+    _mon.set_events(_TOOL, _events)
     sys.addaudithook(_audit)
     atexit.register(_dump)
     try:
-        # multiprocessing children leave through os._exit and skip atexit.
+        # multiprocessing children leave through os._exit and skip atexit; a
+        # forked child also forgets its parent's finalizers, so re-register there.
         from multiprocessing import util as _util
 
-        _util.Finalize(None, _dump, exitpriority=-100)
+        def _arm(_=None):
+            _util.Finalize(None, _dump, exitpriority=-100)
+
+        _arm()
+        _util.register_after_fork(_dump, _arm)
     except Exception:
         pass
