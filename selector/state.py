@@ -648,6 +648,36 @@ class Comparer:
         return self.differences
 
 
+def watchable(cls: type, name: str, value) -> bool:
+    """True for a class attribute that is plain data: something code can only use by reading it.
+
+    Such an attribute can be watched (tools/build_executor_memo.py puts a
+    descriptor in its place that notes every read, through the class, a
+    subclass or an instance). Not methods and other descriptors (using them
+    runs their code), not the names Python itself looks up, not the members of
+    an enum.
+    """
+    if name.startswith("__") and name.endswith("__"):
+        return False
+    if isinstance(cls, enum.EnumMeta):
+        return False
+    return not callable(value) and not hasattr(type(value), "__get__")
+
+
+def watchable_pair(world: dict, module: str, qualname: str, name: str) -> bool:
+    """The same for a (class, attribute) named as the comparison reports it, looked up in `world`
+    (module name -> module). False when the class or the attribute is not there."""
+    found = world.get(module)
+    for part in qualname.split("."):
+        try:
+            found = vars(found)[part]
+        except (KeyError, TypeError):
+            return False
+    if not isinstance(found, type) or name not in vars(found):
+        return False
+    return watchable(found, name, vars(found)[name])
+
+
 def plan_changes(plan) -> dict:
     """path -> new text (None: removed) for every file the plan's patch changes."""
     changes: dict = {}

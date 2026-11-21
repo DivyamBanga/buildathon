@@ -12,6 +12,7 @@ ways and then runs tests with unittest, stopping each test at its first failure:
 Messages to the coordinator, one per line on the pipe:
   S <index>            test started
   R <index> <0|1>      test finished, 1 = failed
+  C <index>            the class of this test raised after its tests had run
   X <text>             the child could not do its job
   D                    all done
 """
@@ -1208,8 +1209,9 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
             # setUpClass failed, so pytest reports an error for each of them.
             emit(f"R {index} 1\n")
         if result.holders and not never:
-            # A class teardown error is reported against the last test that ran.
-            emit(f"R {cases[-1]._br_index} 1\n")
+            # A class teardown error: pytest reports it against the last test of
+            # the class. Which one that is, the coordinator knows.
+            emit(f"C {cases[-1]._br_index}\n")
 
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:

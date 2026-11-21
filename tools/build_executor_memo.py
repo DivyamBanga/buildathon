@@ -27,6 +27,7 @@ sys.path.insert(0, "/repo")
 from selector import runner  # noqa: E402
 
 memo_path, phase_path = sys.argv[1], sys.argv[2]
+attrs_path = sys.argv[3] if len(sys.argv) > 3 else None
 trace_dir = os.environ.get("BR_TRACE_DIR")
 record_dir = "/tmp/execmemo-records"
 shutil.rmtree(record_dir, ignore_errors=True)
@@ -82,6 +83,108 @@ for name in os.listdir(record_dir):
 with open(memo_path, "wb") as handle:
     handle.write(zlib.compress(pickle.dumps(memo, protocol=4), 9))
 print(f"{len(memo)} results, {os.path.getsize(memo_path)} bytes")
+
+if attrs_path:
+    # Which class attributes does the phase read? Every plain data attribute of
+    # every class of sqlglot gets a descriptor that notes a read (through the
+    # class, a subclass or an instance) while the phase is on. The whole
+    # package is imported first, so that classes of modules imported on demand
+    # are watched too, and the tests run in the same orders as above, each in a
+    # fresh process: what is built on first use is then read inside the phase
+    # by whichever test comes first.
+    from selector import state  # noqa: E402
+
+    read_dir = "/tmp/execattrs-records"
+    shutil.rmtree(read_dir, ignore_errors=True)
+    os.makedirs(os.path.join(read_dir, "memo"))
+    watcher = os.fork()
+    if watcher == 0:
+        code = 0
+        try:
+            import importlib
+
+            for name in state.package_modules("/sqlglot"):
+                try:
+                    importlib.import_module(name)
+                except BaseException:  # noqa: BLE001
+                    pass
+            reads: set = set()
+            recording = [False]
+
+            class Watch:
+                __slots__ = ("value", "key")
+
+                def __init__(self, value, key):
+                    self.value = value
+                    self.key = key
+
+                def __get__(self, instance, owner=None):
+                    if recording[0]:
+                        reads.add(self.key)
+                    return self.value
+
+            watched = {}
+            for module in list(sys.modules.values()):
+                module_name = getattr(module, "__name__", "")
+                if not (module_name == "sqlglot" or module_name.startswith("sqlglot.")):
+                    continue
+                pending = [v for v in vars(module).values() if isinstance(v, type) and v.__module__ == module_name]
+                while pending:
+                    cls = pending.pop()
+                    for attr, value in list(vars(cls).items()):
+                        if isinstance(value, type):
+                            if value.__module__ == module_name and value.__qualname__.startswith(cls.__qualname__ + "."):
+                                pending.append(value)
+                            continue
+                        key = f"{module_name}:{cls.__qualname__}|{attr}"
+                        if key in watched or not state.watchable(cls, attr, value):
+                            continue
+                        try:
+                            type.__setattr__(cls, attr, Watch(value, key))
+                        except (AttributeError, TypeError):
+                            reads.add(key)  # cannot be watched: counts as read
+                            continue
+                        watched[key] = (cls, attr)
+            runner.MEMO_RECORD = os.path.join(read_dir, "memo")
+            runner.MEMO_PHASE = lambda kind: recording.__setitem__(0, kind == "X")
+            for number, order in enumerate((names, names[::-1], names[:1], names[1:])):
+                pid = os.fork()
+                if pid == 0:
+                    inner = 0
+                    try:
+                        ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in order]
+                        messages = []
+                        runner.run_tests(list(enumerate(ids)), messages.append)
+                        failed = [m for m in messages if m.startswith("C") or (m.startswith("R") and m.endswith(" 1\n"))]
+                        if failed:
+                            print(f"tests failed while watching attributes: {failed}", flush=True)
+                            inner = 1
+                        # An attribute that was assigned anew is no longer watched: count it as read.
+                        gone = [key for key, (cls, attr) in watched.items() if type(vars(cls).get(attr)) is not Watch]
+                        with open(os.path.join(read_dir, f"reads-{number}.json"), "w") as handle:
+                            json.dump(sorted(reads | set(gone)), handle)
+                    except BaseException as error:  # noqa: BLE001
+                        print(f"watching raised {error!r}", flush=True)
+                        inner = 1
+                    os._exit(inner)
+                _, status = os.waitpid(pid, 0)
+                if status != 0:
+                    code = 1
+            with open(os.path.join(read_dir, "watched.json"), "w") as handle:
+                json.dump(len(watched), handle)
+        except BaseException as error:  # noqa: BLE001
+            print(f"watching raised {error!r}", flush=True)
+            code = 1
+        os._exit(code)
+    _, status = os.waitpid(watcher, 0)
+    if status != 0:
+        raise SystemExit("recording the attributes the phase reads failed")
+    read = set()
+    for name in os.listdir(read_dir):
+        if name.startswith("reads-"):
+            read.update(json.load(open(os.path.join(read_dir, name))))
+    json.dump({"read": sorted(read)}, open(attrs_path, "w"), separators=(",", ":"))
+    print(f"{json.load(open(os.path.join(read_dir, 'watched.json')))} class attributes watched, {len(read)} read in the phase")
 
 if trace_dir:
     if hasattr(tracer, "_dump"):

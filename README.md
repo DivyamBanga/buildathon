@@ -179,7 +179,10 @@ the patched code**, and selects the ones that fail.
        swap nothing else can differ. After a clean import the comparison of
        import state (step 3) lists every module or class attribute that
        differs, and each must be out of that code's sight: a function with
-       other code, defaults or closure must not be one it runs; a constant
+       other code, defaults or closure must not be one it runs; a plain data
+       attribute of a class must not be one it read (`execattrs.json`:
+       recorded with a descriptor in the attribute's place that notes every
+       read through the class, a subclass or an instance); any other constant
        must not be named in any function it runs (`execnames.json`);
        anything else (an attribute added or removed, other bases, a
        difference on the classes the recorded results are made of) turns the
@@ -231,7 +234,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
-| `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it |
+| `execmemo.bin`, `execphase.json`, `execattrs.json` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |

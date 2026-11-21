@@ -199,6 +199,7 @@ class Coordinator:
         self.exec_phase: dict | None = None
         self.exec_ran: set = set()
         self.exec_names: frozenset | None = None
+        self.exec_attrs: frozenset | None = None
         self.record_failed = False
         # ... and when they run their own setup but DuckDB's recorded answers are
         # reused (a clean import, or a patch that touches what the setup runs).
@@ -621,6 +622,10 @@ class Coordinator:
                 self.exec_names = frozenset(json.load(open(os.path.join(MAPS, "execnames.json")))["names"])
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
+            try:
+                self.exec_attrs = frozenset(json.load(open(os.path.join(MAPS, "execattrs.json")))["read"])
+            except (OSError, ValueError, KeyError, TypeError):
+                self.exec_attrs = None
             self.exec_ran = {(path, first) for path, rows in self.exec_phase.items() for first, _ in rows}
         return self.exec_phase
 
@@ -653,13 +658,15 @@ class Coordinator:
         if not self.executor_phase() or self.exec_names is None:
             return False
         for patch in plan.files:
-            # Nothing but existing modules of sqlglot itself: the tests, their
-            # helpers and their data are then what they are at the pinned commit.
+            # Every patched file exists before and after, under the same name.
+            # Code that runs at import is sqlglot's own (probe_ok): only that is
+            # what the comparison of import state covers. What the tests and
+            # their data hand to `execute` needs no assumption, it is checked
+            # where the recorded result would be used (the query's tree, the
+            # tables' content).
             if patch.unapplied or patch.old_text is None or patch.new_text is None:
                 return False
-            if patch.old_path not in (None, patch.path) or not patch.path.startswith("sqlglot/"):
-                return False
-            if not patch.path.endswith(".py"):
+            if patch.old_path not in (None, patch.path):
                 return False
         return not self.touches(plan, self.exec_phase)
 
@@ -674,8 +681,12 @@ class Coordinator:
 
         - a function with other code, defaults or closure is seen by running
           it: it must have no line among those the recorded phase executed;
-        - a constant (a name in capitals) with another value is seen by
-          reading the name: no function the phase runs may mention it
+        - a plain data attribute of a class with another value is seen by
+          reading it, through the class, a subclass or an instance: the
+          recorded phase must not have read it (maps/execattrs.json, taken
+          with a descriptor in the attribute's place);
+        - any other constant (a name in capitals) with another value is seen
+          by reading the name: no function the phase runs may mention it
           (maps/execnames.json, by the same rule as the reader map);
         - anything else (attributes added or removed, other bases, anything on
           the classes the recorded results are made of) counts as seen.
@@ -693,7 +704,18 @@ class Coordinator:
                 if (path, first) in self.exec_ran or self.covmap.is_loader(path, first):
                     return False
                 continue
-            if reason == "value" and attribute in known and attribute.isupper() and attribute not in self.exec_names:
+            if reason != "value":
+                return False
+            if (
+                _kind == "class"
+                and self.exec_attrs is not None
+                and state.PINNED is not None
+                and state.watchable_pair(state.PINNED[2], module, _qualname, attribute)
+            ):
+                if f"{module}:{_qualname}|{attribute}" in self.exec_attrs:
+                    return False
+                continue
+            if attribute in known and attribute.isupper() and attribute not in self.exec_names:
                 continue
             return False
         return True
@@ -1033,6 +1055,16 @@ class Coordinator:
                     run.job.failed.add(bit)
                     if not run.job.replanned and self.replan(run):
                         return
+            elif kind == b"C":
+                # The class teardown raised. pytest holds that against the test
+                # of the class it ran last, which is the last one it collected,
+                # whether or not that test was run here.
+                name = self.bit_class[int(line[2:])]
+                members = [
+                    bit for bit, other in enumerate(self.bit_class) if other == name and self.bit_number[bit] >= 0
+                ]
+                if members:
+                    run.job.failed.add(max(members, key=self.bit_number.__getitem__))
             elif kind == b"E":
                 try:
                     run.state = json.loads(line[2:])
@@ -1108,6 +1140,15 @@ class Coordinator:
         if run.current is not None and run.current in left:
             job.failed.add(run.current)
             left.remove(run.current)
+            if not job.replanned and left:
+                # A test that had to be stopped counts as a failure: the change is
+                # real, and what is left is weighed again as after any first failure.
+                job.replanned = True
+                _, blind = self.weigh(left, job.estimates, list(job.blind | job.failed), PASS_LIVE)
+                if blind:
+                    job.blind.update(blind)
+                    dropped = set(blind)
+                    left = [bit for bit in left if bit not in dropped]
         elif not run.done:
             job.strikes += 1
         if not left:
