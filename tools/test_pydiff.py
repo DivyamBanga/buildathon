@@ -467,4 +467,49 @@ expect("nested lambda removed", changed_of(diff_of(NEST_L, new)), [("G", True), 
 # a scope whose own code is unchanged but whose children do not line up is not trusted
 expect("last line", pydiff.last_line(compile("def f():\n    x = 1\n    return x\n", "m", "exec")), 3)
 
+# a function whose position moved because of an insertion above it: the old lines it changed are found
+# through the line mapping, and only where the paired function really stands
+import difflib
+
+
+def mapped_lines(old_text, new_text, function):
+    """Old lines `analyze` would name for `function` (None: the whole function), as analyze does it."""
+    body = "".join(difflib.unified_diff(old_text.splitlines(True), new_text.splitlines(True), "a/m.py", "b/m.py", n=3))
+    patch = patchlib.parse("diff --git a/m.py b/m.py\nindex 0000000..1111111 100644\n" + body)[0]
+    patchlib.apply(patch, old_text)
+    diff = pydiff.diff_code(compile(old_text, "/x/m.py", "exec"), compile(new_text, "/x/m.py", "exec"))
+    for old, new in diff.changed:
+        if old.co_name != function or new is None:
+            continue
+        first = old.co_firstlineno
+        last = None
+        for node in ast.walk(ast.parse(old_text)):
+            if isinstance(node, ast.FunctionDef) and node.name == function:
+                last = node.end_lineno
+        new_first, new_last = patch.new_line(first), patch.new_line(last)
+        if (
+            new_first is not None
+            and new_last is not None
+            and new.co_firstlineno == new_first
+            and pydiff.last_line(new) <= new_last
+        ):
+            return pydiff.changed_lines_in_function(
+                old_text.splitlines(True), patch.new_text.splitlines(True), (first, last), (new_first, new_last)
+            )
+        return None
+    return "unchanged"
+
+
+SRC = "import os\n\n\ndef top(a):\n    b = a + 1\n    if b:\n        b += 2\n    return b\n\n\ndef last(x):\n    return x\n"
+expect("moved function, edit inside", mapped_lines(SRC, SRC.replace("import os\n", "import os\n\n\ndef new_one():\n    return 1\n").replace("b += 2", "b += 3"), "top"), {7})
+expect("moved function, nothing else", mapped_lines(SRC, SRC.replace("import os\n", "import os\n\n\ndef new_one():\n    return 1\n"), "top"), "unchanged")
+# a statement appended after the old last line of the function is not cut off
+SRC2 = "def top(a):\n    b = a + 1\n    if b:\n        b += 2\n\n\ndef last(x):\n    return x\n"
+expect("statement appended", mapped_lines(SRC2, SRC2.replace("        b += 2\n", "        b += 2\n    b *= 9\n").replace("a + 1", "a + 3"), "top"), None)
+# ... which the old code, without the guard, would have reported as just the edited line
+expect("statement appended, unguarded", pydiff.changed_lines_in_function(SRC2.splitlines(True), SRC2.replace("        b += 2\n", "        b += 2\n    b *= 9\n").replace("a + 1", "a + 3").splitlines(True), (1, 4), (1, 4)), {2})
+# a decorator added above: the function now starts elsewhere
+DEC2 = "import os\n\n\ndef top(a):\n    return a + 1\n"
+expect("decorator added", mapped_lines(DEC2, DEC2.replace("def top", "@staticmethod\ndef top").replace("a + 1", "a + 2"), "top"), None)
+
 print(f"{checks} checks passed")
