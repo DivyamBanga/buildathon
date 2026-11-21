@@ -142,6 +142,19 @@ check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"u": pinned["u"]})}) 
 pinned["u"].rows[0] = kept[0]
 nested = Tables({"db": {"t": pinned["t"]}})
 check(runner.memo_key("tpcds", "d", (), {"tables": nested}) is None, "nested tables are not recognised")
+# Query by query: a recorded result is used only when the query's own record touches nothing the patch changes.
+runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01)}
+runner.MEMO_BLOCK = None
+check(runner._query_untouched("k") and runner._query_untouched("unknown"), "nothing changed in the phase: every query keeps its result")
+for block, expected in (((0b1000, 0), True), ((0b0100, 0), False), ((0, 0b01), False), ((0b1001, 0b10), True), ((0b0010, 0b10), False)):
+    runner.MEMO_BLOCK = block
+    check(runner._query_untouched("k") is expected, f"lines and attributes {block}: kept is {expected}")
+check(not runner._query_untouched("unknown"), "a query with no record of its own is executed once anything changed")
+runner.MEMO_BLOCK = None
+queries = runner.read_executor_queries("/repo/maps/execqueries.bin")
+check(len(queries) == 57 and all(type(a) is int and type(b) is int and a for a, b in queries.values()), "the per-query record reads back")
+check(runner.read_executor_queries("/repo/maps/no-such-file") == {}, "a missing per-query record is an empty one")
+
 # Which class attributes can be watched for reads (state.watchable), and how a pair is looked up.
 from selector import state  # noqa: E402
 from sqlglot import generator  # noqa: E402

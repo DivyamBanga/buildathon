@@ -56,6 +56,7 @@ def outer_functions(body):
 
 
 names = set()
+where = {}  # name -> [[path, first line, last line]] of the code that mentions it
 functions = 0
 whole_files = []
 for path, rows in sorted(phase.items()):
@@ -83,14 +84,22 @@ for path, rows in sorted(phase.items()):
                 break
             for node in holders:
                 names |= names_in(node)
+                for name in names_in(node):
+                    where.setdefault(name, []).append([path, node.lineno, node.end_lineno])
     if used is None:
         whole_files.append(path)
         names |= names_in(tree)
+        for name in names_in(tree):
+            where.setdefault(name, []).append([path, 1, 10**9])
         continue
     functions += len(used)
     for index in used:
-        names |= names_in(spans[index][2])
+        first, last, node = spans[index]
+        names |= names_in(node)
+        for name in names_in(node):
+            where.setdefault(name, []).append([path, first, last])
 
 constants = sorted(name for name in names if CONSTANT_LIKE.match(name))
-json.dump({"names": constants}, open(out_path, "w"), separators=(",", ":"))
+spans_of = {name: sorted(map(list, {tuple(span) for span in where[name]})) for name in constants}
+json.dump({"names": constants, "where": spans_of}, open(out_path, "w"), separators=(",", ":"))
 print(f"{len(phase)} files, {functions} functions, {len(constants)} constant names; whole files: {whole_files}")

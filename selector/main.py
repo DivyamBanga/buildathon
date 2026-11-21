@@ -200,7 +200,7 @@ class Coordinator:
         self.memo_cost: dict[int, float] = {}
         self.exec_phase: dict | None = None
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
-        self.exec_names: frozenset | None = None
+        self.exec_names: dict | None = None
         self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
         self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
@@ -622,7 +622,8 @@ class Coordinator:
             except (OSError, ValueError):
                 self.exec_phase = {}
             try:
-                self.exec_names = frozenset(json.load(open(os.path.join(MAPS, "execnames.json")))["names"])
+                # name -> [[path, first line, last line]]: the code of the phase that mentions it
+                self.exec_names = json.load(open(os.path.join(MAPS, "execnames.json")))["where"]
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
@@ -641,6 +642,17 @@ class Coordinator:
                     number += 1
             self.exec_queries = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
         return self.exec_phase
+
+    def lines_naming(self, name: str) -> int:
+        """Bit mask of the phase lines inside the code that mentions `name`."""
+        mask = 0
+        for path, start, end in self.exec_names.get(name, ()):
+            for (row_path, _first), rows in self.exec_rows.items():
+                if row_path == path:
+                    for line, number in rows:
+                        if start <= line <= end:
+                            mask |= 1 << number
+        return mask
 
     def phase_lines(self, units: dict) -> int:
         """Bit mask of the phase lines that belong to the changed code in `units`
@@ -693,6 +705,8 @@ class Coordinator:
             mine = [entry for key, entry in self.exec_queries.items() if key.startswith(f"{scope}:")]
             touched = sum(1 for own_rows, own_reads in mine if own_rows & rows or own_reads & reads)
             job.memo_share[scope] = touched / len(mine) if mine else 1.0
+            if mine:
+                job.plan.note(f"the patch concerns the execution of {touched} of {len(mine)} recorded {scope} queries")
         return job.memo_share[scope]
 
     def clean_memo_possible(self, job: Job) -> bool:
@@ -734,7 +748,7 @@ class Coordinator:
           that attribute, if the recorded phase read it (maps/execattrs.json,
           taken with a descriptor in the attribute's place);
         - any other constant (a name in capitals) with another value is seen
-          by reading the name: no function the phase runs may mention it
+          by reading the name: through the lines of the code that mentions it
           (maps/execnames.json, by the same rule as the reader map);
         - anything else (attributes added or removed, other bases, anything on
           the classes the recorded results are made of) cannot be pinned down.
@@ -748,27 +762,37 @@ class Coordinator:
         rows = self.phase_lines(job.plan.units)
         reads = 0
         for kind, module, qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
-            if module == "sqlglot.executor.table":
+            where = f"{module}:{qualname}.{attribute}" if qualname else f"{module}.{attribute}"
+            if module == "sqlglot.executor.table" and reason not in ("function-meta", "function-code"):
+                # What the recorded results are made of.
+                job.plan.note(f"no recorded results: {where} differs")
                 return None
             if reason in ("function-meta", "function-code") and path:
                 if self.covmap.is_loader(path, first):
+                    job.plan.note(f"no recorded results: {where} imports on demand")
                     return None
                 rows |= self.phase_lines({path: [(first, None)]})
                 continue
-            if reason != "value":
-                return None
             if (
                 kind == "class"
+                and reason in ("value", "removed")
                 and self.exec_attrs is not None
                 and state.PINNED is not None
                 and state.watchable_pair(state.PINNED[2], module, qualname, attribute)
             ):
+                # Another value, or gone: either way only a read of it can tell.
                 number = self.exec_attrs.get(f"{module}:{qualname}|{attribute}")
                 if number is not None:
                     reads |= 1 << number
                 continue
-            if attribute in known and attribute.isupper() and attribute not in self.exec_names:
+            if reason != "value":
+                job.plan.note(f"no recorded results: {where} {reason}")
+                return None
+            if attribute in known and attribute.isupper():
+                # Read by name: seen by the queries that run code mentioning it.
+                rows |= self.lines_naming(attribute)
                 continue
+            job.plan.note(f"no recorded results: {where} may be read by the executor")
             return None
         return rows, reads
 
