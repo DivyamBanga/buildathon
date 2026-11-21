@@ -278,5 +278,20 @@ if duckdb is not None:
         runner._frame_from_tables(Logged, ("CREATE TABLE b (x INT)",), "SELECT 1 AS k") is None,
         "a setup of anything but CSV views has no table copies",
     )
+    import pandas
+
+    base = pandas.DataFrame({"k": [1, 2], "v": [0.1 + 0.2, float("nan")], "s": ["a", None]})
+    for other, expected, what in (
+        (base.copy(), True, "a copy"),
+        (base.assign(v=[0.3, float("nan")]), True, "a sum taken in another order"),
+        (base.assign(v=[0.3000001, float("nan")]), False, "another value in the seventh digit"),
+        (base.assign(k=[1, 3]), False, "another integer"),
+        (base.assign(k=[1.0, 2.0]), False, "another type"),
+        (base.assign(s=["a", "b"]), False, "a value where there was none"),
+        (base.rename(columns={"k": "j"}), False, "another column name"),
+        (base.iloc[::-1].reset_index(drop=True), False, "the rows in another order"),
+        (base.iloc[:1], False, "fewer rows"),
+    ):
+        check(runner._same_frames(base, other) is expected, f"_same_frames: {what} should be {expected}")
 
 print(f"{checks} checks passed")

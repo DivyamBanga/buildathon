@@ -460,6 +460,23 @@ def _table_copies(connect, statements: tuple):
     return _TABLE_COPIES[statements]
 
 
+def _same_frames(one, other) -> bool:
+    """Two result frames are the same: names, types and every value, floating-point values to nine digits."""
+    import numpy
+
+    if list(one.columns) != list(other.columns) or len(one) != len(other) or list(one.dtypes) != list(other.dtypes):
+        return False
+    for position in range(one.shape[1]):
+        left, right = one.iloc[:, position], other.iloc[:, position]
+        if left.dtype.kind == "f":
+            # Sums taken in another order differ in their last digits, never in the ninth.
+            if not numpy.allclose(left.to_numpy(), right.to_numpy(), rtol=1e-9, atol=0.0, equal_nan=True):
+                return False
+        elif not left.equals(right):
+            return False
+    return True
+
+
 def _frame_from_tables(connect, statements: tuple, query: str):
     """DuckDB's answer to a plain SELECT over the setup's views, computed on tables; None when it cannot be vouched for.
 
@@ -480,17 +497,14 @@ def _frame_from_tables(connect, statements: tuple, query: str):
     if copies is None:
         return None
     try:
-        from pandas.testing import assert_frame_equal
-
         frame = copies[0].execute(query).fetchdf()
         other = copies[1].execute(query).fetchdf()
-        # Exact but for the rounding of sums taken in another order.
-        assert_frame_equal(frame, other, check_exact=False, rtol=1e-9, atol=0.0)
+        same = _same_frames(frame, other)
     except BaseException as error:  # noqa: BLE001 - whatever it is, the real connection will say
         if isinstance(error, (KeyboardInterrupt, SystemExit, MemoryError)):
             raise
         return None
-    return frame
+    return frame if same else None
 
 
 class _Frame:
