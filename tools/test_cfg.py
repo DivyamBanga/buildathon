@@ -35,6 +35,10 @@ FILES = {
     "setup.cfg": SETUP,
     "sqlglotc/pyproject.toml": PYPROJECT,
     "tests/setup.cfg": SETUP,
+    "tests/__init__.py": "",
+    "tests/x.py": "def f():\n    return 1\n",
+    "tests/y.py": "def g():\n    return 2\n",
+    "tests/run.py": "import os\nos.getcwd()\n",
 }
 
 
@@ -80,6 +84,9 @@ with tempfile.TemporaryDirectory() as root:
     everything("setup.cfg: mypy flag", edit("setup.cfg", SETUP, SETUP.replace("False", "True")), False)
     everything("pyproject: comment line", edit("pyproject.toml", PYPROJECT, PYPROJECT + "# a note\n"), False)
     everything("setup.cfg: comment line", edit("setup.cfg", SETUP, SETUP + "# a note\n"), False)
+    everything("setup.cfg: byte that is not UTF-8 added (surrogate escape, as main reads patches)", edit("setup.cfg", SETUP, SETUP + "# caf\udce9\n"), True)
+    # a key spelled with an escape: the changed line does not hold the word
+    everything("pyproject: [tool.\"\\u0070ytest\".ini_options]", edit("pyproject.toml", PYPROJECT, PYPROJECT + '\n[tool."\\u0070ytest".ini_options]\naddopts = "--zz"\n'), True)
     # pytest settings appear
     everything("pyproject: ini_options added", edit("pyproject.toml", PYPROJECT, PYPROJECT + '\n[tool.pytest.ini_options]\naddopts = "-x"\n'), True)
     everything("setup.cfg: [tool:pytest] added", edit("setup.cfg", SETUP, SETUP + "\n[tool:pytest]\naddopts = -x\n"), True)
@@ -97,6 +104,20 @@ with tempfile.TemporaryDirectory() as root:
         "diff --git a/pyproject.toml b/other.toml\nsimilarity index 100%\nrename from pyproject.toml\nrename to other.toml\n"
     )
     everything("pyproject renamed away", rename, True)
+    # a file renamed onto, or away from, a name pytest reads (the runner cannot reproduce what pytest does with it)
+    def move(old, new):
+        return f"diff --git a/{old} b/{new}\nsimilarity index 100%\nrename from {old}\nrename to {new}\n"
+
+    for target in ("tests/conftest.py", "tests/pytest.ini", "tests/tox.ini", "tests/.pytest.toml", "tests/pyproject.toml",
+                   "tests/setup.cfg", "tests/dialects/__init__.py", "tests/sitecustomize.py", "pytest.ini", "conftest.py"):
+        src = "tests/x.py" if target != "tests/setup.cfg" else "tests/y.py"
+        everything("rename onto " + target, move(src, target), True)
+    everything("rename away from tests/__init__.py", move("tests/__init__.py", "tests/other.py"), True)
+    everything("tests/__init__.py deleted", delete("tests/__init__.py"), True)
+    everything("tests/setup.cfg renamed away", move("tests/setup.cfg", "tests/setup.cfg.bak"), True)
+    everything("rename into tests as a test module that runs code", move("tests/run.py", "tests/test_run.py"), True)
+    everything("rename into tests as a test module that only defines tests", move("tests/x.py", "tests/test_x.py"), False)
+    everything("plain rename of a helper", move("tests/x.py", "tests/z.py"), False)
     # a file pytest never looks at keeps today's behaviour (the 'no test opens it' path)
     plan = plan_of(edit("sqlglotc/pyproject.toml", PYPROJECT, PYPROJECT.replace("[project]", "[project")))
     expect("sqlglotc/pyproject.toml broken: not selected", plan.select_all, False)

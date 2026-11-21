@@ -416,6 +416,37 @@ def _config_may_break(patch: patchlib.FilePatch, path: str, old_path: str) -> bo
         return True
 
 
+_PYTEST_FILES = _PYTEST_CONFIG + ("__init__.py", "sitecustomize.py", "usercustomize.py")
+
+
+def _pytest_file_moves(patch: patchlib.FilePatch, path: str, old_path: str) -> str | None:
+    """A file pytest reads for itself that appears, vanishes or moves, by whatever route.
+
+    The rules for new files and for edits in place do not see a rename onto one of
+    these names (or away from one), and the runner, which uses unittest, cannot
+    reproduce what pytest does with them. A file renamed into the test tree under a
+    test name is collected: it must be one that only defines tests.
+    """
+    arrives = patch.new_text is not None and (patch.new_file or old_path != path)
+    leaves = patch.new_text is None or old_path != path
+    if arrives:
+        name = os.path.basename(path)
+        if name in _PYTEST_FILES or (name in _MAYBE_PYTEST_CONFIG and _searched(path)):
+            return f"{path} appears under a name pytest reads"
+        if (
+            old_path != path
+            and path.startswith("tests/")
+            and (name.startswith("test_") or name.endswith("_test.py"))
+            and not pydiff.harmless_new_test_module(patch.new_text or "")
+        ):
+            return f"{path}: a file moved into the tests is collected and does more than define tests"
+    if leaves:
+        name = os.path.basename(old_path)
+        if name in _PYTEST_FILES or (name in _MAYBE_PYTEST_CONFIG and _searched(old_path)):
+            return f"{old_path} vanishes or moves away: a name pytest reads"
+    return None
+
+
 def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     path = patch.path
     old_path = patch.old_path or path
@@ -589,6 +620,11 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note(f"{path}: unchanged")
             continue
         try:
+            moved = _pytest_file_moves(patch, path, old_path)
+            if moved:
+                plan.select_all = True
+                plan.note(moved)
+                continue
             _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
                 _test_file_rules(plan, patch, covmap)
