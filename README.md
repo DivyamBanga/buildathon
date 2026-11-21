@@ -177,6 +177,54 @@ the patched code**, and selects the ones that fail.
    modules, and the enum whose values are the keys): one test file empties
    that registry, and every later test meets it as the tests before left it.
 
+   **Names that nothing reads** (`CovMap.unobservable`, `maps/names.json`). A
+   commit that adds or removes a name (a constant, a function, a class, a
+   method, an import) without editing code in place shows up in the comparison
+   as an "added" or "removed" attribute of a module or class. The comparison
+   still reports it; what is narrowed is who can see it. Such a difference is
+   seen by nobody when nothing at the pinned commit can read the name:
+
+   - *Reads by name*: `named` lists every name the pinned code, its tests,
+     `sqlglotc`, the integration tests and the setup files load or store as an
+     attribute (`obj.name`), import (`from m import name`), delete, or hold
+     whole as a string constant (`getattr(x, "name")`, dict keys, `__all__`,
+     `__slots__`, `mock.patch("m.name")`; `"a.b"`, `"m:name"` and short lists
+     of words count as their parts). A name found there is visible.
+   - *Reads as a global*: for each file of the package, the names its code loads
+     as globals, or in a module or class body (so a builtin it calls too), that
+     `named` does not hold. A name the module's own code loads is visible, and
+     so is one that a module star-importing it loads, through any chain of star
+     imports (`from m import *`). For a class the file's globals are checked
+     as well, since a class body reads its own namespace and then the module's.
+   - *Reads with no name in the source*, kept visible by shape or by name:
+     dunders (`__reduce__`, `__deepcopy__`, `__len__`: Python looks them up);
+     names ending in `_sql` (the generators and the simplifier build their
+     dispatch with `dir()` over the class, `getattr(self, key + "_sql")`);
+     classes that register themselves or are found by walking a namespace (any
+     class defined in the module with a base from the package or a metaclass:
+     `subclasses()` over `sqlglot.expressions`, `Dialect._try_load` over a
+     dialect module, serde's class lookup, the dialect registry, a new `Dialects`
+     member); a module no other namespace binds (importing it has effects);
+     every attribute of a class with a base from outside the package (an
+     enum, an exception, a `dict` subclass: their own machinery reads names);
+     and the enum classes, classes made inside functions and any class the map
+     of classes does not know. `maps/names.json` is built by
+     `tools/build_names.py`; `tools/inventory_dynamic.py` lists every site in
+     the pinned code that reads a name another way, and the README of that
+     tool's output was read site by site (the tokenizer, `Expr` and dialect
+     hooks read fixed names, which are in `named`; `getattr(e, this)` in the
+     executor reads attributes of a `datetime`).
+   - A function that a changed function calls is reached through the changed
+     function's own candidates; an unused one is not reached at all.
+
+   Anything the map cannot show is unread stays as before (every test that
+   imports the module, or every test that can reach the class). Docstring
+   tests (`tests/test_docs.py`) are not collected by pytest, so an added
+   docstring example runs nowhere. The registry inputs (the module-level code
+   of `dialects/dialect.py` and `dialects/__init__.py`) still select every
+   test whatever is added there, because that rule is applied before the
+   comparison.
+
 4. **Run the candidates against the patch** (`selector/runner.py`). The
    coordinator imports sqlglot and the test modules once, then forks a child
    per commit:
@@ -352,6 +400,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
 | `readers.bin`, `constants.json` | `build_extra.py` | constant → tests that execute a line reading it |
 | `order.json` | `build_order.py` | module or class attribute → its tables come out in the same order in every fresh import |
+| `names.json` | `build_names.py` | every name the pinned code, its tests and setup files read (attribute, import, string), the globals each file loads, star imports: an added or removed name nobody reads is seen by no test |
 | `tcov.bin`, `tcov.json` | `trace_all.py` with `BR_TRACE_SPLIT=1`, `build_tcov.py` | (code object, line) → tests that execute it while the test itself runs, sqlglot being imported in full beforehand |
 | `treaders.bin` | `build_extra.py` | constant → tests that read it while the test itself runs |
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |
@@ -385,7 +434,7 @@ observed failing on the patched code or could not be ruled out.
 - `tools/crosscheck_trace.py` compares the coverage tracer with `sys.settrace`
   line for line.
 - `tools/test_pydiff.py` holds the unit checks for the code comparison,
-  `tools/test_state.py` those for the comparison of import state;
+  `tools/test_state.py` those for the comparison of import state, `tools/test_names.py` those for the names map;
   `tools/state_probe.py` shows what a given patch changes at import (for the
   unchanged tree: nothing). `tools/mutate_import.py` generates one-token
   patches to code that runs at import, labeled like the others.
