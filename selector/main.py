@@ -1016,18 +1016,26 @@ class Coordinator:
         # bodies to swap has no import-time candidates and stops at the next test.
         if not STATE_PROBE or job.probed:
             return False
-        if not plan.import_candidates or not plan.probe_ok or not self.covmap.has_test_time():
+        if not plan.probe_ok or not self.covmap.has_test_time():
             return False
+        # The comparison also tells whether recorded executor results may be reused.
+        for_results = self.clean_memo_possible(job) and any(
+            bit in self.memo_cost and self.bit_cost[bit] - self.memo_cost[bit] > 4.0 * PROBE_COST
+            for bit in job.candidates
+        )
+        if not plan.import_candidates:
+            # Nothing to narrow down. A commit can go the clean way all the same:
+            # the changed body of a function that already ran while the tests were
+            # imported, on lines only tests run. Without the comparison nothing
+            # says what the fresh import left, and the executor tests would run
+            # every query.
+            return for_results
         if plan.narrowed:
             # Tests were left out as unable to see the change to a class or
             # module body. That is only true if the module still imports, and
             # importing it is what the comparison does first.
             return True
-        if self.clean_memo_possible(job) and any(
-            bit in self.memo_cost and self.bit_cost[bit] - self.memo_cost[bit] > 4.0 * PROBE_COST
-            for bit in job.candidates
-        ):
-            # The comparison also tells whether recorded executor results may be reused.
+        if for_results:
             return True
         bits = job.candidates
         checking = self.machine * (self.overhead(job, bits) + sum(job.estimates[bit] for bit in bits))

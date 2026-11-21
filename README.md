@@ -99,6 +99,13 @@ the patched code**, and selects the ones that fail.
    closures; tables entry by entry; classes attribute by attribute). What comes
    out is the list of (module or class, attribute) pairs that differ, including
    whatever sqlglot itself derived from the changed value while importing.
+   The comparison is also run, whatever the candidates cost, for a commit
+   that needs a fresh import and has an executor test with recorded results
+   (step 5) among its candidates: for instance an edit to the body of a parse
+   function that sqlglot itself calls while it is imported, on a line only
+   tests reach. Nothing is narrowed then, but only the comparison says that
+   the fresh import left what the pinned one left, which is what reusing a
+   recorded result needs.
 
    - No difference: the change cannot be observed (a flag only the type checker
      reads, a `not` on a value nothing uses), and it adds no candidate.
