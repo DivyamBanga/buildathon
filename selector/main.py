@@ -64,6 +64,9 @@ SETUP_ALLOWANCE = 40.0
 SETUP_CPU = 8.0
 MEMORY_ALLOWANCE = 1.2 * 1024**3
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
+# For experiments only: pretend every CPU second a child uses costs this many,
+# to see what the selector decides on a slower machine than the one at hand.
+SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
@@ -733,7 +736,7 @@ class Coordinator:
         used = 0.0
         try:
             _, _, usage = os.wait4(run.pid, 0)
-            used = usage.ru_utime + usage.ru_stime
+            used = (usage.ru_utime + usage.ru_stime) * SLOWDOWN
         except OSError:
             pass
         if run.overlay:
