@@ -91,6 +91,10 @@ BASE_STORES = TESTS + "\n\ndef setup_thing():\n    helper.cache = 1\n"
 expect("E: existing store unchanged", effects(BASE_STORES + "\n\ndef other():\n    return 1\n", BASE_STORES), False)
 expect("E: existing store, new copy", effects(BASE_STORES + "\n\ndef other():\n    helper.cache = 1\n", BASE_STORES), True)
 expect("E: store added to an existing test", effects(TESTS.replace("self.assertEqual(helper(1), 1)", "helper.cache = 1")), True)
+STORE_TEST = TESTS + "\n\ndef restore():\n    try:\n        pass\n    finally:\n        helper.mode = 'a'\n"
+expect("E: existing store, another value", effects(STORE_TEST.replace("'a'", "'b'"), STORE_TEST), True)
+expect("E: existing store, another value in a nested block", effects(STORE_TEST.replace("= 'a'", "= helper.other"), STORE_TEST), True)
+expect("E: existing store, same statement", effects(STORE_TEST + "\n\ndef other():\n    return 1\n", STORE_TEST), False)
 expect("E: text that does not parse", effects("def (:\n"), False)
 expect("E: new file, store", effects("import os\nos.environ['A'] = '1'\n", ""), True)
 expect("E: new file, plain", effects("import os\n\n\ndef test_a():\n    x = {}\n    x['a'] = 1\n    assert x\n", ""), True)  # subscript on a local: conservative

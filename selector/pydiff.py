@@ -438,7 +438,7 @@ def _own_self(node) -> bool:
     return bool(node.args.args) and node.args.args[0].arg == "self" and not _rebinds_self(node)
 
 
-def _global_effects(tree, scope: str = "", method_ok: bool = False):
+def _global_effects(tree, scope: str = "", method_ok: bool = False, statement=None):
     """Signatures of the statements under `tree` that can act outside the local scope.
 
     A function that only stores to its own locals and to attributes of `self`
@@ -457,6 +457,7 @@ def _global_effects(tree, scope: str = "", method_ok: bool = False):
             own = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(tree, ast.ClassDef) and _own_self(node)
             found.extend(_global_effects(node, scope + "." + node.name, own))
             continue
+        here = node if isinstance(node, ast.stmt) else statement
         flagged = False
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             flagged = True
@@ -471,8 +472,12 @@ def _global_effects(tree, scope: str = "", method_ok: bool = False):
             name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
             flagged = name in _MUTATORS
         if flagged:
-            found.append((scope, ast.dump(node)))
-        found.extend(_global_effects(node, scope, method_ok))
+            # A store is identified with the statement it sits in: the same target
+            # given another value (a test restoring a class attribute to a new
+            # value) is another effect.
+            stored = isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del))
+            found.append((scope, ast.dump(here if stored and here is not None else node)))
+        found.extend(_global_effects(node, scope, method_ok, here))
     return found
 
 
