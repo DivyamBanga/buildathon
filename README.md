@@ -111,6 +111,13 @@ the patched code**, and selects the ones that fail.
      the pairs it covers; added and removed attributes, functions, enum
      members, anything with a `__get__` and any class the tracer could not
      name by module and qualified name stay with the rules below.
+     For a dict-valued attribute whose differing entries the comparison names
+     (the `entries` of the difference row), `akeys.bin` narrows that further:
+     the tests that read the table as a whole, the tests that look up one of
+     those names, and the tests the map cannot vouch for, intersected with the
+     readers of the attribute. A difference of order only has no names: only the
+     whole readers see it. A table anything else also holds (a default, a
+     closure, an instance), or that is handed to exec, stays at the level above.
      The runner formats a subtest's message with `str()` and its parameters
      with `repr()` after each subtest, as pytest does when it reports one, so
      that the reads on that path are traced and a message that fails to format
@@ -336,6 +343,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `areaders.bin` | `trace_attrs.py`, `build_areaders.py` | `module:Class\|attribute` → tests that read that class attribute while the test itself runs |
+| `akeys.bin` | `trace_keys.py`, `recdict.py`, `build_akeys.py` | for the dict-valued attributes (class and module level), per entry name (`state.key_names`) the tests that look that entry up, and the tests that read the table as a whole |
 | `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
