@@ -16,5 +16,7 @@ COPY maps /app/maps
 RUN python -m compileall -q /sqlglot /app && chmod -R a+rX /sqlglot /app
 
 ENV PYTHONPATH=/app SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
+# Measurement build (branch exp-ac1 only): every candidate is run, nothing is selected unchecked.
+ENV BR_ALWAYS_CHECK=1
 WORKDIR /app
 CMD ["python", "-m", "selector.main"]
