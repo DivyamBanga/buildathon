@@ -21,7 +21,9 @@ the patched code**, and selects the ones that fail.
    (runs only when called) or a module or class body (ran at import). Inside a
    changed function, the old and new source of that function are parsed and
    compared statement by statement, to name the old lines a test must execute
-   to see the change.
+   to see the change. A function that binds other names afterwards (its local,
+   cell or free names differ as sets) counts as changed in full, and so does any
+   line whose instructions differ although its text does not.
 
 3. **Name the candidate tests** (`selector/analyze.py`, `selector/covmap.py`).
    `maps/` records, for every test run alone at the pinned commit, each line it
@@ -133,11 +135,19 @@ the patched code**, and selects the ones that fail.
 
    What the comparison takes for granted, each checked against the pinned
    code: annotations, docstrings and what `typing` records about a TypedDict
-   are not read while tests run; nothing relies on the order of the entries of
-   a table keyed by classes, enum members or strings (sqlglot builds several
-   of them by looping over sets, so their order already differs from run to
-   run); a default or a closure value of a function matters only when the
-   function is called. A function that imports modules on demand (four in
+   are not read while tests run; a default or a closure value of a function
+   matters only when the function is called. The order of the entries of a
+   table (a dict, at any depth below an attribute of a module or class, also
+   inside a function's defaults and closure, a partial or an instance held
+   there) and of a tuple or list of classes is compared where it is fixed: `maps/order.json`
+   lists the attributes whose tables come out in the same order in every fresh
+   import of the pinned package (`tools/build_order.py`: 16 imports, each with
+   its own hash seed and memory layout), and for those another order is a
+   difference (`arg_types` is read in order to give positional arguments their
+   names). Only for the attributes that are not listed, whose order already
+   differs from run to run because sqlglot builds the table by looping over a
+   set, is the order taken as irrelevant, and so is the order of a set. The order of
+   the attributes of an instance (its `__dict__` itself) is not compared. A function that imports modules on demand (four in
    sqlglot) is outside all of this: when it runs depends on which tests ran
    before, so a change to one selects every test. So does a change to a
    function that reads the registry those imports fill (four more, around
@@ -152,7 +162,13 @@ the patched code**, and selects the ones that fail.
 
    - *hot*: when only function bodies changed (and none of them already ran
      while the tests were imported), the child swaps the new code objects into
-     the functions already in memory and runs the tests at once.
+     the functions already in memory and runs the tests at once. A function
+     whose signature changed (parameter names, number, order or kind, whether
+     it is a generator or a coroutine, its free variables, its name) is not
+     swapped: a decorator or a registry reads those when `def` runs and keeps
+     what it found, so such a commit gets a clean import and the comparison of
+     import state, whose differences name the tests that can see what the
+     definition made.
    - *on demand*: sqlglot imports most of its dialects only when one is first
      used, so about half of its modules have never run in the coordinator.
      Nothing of such a module exists in the child, whatever the patch changes
@@ -314,6 +330,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
 | `readers.bin`, `constants.json` | `build_extra.py` | constant → tests that execute a line reading it |
+| `order.json` | `build_order.py` | module or class attribute → its tables come out in the same order in every fresh import |
 | `tcov.bin`, `tcov.json` | `trace_all.py` with `BR_TRACE_SPLIT=1`, `build_tcov.py` | (code object, line) → tests that execute it while the test itself runs, sqlglot being imported in full beforehand |
 | `treaders.bin` | `build_extra.py` | constant → tests that read it while the test itself runs |
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |
