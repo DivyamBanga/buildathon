@@ -317,6 +317,12 @@ observed failing on the patched code or could not be ruled out.
 - `tools/test_runner_paths.py` holds the unit checks for how a child finds
   patched files: redirected `open` and `io.open_code`, resolved paths that
   stay in the overlay, and modules imported on demand from patched text.
+- `tools/test_kinds.py` holds the unit checks for the rules about kinds of
+  change that one test run cannot settle (a path in several sections, added
+  lines that mention pytest, new tests and helpers that store outside their
+  locals or shadow a name, a file that appears or vanishes) and replays the
+  patches in `tools/kinds_seeds/`: each was a commit for which pytest failed a
+  test and the selector selected nothing of the kind.
 - `tools/trace_suite.py` traces the whole suite in one process, in collection
   order, and `tools/build_suite.py` compares it test by test with the runs
   alone. Of 2.59 million (test, line) pairs, 121 are executed in the suite but
