@@ -133,11 +133,18 @@ the patched code**, and selects the ones that fail.
 
    What the comparison takes for granted, each checked against the pinned
    code: annotations, docstrings and what `typing` records about a TypedDict
-   are not read while tests run; nothing relies on the order of the entries of
-   a table keyed by classes, enum members or strings (sqlglot builds several
-   of them by looping over sets, so their order already differs from run to
-   run); a default or a closure value of a function matters only when the
-   function is called. A function that imports modules on demand (four in
+   are not read while tests run; a default or a closure value of a function
+   matters only when the function is called. The order of the entries of a
+   table (a dict, at any depth below an attribute of a module or class) and of
+   a tuple or list of classes is compared where it is fixed: `maps/order.json`
+   lists the attributes whose tables come out in the same order in every fresh
+   import of the pinned package (`tools/build_order.py`: 16 imports, each with
+   its own hash seed and memory layout), and for those another order is a
+   difference (`arg_types` is read in order to give positional arguments their
+   names). Only for the attributes that are not listed, whose order already
+   differs from run to run because sqlglot builds the table by looping over a
+   set, is the order taken as irrelevant, and so is the order of a set. The
+   order inside the state of an instance is not compared either way. A function that imports modules on demand (four in
    sqlglot) is outside all of this: when it runs depends on which tests ran
    before, so a change to one selects every test. So does a change to a
    function that reads the registry those imports fill (four more, around
@@ -322,6 +329,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
 | `readers.bin`, `constants.json` | `build_extra.py` | constant → tests that execute a line reading it |
+| `order.json` | `build_order.py` | module or class attribute → its tables come out in the same order in every fresh import |
 | `tcov.bin`, `tcov.json` | `trace_all.py` with `BR_TRACE_SPLIT=1`, `build_tcov.py` | (code object, line) → tests that execute it while the test itself runs, sqlglot being imported in full beforehand |
 | `treaders.bin` | `build_extra.py` | constant → tests that read it while the test itself runs |
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |

@@ -83,7 +83,29 @@ _BUILTIN_CALLABLES = (
 )
 _LRU = type(functools.lru_cache(lambda: None))
 _MISSING = object()
+# The containers an entry's order is read through: a dict, and what holds dicts or classes in order.
+_ORDERED = (dict, list, tuple, types.MappingProxyType)
+# (module, class qualname or "", attribute) -> the order of the tables in it is the same in every
+# fresh import (maps/order.json, tools/build_order.py). Empty until load_order is called.
+STABLE_ORDER: frozenset = frozenset()
 _STATELESS = frozenset(("lock", "RLock", "_local", "local", "count", "object"))
+
+
+def load_order(path: str) -> None:
+    """Read the map of attributes whose tables come out in the same order in every fresh import."""
+    global STABLE_ORDER
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        STABLE_ORDER = frozenset()
+        return
+    STABLE_ORDER = frozenset(
+        (module, qualname, attribute)
+        for module, classes in data.get("stable", {}).items()
+        for qualname, attributes in classes.items()
+        for attribute in attributes
+    )
 
 
 def package_modules(root: str) -> list[str]:
@@ -217,6 +239,78 @@ def outside_state() -> dict:
     }
 
 
+def token_of(value):
+    """A hashable stand-in that is equal for equal members of the two worlds, or None."""
+    kind = type(value)
+    if kind in _PLAIN:
+        return (kind.__name__, repr(value))
+    if isinstance(value, enum.Enum):
+        return ("enum", kind.__module__, kind.__qualname__, value.name)
+    if isinstance(value, type):
+        return ("class", value.__module__, value.__qualname__)
+    if kind is tuple or kind is frozenset:
+        parts = [token_of(item) for item in value]
+        if any(part is None for part in parts):
+            return None
+        return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
+    return None
+
+
+def _flat(token):
+    """A token as text that does not depend on the order of a frozenset."""
+    if isinstance(token, tuple):
+        return "(" + ",".join(_flat(part) for part in token) + ")"
+    if isinstance(token, frozenset):
+        return "{" + ",".join(sorted(_flat(part) for part in token)) + "}"
+    return repr(token)
+
+
+def order_signature(value) -> str:
+    """The order of every table and every run of classes inside `value`, as text.
+
+    It walks what Comparer walks in order: dicts (by their keys when every key
+    has a token), and lists and tuples, and records the keys of each dict and
+    the members of each list or tuple that holds only classes. Empty when
+    there is nothing whose order the comparison could look at.
+    """
+    rows: list = []
+    seen: set = set()
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if not isinstance(item, _ORDERED) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, (dict, types.MappingProxyType)):
+            tokens = [token_of(key) for key in item]
+            if len(tokens) > 1 and all(token is not None for token in tokens):
+                rows.append("d" + ";".join(_flat(token) for token in tokens))
+            pending.extend(reversed(list(item.values())))
+        else:
+            if len(item) > 1 and all(isinstance(member, type) for member in item):
+                rows.append("s" + ";".join(_flat(token_of(member)) for member in item))
+            pending.extend(reversed(list(item)))
+    return "|".join(rows)
+
+
+def iter_attributes(modules: dict):
+    """(module, class qualname or "", attribute, value) as Comparer._namespace walks them."""
+    for name, module in modules.items():
+        stack = [("", dict(vars(module)), _MODULE_NOISE, "")]
+        while stack:
+            qualname, namespace, noise, prefix = stack.pop()
+            for key, value in namespace.items():
+                if key in noise:
+                    continue
+                if isinstance(value, type) and value.__module__ == name and value.__qualname__ == prefix + key:
+                    inner = _CLASS_NOISE
+                    if typing.is_typeddict(value):
+                        inner = inner | _TYPED_DICT_NOISE
+                    stack.append((value.__qualname__, dict(vars(value)), inner, value.__qualname__ + "."))
+                    continue
+                yield name, qualname, key, value
+
+
 class Comparer:
     def __init__(self, old: dict, new: dict, old_root: str) -> None:
         self.old = old
@@ -228,6 +322,8 @@ class Comparer:
         self.keep: list = []
         self.differences: list = []
         self.changed_functions: dict = {}
+        self.stable = STABLE_ORDER
+        self.strict = False  # inside an attribute whose tables have a fixed order
         self.explain = False  # offline: remember where two values first differed
         self.why = ""
 
@@ -305,7 +401,8 @@ class Comparer:
             return self._no(a, b, "types")
         if ta in _PLAIN:
             return repr(a) == repr(b) if ta is float or ta is complex else a == b
-        key = (id(a), id(b))
+        strict = self.strict and isinstance(a, _ORDERED)
+        key = (id(a), id(b), strict)
         known = self.memo.get(key)
         if known is not None:
             return known
@@ -317,12 +414,15 @@ class Comparer:
         depth = len(self.active)
         self.active[key] = depth
         outer, self.low = self.low, 1 << 60
+        outer_strict, self.strict = self.strict, strict
         try:
             result = self._same(a, b)
         except RecursionError:
             raise
         except Exception:
             result = False
+        finally:
+            self.strict = outer_strict
         del self.active[key]
         if not result:
             self._no(a, b, "differ")
@@ -355,6 +455,10 @@ class Comparer:
                 break
             right[token] = value
         if right is not None and len(right) == len(b):
+            if self.strict and [self._token(key) for key in a] != list(right):
+                # The order of this table is the same in every fresh import
+                # (STABLE_ORDER), so another order is another table.
+                return False
             for key, value in a.items():
                 other = right.get(self._token(key), _MISSING)
                 if other is _MISSING or not self.same(value, other):
@@ -364,21 +468,7 @@ class Comparer:
             self.same(ka, kb) and self.same(va, vb) for (ka, va), (kb, vb) in zip(a.items(), b.items())
         )
 
-    def _token(self, value):
-        """A hashable stand-in that is equal for equal members of the two worlds, or None."""
-        kind = type(value)
-        if kind in _PLAIN:
-            return (kind.__name__, repr(value))
-        if isinstance(value, enum.Enum):
-            return ("enum", kind.__module__, kind.__qualname__, value.name)
-        if isinstance(value, type):
-            return ("class", value.__module__, value.__qualname__)
-        if kind is tuple or kind is frozenset:
-            parts = [self._token(item) for item in value]
-            if any(part is None for part in parts):
-                return None
-            return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
-        return None
+    _token = staticmethod(lambda value: token_of(value))
 
     def changed_entries(self, a, b) -> list | None:
         """For two dicts (or two sets) that differ: the names of the keys (members)
@@ -438,7 +528,8 @@ class Comparer:
             # A sequence of classes made from a set (for isinstance and the like)
             # comes out in a different order every run: compare what is in it.
             return (
-                len(a) == len(b)
+                not self.strict
+                and len(a) == len(b)
                 and all(isinstance(item, type) for item in a)
                 and all(isinstance(item, type) for item in b)
                 and sorted(map(self._token, a)) == sorted(map(self._token, b))
@@ -644,7 +735,11 @@ class Comparer:
             ):
                 self._class(value_a, value_b, module_name)
                 continue
-            found = self._difference(value_a, value_b)
+            self.strict = (owner[1], owner[2], key) in self.stable
+            try:
+                found = self._difference(value_a, value_b)
+            finally:
+                self.strict = False
             if found is not None:
                 entries = self.changed_entries(value_a, value_b) if found[0] == "value" else None
                 self.report(owner, key, found[0], found[1], entries)

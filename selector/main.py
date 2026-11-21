@@ -923,6 +923,7 @@ class Coordinator:
 
     def spawn_probe(self, job: Job) -> None:
         if state.PINNED is None:
+            state.load_order(os.path.join(MAPS, "order.json"))
             state.load_pinned(ROOT)
             gc.freeze()
         self.sequence += 1
