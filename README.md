@@ -288,9 +288,20 @@ the patched code**, and selects the ones that fail.
    attribute is removed, or added under a name an ancestor defines, the name is
    read, and `maps/areaders.bin` answers (`CovMap.moved_readers`): for a removal
    the tests that read that (class, attribute) pair, for an addition the tests
-   that read the same name on any ancestor that holds it, narrowed to the tests
-   that can reach the class; a pair the map does not cover (a function, a
-   property, a dunder) is not answered and keeps the rule that applied before.
+   that read the same name on any class that holds it other than the subclasses
+   of the class, narrowed to the tests that can reach the class; a pair the map
+   does not cover (a function, a property, a dunder) is not answered and keeps
+   the rule that applied before. The holders are not only the ancestors:
+   sqlglot's expressions are built from traits (`class Add(Expression, Binary)`,
+   `class RegexpLike(Expression, Binary, Predicate, Func)`), so `Add.arg_types`
+   is the one of Binary and `RegexpLike.is_var_len_args` the one of Func, and a
+   name added to Expression, Binary or Predicate comes before them in that MRO
+   although none of these is a subclass of the holder. A subclass of the class
+   keeps what it holds itself (it comes first in every MRO they share); any
+   other holder can follow the class in the MRO of a class a test reads through.
+   Checked with a trace of the class each read went through
+   (329689 reads of 1620 tests against 10664 possible additions: no reader
+   outside the candidates; with the ancestors only, 729 in 5 additions).
    An all-capitals name that is added or removed is seen by the tests that run a
    line reading that name (`treaders.bin`), as a changed value of it would be.
 

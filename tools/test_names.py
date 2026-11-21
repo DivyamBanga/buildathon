@@ -221,12 +221,39 @@ class Leaf(Grand):
     pass
 
 
-for klass_ in (Base, Child, Grand, Leaf):
+# Classes built from traits, as sqlglot's expressions are (`class Add(Expression, Binary)`): what a read
+# through Mixed finds is held by a class that is no ancestor of Concrete.
+class Root:
+    KIND = 1
+    SIZE = 1
+    loose = 1
+
+
+class Concrete(Root):
+    pass
+
+
+class Trait(Root):
+    KIND = 2
+    loose = 2
+
+
+class Mixed(Concrete, Trait):  # MRO: Mixed, Concrete, Trait, Root
+    pass
+
+
+class Below(Concrete):
+    KIND = 3
+
+
+for klass_ in (Base, Child, Grand, Leaf, Root, Concrete, Trait, Mixed, Below):
     klass_.__module__ = "pkg.m"
     klass_.__qualname__ = klass_.__name__
     setattr(fake, klass_.__name__, klass_)
 state.PINNED = ("/root", [], {"pkg.m": fake}, {}, {}, 0)
-bitmaps = {("pkg.m", "Base", "FLAG"): 0b0110, ("pkg.m", "Base", "OTHER"): 0b1000, ("pkg.m", "Grand", "FLAG"): 0b10000}
+bitmaps = {("pkg.m", "Base", "FLAG"): 0b0110, ("pkg.m", "Base", "OTHER"): 0b1000, ("pkg.m", "Grand", "FLAG"): 0b10000,
+           ("pkg.m", "Root", "KIND"): 0b1, ("pkg.m", "Trait", "KIND"): 0b10, ("pkg.m", "Below", "KIND"): 0b100,
+           ("pkg.m", "Root", "SIZE"): 0b1000, ("pkg.m", "Root", "loose"): 0b10000}
 covmap.attribute_readers = lambda module, qualname, attribute: bitmaps.get((module, qualname, attribute))
 expect("removed: the readers of the pair", covmap.moved_readers("pkg.m", "Base", "FLAG", "removed"), 0b0110)
 expect("removed: a pair the map does not cover", covmap.moved_readers("pkg.m", "Base", "mid", "removed"), None)
@@ -237,6 +264,14 @@ expect("added over a name an ancestor defines and the map does not cover", covma
 expect("added under a name no ancestor defines", covmap.moved_readers("pkg.m", "Child", "NEW_ONE", "added"), None)
 expect("added to a class the pinned world does not have", covmap.moved_readers("pkg.m", "Nope", "FLAG", "added"), None)
 expect("an uncovered ancestor next to a covered one", covmap.moved_readers("pkg.m", "Leaf", "mid", "added"), None)
+expect("the read went through a class built from traits", Mixed.KIND, 2)
+expect("added before a trait in the MRO of a subclass: the readers of the trait too, not of a subclass",
+       covmap.moved_readers("pkg.m", "Concrete", "KIND", "added"), 0b11)
+expect("added to the class built from them: every holder that is not below it",
+       covmap.moved_readers("pkg.m", "Mixed", "KIND", "added"), 0b111)
+expect("a name only the root holds", covmap.moved_readers("pkg.m", "Concrete", "SIZE", "added"), 0b1000)
+expect("a trait whose pair the map does not cover", covmap.moved_readers("pkg.m", "Concrete", "loose", "added"), None)
+expect("removed from the trait: its own readers", covmap.moved_readers("pkg.m", "Trait", "KIND", "removed"), 0b10)
 state.PINNED = None
 expect("without the pinned world nothing is answered", covmap.moved_readers("pkg.m", "Base", "FLAG", "removed"), None)
 

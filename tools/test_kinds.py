@@ -695,4 +695,38 @@ if covmap._dirs["names"] is not None:
         plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
         expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)
 
+# seed add_trait_shadow gives the trait Predicate two attributes its ancestor Expr holds (is_var_len_args,
+# var_len_arg_key). sqlglot's expressions are built from traits: `class RegexpLike(Expression, Binary,
+# Predicate, Func)` finds both on Func, which is no ancestor of Predicate, and the added ones come first in
+# that MRO. Under pytest the tests below fail with the patch (they parse REGEXP_LIKE, RLIKE or CONTAINS as
+# functions and get a list where an expression was); with the readers of the ancestors only, one of them was
+# a candidate. The rows are what the comparison of import state reports for the two names.
+from selector import state  # noqa: E402
+
+state.load_order(os.path.join(MAPS, "order.json"))
+state.load_pinned(ROOT)
+SHADOW_ROWS = [
+    ["class", "sqlglot.expressions.core", "Predicate", name, "added", "sqlglot/expressions/core.py", "", 0, ""]
+    for name in ("is_var_len_args", "var_len_arg_key")
+]
+left = covmap.state_candidates({"differences": SHADOW_ROWS, "inconclusive": ""})
+for test_id in (
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+    "tests/dialects/test_dremio.py::TestDremio::test_regexp_like",
+    "tests/dialects/test_exasol.py::TestExasol::test_regexp_like",
+    "tests/dialects/test_presto.py::TestPresto::test_regex",
+    "tests/dialects/test_spark.py::TestSpark::test_spark",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+):
+    expect("seed add_trait_shadow: " + test_id.split("::", 1)[1], bool(left >> ID[test_id] & 1), True)
+expect("seed add_trait_shadow: narrower than every test", left != covmap.all, True)
+func_readers = covmap.attribute_readers("sqlglot.expressions.core", "Func", "is_var_len_args")
+expect("seed add_trait_shadow: the map knows who reads the trait's attribute", func_readers not in (None, 0), True)
+shadowed = covmap.moved_readers("sqlglot.expressions.core", "Predicate", "is_var_len_args", "added")
+expect("seed add_trait_shadow: the readers of the trait's attribute are among the readers", shadowed & func_readers, func_readers)
+flag = covmap.moved_readers("sqlglot.dialects.duckdb", "DuckDB", "NORMALIZE_FUNCTIONS", "added")
+base = covmap.attribute_readers("sqlglot.dialects.dialect", "Dialect", "NORMALIZE_FUNCTIONS")
+expect("an inherited dialect flag set in a dialect: never fewer than the readers of the ancestor", base is not None and flag & base, base)
+state.PINNED = None
+
 print(f"{checks} checks passed")

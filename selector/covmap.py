@@ -601,18 +601,37 @@ class CovMap:
             pending.extend(importers.get(path, ()))
         return True
 
+    def _holders(self, attribute: str) -> list:
+        """(module, qualname) of every class of the pinned package whose own dict has the attribute,
+        as the comparison of import state names classes."""
+        world = state.PINNED[2]
+        if getattr(self, "_holder_world", None) is not world:
+            table: dict = {}
+            for module, qualname, key, _value in state.iter_attributes(world):
+                if qualname:
+                    table.setdefault(key, []).append((module, qualname))
+            self._holder_world, self._holder_table = world, table
+        return self._holder_table.get(attribute, [])
+
     def moved_readers(self, module: str, qualname: str, attribute: str, reason: str) -> int | None:
-        """Tests that read a class attribute the patch removes, or one it adds under a name an
-        ancestor already defines (so that a read through the class finds another value),
+        """Tests that read a class attribute the patch removes, or one it adds under a name that
+        a read through the class found elsewhere until now (so that it finds another value),
         taken from maps/areaders.bin; None when that map cannot answer.
 
         - removed: the readers of that (class, attribute) pair. A test that reads it finds
           what an ancestor has, or nothing; no other test reads it;
-        - added: the readers of the same name on every ancestor that defines it (reads of an
-          attribute are credited to the class whose dict holds it, whichever subclass or
-          instance the read went through), narrowed to the tests that can reach the class
-          where the map of reaches knows them. A name no ancestor defines is not answered
-          here: nobody has read it from this class yet (that is maps/names.json's question).
+        - added: the readers of the same name on every class that holds it, except the
+          subclasses of the class. Reads of an attribute are credited to the class whose
+          dict holds it, whichever subclass or instance the read went through, and that
+          holder need not be an ancestor of the class: sqlglot's expressions are built
+          from traits (`class Add(Expression, Binary)`), a read of `Add.arg_types` finds
+          the one of Binary, and an `arg_types` added to Expression comes first in that
+          MRO. A subclass of the class comes before it in every MRO they share, so a
+          value held there is still found first; any other holder can follow the class
+          in the MRO of the class read through. The caller narrows to the tests that
+          can reach the class. A name no ancestor defines is not answered here: nobody
+          has read it from this class yet (that is maps/names.json's question), and a
+          probe (hasattr, a default) leaves no trace in the map.
         """
         if state.PINNED is None:
             return None
@@ -630,6 +649,16 @@ class CovMap:
                 if exact is None:
                     return None
                 readers = (readers or 0) | exact
+        if readers is None:
+            return None
+        for holder_module, holder_qualname in self._holders(attribute):
+            holder = state.Comparer._resolve(state.PINNED[2], holder_module, holder_qualname)
+            if isinstance(holder, type) and any(base is found for base in holder.__mro__):
+                continue
+            exact = self.attribute_readers(holder_module, holder_qualname, attribute)
+            if exact is None:
+                return None
+            readers |= exact
         return readers
 
     def state_candidates(self, result: dict, own=frozenset()) -> int | None:
