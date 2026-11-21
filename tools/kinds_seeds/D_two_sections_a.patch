@@ -1,0 +1,26 @@
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -913,7 +913,7 @@
+         "VIEWS",
+         "SEQUENCES",
+         "UNIQUE KEYS",
+-        "IMPORTED KEYS",
++        'IMPORTED KEYSX',
+     }
+ 
+     NON_TABLE_CREATABLES: t.ClassVar = {"STORAGE INTEGRATION", "TAG", "WAREHOUSE", "STREAMLIT"}
+diff --git a/sqlglot/parsers/snowflake.py b/sqlglot/parsers/snowflake.py
+index 0000000..1111111 100644
+--- a/sqlglot/parsers/snowflake.py
++++ b/sqlglot/parsers/snowflake.py
+@@ -825,7 +825,7 @@
+ 
+     DESCRIBE_QUALIFIER_PARSERS: t.ClassVar[dict[str, t.Callable]] = {
+         "API": lambda self: self.expression(exp.ApiProperty()),
+-        "APPLICATION": lambda self: self.expression(exp.ApplicationProperty()),
++        "APPLICATIONX": lambda self: self.expression(exp.ApplicationProperty()),
+         "CATALOG": lambda self: self.expression(exp.CatalogProperty()),
+         "COMPUTE": lambda self: self.expression(exp.ComputeProperty()),
+         "DATABASE": lambda self: (

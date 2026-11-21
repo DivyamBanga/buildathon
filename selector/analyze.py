@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import marshal
 import os
+import posixpath
 
 from . import patchlib, pydiff
 from .covmap import CovMap
@@ -374,6 +375,18 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note("unrecognised patch")
         else:
             plan.note("empty patch")
+        return plan
+    sections: dict[str, int] = {}
+    for patch in plan.files:
+        for name in {posixpath.normpath(p) for p in (patch.old_path, patch.new_path) if p}:
+            sections[name] = sections.get(name, 0) + 1
+    repeated = sorted(name for name, count in sections.items() if count > 1)
+    if repeated:
+        # A path in more than one section (edited twice, deleted and created,
+        # renamed and edited): the sections are not applied one after the other
+        # here, and what the tests see depends on how they are.
+        plan.select_all = True
+        plan.note(f"{repeated[0]} occurs in more than one section of the patch")
         return plan
     for patch in plan.files:
         path = patch.path

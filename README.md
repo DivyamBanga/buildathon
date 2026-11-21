@@ -41,6 +41,11 @@ the patched code**, and selects the ones that fail.
 
    No candidates means the commit selects nothing.
 
+   **A path in more than one section of a patch** (a file edited twice, deleted
+   and created again, renamed and edited) selects every test. The sections are
+   analysed one by one against the pinned file here, which is not what applying
+   them in order gives.
+
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
    another state: other module globals, class attributes, defaults or closures.
