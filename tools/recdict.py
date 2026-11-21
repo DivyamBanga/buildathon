@@ -194,3 +194,54 @@ def close_window():
     found = (WINDOW_KEYS or set(), WINDOW_WHOLE or set())
     WINDOW_KEYS = WINDOW_WHOLE = None
     return found
+
+
+def wrap(watched, slot="value", ignore=()):
+    """Put a RecDict in place of every plain dict that only watched descriptors hand out.
+
+        watched   {pair: descriptor}; getattr(descriptor, slot) is the value the descriptor returns
+        ignore    containers of the caller that hold the values without reading them
+
+    Pairs whose value is the same object share one RecDict. A table that anything else
+    holds as well (a default, a closure, an instance, a module global, another table)
+    is left alone: a lookup through that holder would go unnoted. Returns
+    (key_pairs, whole): the pairs whose keys are noted from now on, and {pair: reason}
+    for the dict-valued pairs left alone, which stay "read as a whole" for the caller.
+    Not looked at here: a table handed to exec or eval as a namespace (leave its pair
+    out of `watched`), and code that asks `type(table) is dict`.
+    """
+    import gc
+    import types
+
+    groups: dict = {}  # id(value) -> [value, [(pair, descriptor), ...]]
+    for pair, descriptor in watched.items():
+        value = getattr(descriptor, slot)
+        if type(value) is dict:
+            groups.setdefault(id(value), [value, []])[1].append((pair, descriptor))
+    allowed = {id(holder) for holder in ignore} | {id(group) for group in groups.values()}
+    here = wrap.__code__.co_filename
+    key_pairs: list = []
+    whole: dict = {}
+    for group in list(groups.values()):
+        mine = set()
+        for _, descriptor in group[1]:
+            mine.add(id(descriptor))
+            if hasattr(descriptor, "__dict__"):
+                mine.add(id(vars(descriptor)))
+        reason = None
+        for holder in gc.get_referrers(group[0]):
+            if id(holder) in mine or id(holder) in allowed:
+                continue
+            if isinstance(holder, types.FrameType) and holder.f_code.co_filename == here:
+                continue
+            reason = f"also held by a {type(holder).__name__}"
+            break
+        del holder
+        if reason is not None:
+            whole.update({pair: reason for pair, _ in group[1]})
+            continue
+        table = RecDict(group[0], [pair for pair, _ in group[1]])
+        for pair, descriptor in group[1]:
+            setattr(descriptor, slot, table)
+            key_pairs.append(pair)
+    return sorted(key_pairs), whole

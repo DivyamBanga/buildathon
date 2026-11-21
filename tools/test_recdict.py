@@ -140,5 +140,94 @@ print(("ok   " if noted(table) == (set(), False) else "FAIL ") + "writes are not
 if noted(table) != (set(), False):
     failed += 1
 
+
+# ---- wrap: which tables of watched descriptors get a RecDict ------------------
+
+
+class _Watch:
+    __slots__ = ("value", "key")
+
+    def __init__(self, value, key):
+        self.value = value
+        self.key = key
+
+    def __get__(self, instance, owner=None):
+        return self.value
+
+
+class _Loose:  # a descriptor without slots: its __dict__ is the holder
+    def __init__(self, value):
+        self.value = value
+
+    def __get__(self, instance, owner=None):
+        return self.value
+
+
+def _expect(name, ok):
+    global failed
+    print(("ok   " if ok else "FAIL ") + name)
+    if not ok:
+        failed += 1
+
+
+def _default(table={"k": 1}):
+    return table
+
+
+class _A:
+    ALONE = {"x": 1, "y": 2}
+    SHARED = {"s": 1}
+    LOOSE = {"l": 1}
+    DEFAULT = _default.__defaults__[0]
+    NUMBER = 3
+
+
+class _B(_A):
+    SHARED = _A.SHARED
+
+
+_held_by_global = {"g": 1}
+
+
+class _C:
+    GLOBAL = _held_by_global
+    INSTANCE = {"i": 1}
+
+
+class _Keeper:
+    def __init__(self):
+        self.kept = _C.INSTANCE
+
+
+_keeper = _Keeper()
+_watched = {}
+for _cls, _name, _kind in (
+    (_A, "ALONE", _Watch), (_A, "SHARED", _Watch), (_B, "SHARED", _Watch), (_A, "LOOSE", _Loose),
+    (_A, "DEFAULT", _Watch), (_A, "NUMBER", _Watch), (_C, "GLOBAL", _Watch), (_C, "INSTANCE", _Watch),
+):
+    _value = vars(_cls)[_name]
+    _descriptor = _kind(_value, f"m:{_cls.__name__}|{_name}") if _kind is _Watch else _kind(_value)
+    setattr(_cls, _name, _descriptor)
+    _watched[f"m:{_cls.__name__}|{_name}"] = _descriptor
+del _value, _descriptor
+recdict.KEYS.clear()
+recdict.WHOLE.clear()
+_keys, _whole = recdict.wrap(_watched)
+_expect("wrap: tables only descriptors hold get a RecDict", _keys == ["m:_A|ALONE", "m:_A|LOOSE", "m:_A|SHARED", "m:_B|SHARED"])
+_expect("wrap: a table also held by a default, a module global or an instance stays whole",
+        sorted(_whole) == ["m:_A|DEFAULT", "m:_C|GLOBAL", "m:_C|INSTANCE"]
+        and "tuple" in _whole["m:_A|DEFAULT"] and "dict" in _whole["m:_C|GLOBAL"]
+        and ("_Keeper" in _whole["m:_C|INSTANCE"] or "dict" in _whole["m:_C|INSTANCE"]))  # 3.13 keeps instance values inline
+_expect("wrap: one RecDict for every pair of the same object", _A.SHARED is _B.SHARED and type(_A.SHARED) is RecDict
+        and _A.SHARED._br_pairs == ("m:_A|SHARED", "m:_B|SHARED"))
+_expect("wrap: other values are left as they were", _A.NUMBER == 3 and type(_A.DEFAULT) is dict and type(_C.GLOBAL) is dict)
+_A.ALONE["x"], _A().ALONE.get("nope"), _B.SHARED["s"], _A.LOOSE["l"]
+_notes = {(recdict.TABLES[t]._br_pairs, key) for t, key in recdict.KEYS}
+_expect("wrap: lookups through class, subclass and instance are key notes with the pairs",
+        _notes == {(("m:_A|ALONE",), "x"), (("m:_A|ALONE",), "nope"), (("m:_A|SHARED", "m:_B|SHARED"), "s"), (("m:_A|LOOSE",), "l")}
+        and not recdict.WHOLE)
+len(_A.ALONE)
+_expect("wrap: a whole read names the table", {recdict.TABLES[t]._br_pairs for t in recdict.WHOLE} == {("m:_A|ALONE",)})
+
 print("failed:", failed)
 sys.exit(1 if failed else 0)
