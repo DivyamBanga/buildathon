@@ -82,6 +82,8 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 # simulated time is what the failing tests alone come to.
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
+# Measurement build (branch exp-e7 only): see full_cost.
+EXPERIMENT_SKIP_COMPARED = os.environ.get("BR_SKIP_COMPARED", "1") != "0"
 FIXTURES = "tests/fixtures/"
 # The lines of the executor phase that look a name up by a computed text or walk
 # a namespace (maps/execnames.json "dynamic"), as reviewed at the pinned commit:
@@ -932,6 +934,15 @@ class Coordinator:
 
     def full_cost(self, job: Job, bit: int) -> float:
         """What the whole test costs to run for this commit, in recorded seconds of a plain test."""
+        if EXPERIMENT_SKIP_COMPARED and job.mode == "clean" and bit in self.memo_cost and self.bit_seconds[bit] > 10.0:
+            # Measurement build: after a clean import the largest executor test is
+            # selected without being run when import state was compared and the
+            # comparison narrowed the candidates (job.state), yet recorded results
+            # are off: something it found cannot be pinned down, or a patched
+            # module is imported on demand. With no comparison, or one that
+            # narrowed nothing, the test is run as before.
+            if job.state is not None and not self.executor_memo_ok(job):
+                return float("inf")
         if bit in self.memo_cost and self.executor_memo_ok(job):
             share = self.memo_share(job, bit)
             if not share:
