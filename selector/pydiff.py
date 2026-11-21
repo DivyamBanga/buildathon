@@ -169,6 +169,38 @@ def same_behaviour(old: CODE, new: CODE) -> bool:
         return False
 
 
+# Flags that say how a function is called and what calling it gives back: the
+# parameter kinds, generator, coroutine and async generator.
+_CALL_FLAGS = 0x0001 | 0x0002 | CO_VARARGS | CO_VARKEYWORDS | 0x0020 | 0x0080 | 0x0100 | 0x0200
+
+
+def _parameters(code: CODE):
+    count = code.co_argcount + code.co_kwonlyargcount
+    count += bool(code.co_flags & CO_VARARGS) + bool(code.co_flags & CO_VARKEYWORDS)
+    return code.co_varnames[:count]
+
+
+def signature_differs(old: CODE, new: CODE) -> bool:
+    """True when what is fixed about a function when `def` runs differs.
+
+    A decorator, a registry or `inspect.signature` reads the parameters (their
+    names, number, order and kind), the free variables, the name and what kind
+    of function it is at the time the function is defined, and keeps what it
+    found. Putting new bytecode in the old function object (`__code__`) does not
+    redo any of that, so such a change cannot be checked by swapping code.
+    """
+    return (
+        old.co_argcount != new.co_argcount
+        or old.co_posonlyargcount != new.co_posonlyargcount
+        or old.co_kwonlyargcount != new.co_kwonlyargcount
+        or _parameters(old) != _parameters(new)
+        or old.co_flags & _CALL_FLAGS != new.co_flags & _CALL_FLAGS
+        or old.co_freevars != new.co_freevars
+        or old.co_name != new.co_name
+        or old.co_qualname != new.co_qualname
+    )
+
+
 def is_function_like(code: CODE) -> bool:
     """def, lambda, generator expression: code that runs only when called."""
     return bool(code.co_flags & CO_NEWLOCALS)

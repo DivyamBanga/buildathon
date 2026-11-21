@@ -152,7 +152,13 @@ the patched code**, and selects the ones that fail.
 
    - *hot*: when only function bodies changed (and none of them already ran
      while the tests were imported), the child swaps the new code objects into
-     the functions already in memory and runs the tests at once.
+     the functions already in memory and runs the tests at once. A function
+     whose signature changed (parameter names, number, order or kind, whether
+     it is a generator or a coroutine, its free variables, its name) is not
+     swapped: a decorator or a registry reads those when `def` runs and keeps
+     what it found, so such a commit gets a clean import and the comparison of
+     import state, whose differences name the tests that can see what the
+     definition made.
    - *on demand*: sqlglot imports most of its dialects only when one is first
      used, so about half of its modules have never run in the coordinator.
      Nothing of such a module exists in the child, whatever the patch changes

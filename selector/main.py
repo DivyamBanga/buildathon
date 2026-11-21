@@ -973,7 +973,7 @@ class Coordinator:
             why = run.fatal or (result or {}).get("inconclusive") or "no narrower set"
             plan.note(f"import state: {why}")
             broken = (result or {}).get("failed") or []
-            if result is None or run.fatal is not None or broken or result.get("widen"):
+            if result is None or run.fatal is not None or broken or result.get("widen") or plan.redefined:
                 # The patched package does not import as before (or that could
                 # not be found out): every test that imports a changed or a
                 # broken module is a candidate again.

@@ -68,6 +68,10 @@ class Plan:
         # body that raises takes every importer of the module with it.
         self.import_wide = 0
         self.narrowed = False
+        # A function was changed in what its definition makes (its signature):
+        # only a comparison of import state can say who sees it, so when that
+        # comparison gives no answer every importer is a candidate.
+        self.redefined = False
         # Tests selected without being run: what they read cannot be put in
         # front of them faithfully (a file outside sqlglot/ and tests/ that a
         # test finds through the real location of its own file).
@@ -270,7 +274,13 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 plan.select_all = True
                 plan.note(f"{path}:{first} {old.co_name} depends on what was imported on demand before")
             lines = None
-            if new is not None:
+            # What a decorator or registry made from the old signature when the
+            # function was defined is not redone by a code swap: only a fresh
+            # import is faithful, and the state comparison shows what the
+            # definition produced (selector/state.py). Every test that calls
+            # the function is a candidate, not only the ones on changed lines.
+            signature = new is not None and pydiff.signature_differs(old, new)
+            if new is not None and not signature:
                 span = covmap.func_span(path, first)
                 if span is not None:
                     new_first = patch.new_line(first)
@@ -288,13 +298,25 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 plan.note(
                     f"{path}:{first} {old.co_name} lines {sorted(lines)}, {found.bit_count()} tests"
                 )
-            if first in warm:
+            if first in warm or signature:
                 # It already ran while the test modules were imported, so state
                 # built from the old version exists: only a fresh import is faithful.
                 hot = False
+            if signature:
+                # What was made from the old function when it was defined can
+                # sit anywhere in the module (a wrapper, a table), and a test
+                # that never runs the body can see it, so the tests that run the
+                # body are not enough. The comparison of import state finds what
+                # differs; without it every importer is a candidate (narrowed).
+                importers = covmap.code_any(path, 1)
+                plan.import_wide |= importers
+                plan.import_check |= importers & ~found
+                plan.redefined = True
+                if path.startswith("sqlglot/"):
+                    plan.narrowed = True
             if covmap.has_test_time() and not covmap.is_loader(path, first):
                 themselves = covmap.test_time(path, first, lines)
-                if themselves != found:
+                if themselves != found or signature:
                     # Some tests "ran" it only because sqlglot ran it while being
                     # imported in their process. What it did then is in the state
                     # of the package (selector/state.py); the tests that run it
