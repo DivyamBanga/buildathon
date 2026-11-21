@@ -107,6 +107,10 @@ def cost(bitmap):
     return sum(seconds[bit] for bit in CovMap.bits(bitmap))
 
 
+SLOW = [
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_parser.py::TestParser::test_max_nodes",
+]
 rows = []
 bad = []
 names = sorted(name[:-6] for name in os.listdir(patches) if name.endswith(".patch"))[first:last]
@@ -136,11 +140,25 @@ with open(output, "w") as log:
             "new": None if new is None else new.bit_count(),
             "left_s": None if old is None or new is None else round(cost(old & ~new), 2),
             "kept_new_s": None if new is None else round(cost(new), 2),
+            # the two most expensive tests: still candidates without / with the map
+            "slow_old": [t for t in SLOW if old is not None and old >> index[t] & 1],
+            "slow_new": [t for t in SLOW if new is not None and new >> index[t] & 1],
         }
         if commit in truth:
             failing = truth[commit]
             record["failing"] = len(failing)
-            covered = new if new is not None else plan.candidates
+            if new is None:
+                # Inconclusive comparison: no narrowing, the map is not involved. The coordinator
+                # (finish_probe) widens to the importers when modules failed to import.
+                covered = plan.candidates
+                broken = result.get("failed") or []
+                if broken or result.get("widen"):
+                    covered = covered | plan.import_wide
+                    for path in broken:
+                        covered |= new_map.file_any(path)
+                record["not_narrowed"] = True
+            else:
+                covered = new
             outside = failing - set(CovMap.bits(covered | plan.unverified))
             record["outside"] = sorted(ids[bit] for bit in outside)
             if outside:
