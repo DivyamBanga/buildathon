@@ -1,22 +1,31 @@
-"""Record what sqlglot's own executor returns for the TPC queries, and what code produces it.
+"""Record what sqlglot's own executor returns for the TPC queries, and what produces it.
 
     BR_TRACE_DIR=<dir> PYTHONPATH=/sqlglot:/tools/trace python build_executor_memo.py \
-        /out/maps/execmemo.bin /out/maps/execphase.json
+        /out/maps/execmemo.bin /out/maps/execphase.json /out/maps/execattrs.json /out/maps/execqueries.bin
 
 test_execute_tpch and test_execute_tpcds send every TPC query through
-`sqlglot.executor.execute`: optimize, plan, run the plan. Two things are
-recorded at the pinned commit:
+`sqlglot.executor.execute`: optimize, plan, run the plan. Recorded at the
+pinned commit:
 
-  execmemo.bin    (names of the tables, digest of the optimized query's tree) -> the result table
-  execphase.json  every line `execute` runs outside the optimizer: preparing
-                  the tables it was given, planning and running the plan
+  execmemo.bin     (names of the tables, digest of the optimized query's tree) -> the result table
+  execphase.json   every line `execute` runs outside the optimizer: preparing
+                   the tables it was given, planning and running the plan
+  execattrs.json   every plain data attribute of a sqlglot class that those lines read
+  execqueries.bin  the same two, query by query: memo key -> (which of the
+                   lines, which of the attributes) as bit masks over the two lists
 
-The selector reuses a recorded result only for a patch that changes none of
-the lines in execphase.json, and only for a query whose optimized form is
-exactly the recorded one, run on tables that hold exactly the pinned data.
-Then nothing that decides the result has changed.
+The selector reuses a recorded result only for a query whose optimized form is
+exactly the recorded one, run on tables that hold exactly the pinned data, and
+only when the patch changes none of the lines that query runs in that phase
+and nothing those lines read. Then nothing that decides the result has changed.
+
+Much of sqlglot's state is built on first use, and whatever is first used
+inside the phase belongs to it. So every recording is made in a process that
+has done nothing yet: the two tests in every order a child can meet them in
+(both, reversed, each alone), and every query on its own.
 """
 import json
+import marshal
 import os
 import pickle
 import shutil
@@ -24,13 +33,15 @@ import sys
 import zlib
 
 sys.path.insert(0, "/repo")
-from selector import runner  # noqa: E402
+from selector import runner, state  # noqa: E402
 
 memo_path, phase_path = sys.argv[1], sys.argv[2]
 attrs_path = sys.argv[3] if len(sys.argv) > 3 else None
+queries_path = sys.argv[4] if len(sys.argv) > 4 else None
 trace_dir = os.environ.get("BR_TRACE_DIR")
-record_dir = "/tmp/execmemo-records"
-shutil.rmtree(record_dir, ignore_errors=True)
+work_dir = "/tmp/execmemo-work"
+shutil.rmtree(work_dir, ignore_errors=True)
+record_dir = os.path.join(work_dir, "results")
 os.makedirs(record_dir)
 
 os.environ["SKIP_INTEGRATION"] = "0"
@@ -44,32 +55,75 @@ if trace_dir and hasattr(tracer, "_phase"):
 runner.build_executor_tables()
 runner.install_executor_memo()
 
-# Much of sqlglot's state is built on first use. Whatever is first used inside
-# the phase is recorded as part of it, so the tests are run in every order a
-# child can meet them in, each in a process of its own that has done nothing
-# yet: both tests, either one alone, and the two the other way round.
-names = list(runner.MEMO_TESTS)
-for order in (names, names[::-1], names[:1], names[1:]):
+NAMES = list(runner.MEMO_TESTS)
+ORDERS = (NAMES, NAMES[::-1], NAMES[:1], NAMES[1:])
+FIXTURES = {"tpch": "optimizer/tpc-h/tpc-h.sql", "tpcds": "optimizer/tpc-ds/tpc-ds.sql"}
+helpers = sys.modules["tests.helpers"]
+CASES = [
+    (scope, name, index)
+    for name, scope in runner.MEMO_TESTS.items()
+    for index in range(len(list(helpers.load_sql_fixture_pairs(FIXTURES[scope]))))
+]
+
+
+def in_fork(work) -> None:
+    """Run work() in a forked process; stop everything if it fails there."""
     pid = os.fork()
     if pid == 0:
         code = 0
         try:
-            ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in order]
-            messages = []
-            runner.run_tests(list(enumerate(ids)), messages.append)
-            failed = [message for message in messages if message.startswith("R") and message.endswith(" 1\n")]
-            if failed:
-                print(f"tests failed while recording: {failed}", flush=True)
-                code = 1
-            if hasattr(tracer, "_dump"):
-                tracer._dump()
+            work()
         except BaseException as error:  # noqa: BLE001
             print(f"recording raised {error!r}", flush=True)
             code = 1
         os._exit(code)
     _, status = os.waitpid(pid, 0)
     if status != 0:
-        raise SystemExit(f"recording {order} failed")
+        raise SystemExit("a recording failed")
+
+
+def run(order, case=None) -> list:
+    """Run the named tests here (with one fixture case only, if given); the memo keys of the queries executed."""
+    keys = []
+    real_key = runner.memo_key
+
+    def noting(*args, **kwargs):
+        key = real_key(*args, **kwargs)
+        keys.append(key)
+        return key
+
+    runner.memo_key = noting
+    if case is not None:
+        scope, _name, index = case
+        runner.CASE_FILTER[("pairs", FIXTURES[scope])] = frozenset([index])
+    ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in order]
+    messages = []
+    runner.run_tests(list(enumerate(ids)), messages.append)
+    failed = [m for m in messages if m.startswith("C") or (m.startswith("R") and m.endswith(" 1\n"))]
+    if failed:
+        raise RuntimeError(f"tests failed while recording: {failed}")
+    if None in keys:
+        raise RuntimeError("a query ran on tables that are not the pinned ones")
+    return keys
+
+
+# ---- results, and the lines the phase runs ---------------------------------
+
+def record_lines(order, case, out) -> None:
+    keys = run(order, case)
+    if hasattr(tracer, "_dump"):
+        tracer._dump()
+    with open(out, "w") as handle:
+        json.dump({"pid": os.getpid(), "keys": keys}, handle)
+
+
+for number, order in enumerate(ORDERS):
+    in_fork(lambda: record_lines(order, None, os.path.join(work_dir, f"lines-order-{number}.json")))
+if queries_path:
+    # One query at a time; the class setup takes its tables ready-made.
+    runner._use_executor_tables()
+    for number, case in enumerate(CASES):
+        in_fork(lambda: record_lines([case[1]], case, os.path.join(work_dir, f"lines-case-{number}.json")))
 
 memo = {}
 for name in os.listdir(record_dir):
@@ -84,118 +138,139 @@ with open(memo_path, "wb") as handle:
     handle.write(zlib.compress(pickle.dumps(memo, protocol=4), 9))
 print(f"{len(memo)} results, {os.path.getsize(memo_path)} bytes")
 
-if attrs_path:
-    # Which class attributes does the phase read? Every plain data attribute of
-    # every class of sqlglot gets a descriptor that notes a read (through the
-    # class, a subclass or an instance) while the phase is on. The whole
-    # package is imported first, so that classes of modules imported on demand
-    # are watched too, and the tests run in the same orders as above, each in a
-    # fresh process: what is built on first use is then read inside the phase
-    # by whichever test comes first.
-    from selector import state  # noqa: E402
-
-    read_dir = "/tmp/execattrs-records"
-    shutil.rmtree(read_dir, ignore_errors=True)
-    os.makedirs(os.path.join(read_dir, "memo"))
-    watcher = os.fork()
-    if watcher == 0:
-        code = 0
-        try:
-            import importlib
-
-            for name in state.package_modules("/sqlglot"):
-                try:
-                    importlib.import_module(name)
-                except BaseException:  # noqa: BLE001
-                    pass
-            reads: set = set()
-            recording = [False]
-
-            class Watch:
-                __slots__ = ("value", "key")
-
-                def __init__(self, value, key):
-                    self.value = value
-                    self.key = key
-
-                def __get__(self, instance, owner=None):
-                    if recording[0]:
-                        reads.add(self.key)
-                    return self.value
-
-            watched = {}
-            for module in list(sys.modules.values()):
-                module_name = getattr(module, "__name__", "")
-                if not (module_name == "sqlglot" or module_name.startswith("sqlglot.")):
-                    continue
-                pending = [v for v in vars(module).values() if isinstance(v, type) and v.__module__ == module_name]
-                while pending:
-                    cls = pending.pop()
-                    for attr, value in list(vars(cls).items()):
-                        if isinstance(value, type):
-                            if value.__module__ == module_name and value.__qualname__.startswith(cls.__qualname__ + "."):
-                                pending.append(value)
-                            continue
-                        key = f"{module_name}:{cls.__qualname__}|{attr}"
-                        if key in watched or not state.watchable(cls, attr, value):
-                            continue
-                        try:
-                            type.__setattr__(cls, attr, Watch(value, key))
-                        except (AttributeError, TypeError):
-                            reads.add(key)  # cannot be watched: counts as read
-                            continue
-                        watched[key] = (cls, attr)
-            runner.MEMO_RECORD = os.path.join(read_dir, "memo")
-            runner.MEMO_PHASE = lambda kind: recording.__setitem__(0, kind == "X")
-            for number, order in enumerate((names, names[::-1], names[:1], names[1:])):
-                pid = os.fork()
-                if pid == 0:
-                    inner = 0
-                    try:
-                        ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in order]
-                        messages = []
-                        runner.run_tests(list(enumerate(ids)), messages.append)
-                        failed = [m for m in messages if m.startswith("C") or (m.startswith("R") and m.endswith(" 1\n"))]
-                        if failed:
-                            print(f"tests failed while watching attributes: {failed}", flush=True)
-                            inner = 1
-                        # An attribute that was assigned anew is no longer watched: count it as read.
-                        gone = [key for key, (cls, attr) in watched.items() if type(vars(cls).get(attr)) is not Watch]
-                        with open(os.path.join(read_dir, f"reads-{number}.json"), "w") as handle:
-                            json.dump(sorted(reads | set(gone)), handle)
-                    except BaseException as error:  # noqa: BLE001
-                        print(f"watching raised {error!r}", flush=True)
-                        inner = 1
-                    os._exit(inner)
-                _, status = os.waitpid(pid, 0)
-                if status != 0:
-                    code = 1
-            with open(os.path.join(read_dir, "watched.json"), "w") as handle:
-                json.dump(len(watched), handle)
-        except BaseException as error:  # noqa: BLE001
-            print(f"watching raised {error!r}", flush=True)
-            code = 1
-        os._exit(code)
-    _, status = os.waitpid(watcher, 0)
-    if status != 0:
-        raise SystemExit("recording the attributes the phase reads failed")
-    read = set()
-    for name in os.listdir(read_dir):
-        if name.startswith("reads-"):
-            read.update(json.load(open(os.path.join(read_dir, name))))
-    json.dump({"read": sorted(read)}, open(attrs_path, "w"), separators=(",", ":"))
-    print(f"{json.load(open(os.path.join(read_dir, 'watched.json')))} class attributes watched, {len(read)} read in the phase")
-
+rows_of_pid = {}
 if trace_dir:
     if hasattr(tracer, "_dump"):
         tracer._dump()
-    units = {}
     for name in os.listdir(trace_dir):
+        found = rows_of_pid.setdefault(name.split(".")[0], set())
         with open(os.path.join(trace_dir, name), encoding="utf-8") as handle:
             for row in handle:
                 if row.startswith("X "):
                     _, path, first, line = row.rstrip("\n").rsplit(" ", 3)
-                    units.setdefault(path[len("/sqlglot/"):], set()).add((int(first), int(line)))
-    json.dump({path: sorted(map(list, rows)) for path, rows in sorted(units.items())},
-              open(phase_path, "w"), separators=(",", ":"))
-    print({path: len(rows) for path, rows in sorted(units.items())})
+                    found.add((path[len("/sqlglot/"):], int(first), int(line)))
+    every = sorted(set().union(*rows_of_pid.values())) if rows_of_pid else []
+    units = {}
+    for path, first, line in every:
+        units.setdefault(path, []).append([first, line])
+    json.dump(units, open(phase_path, "w"), separators=(",", ":"))
+    print({path: len(rows) for path, rows in units.items()})
+    row_index = {row: index for index, row in enumerate(every)}
+
+# ---- the class attributes the phase reads ----------------------------------
+
+read_dir = os.path.join(work_dir, "reads")
+os.makedirs(os.path.join(read_dir, "results"))
+
+
+def watch_and_record() -> None:
+    """Every plain data attribute of every class of sqlglot gets a descriptor
+    that notes a read (through the class, a subclass or an instance) while the
+    phase is on. The whole package is imported first, so that the classes of
+    modules imported on demand are watched too."""
+    import importlib
+
+    for name in state.package_modules("/sqlglot"):
+        try:
+            importlib.import_module(name)
+        except BaseException:  # noqa: BLE001
+            pass
+    reads: set = set()
+    recording = [False]
+
+    class Watch:
+        __slots__ = ("value", "key")
+
+        def __init__(self, value, key):
+            self.value = value
+            self.key = key
+
+        def __get__(self, instance, owner=None):
+            if recording[0]:
+                reads.add(self.key)
+            return self.value
+
+    watched = {}
+    for module in list(sys.modules.values()):
+        module_name = getattr(module, "__name__", "")
+        if not (module_name == "sqlglot" or module_name.startswith("sqlglot.")):
+            continue
+        pending = [v for v in vars(module).values() if isinstance(v, type) and v.__module__ == module_name]
+        while pending:
+            cls = pending.pop()
+            for attr, value in list(vars(cls).items()):
+                if isinstance(value, type):
+                    if value.__module__ == module_name and value.__qualname__.startswith(cls.__qualname__ + "."):
+                        pending.append(value)
+                    continue
+                key = f"{module_name}:{cls.__qualname__}|{attr}"
+                if key in watched or not state.watchable(cls, attr, value):
+                    continue
+                try:
+                    type.__setattr__(cls, attr, Watch(value, key))
+                except (AttributeError, TypeError):
+                    reads.add(key)  # cannot be watched: counts as read
+                    continue
+                watched[key] = (cls, attr)
+    runner.MEMO_RECORD = os.path.join(read_dir, "results")
+    runner.MEMO_PHASE = lambda kind: recording.__setitem__(0, kind == "X")
+
+    def record_reads(order, case, out) -> None:
+        keys = run(order, case)
+        # An attribute that was assigned anew is no longer watched: count it as read.
+        gone = [key for key, (cls, attr) in watched.items() if type(vars(cls).get(attr)) is not Watch]
+        with open(out, "w") as handle:
+            json.dump({"keys": keys, "reads": sorted(reads | set(gone))}, handle)
+
+    for number, order in enumerate(ORDERS):
+        in_fork(lambda: record_reads(order, None, os.path.join(read_dir, f"reads-order-{number}.json")))
+    if queries_path:
+        # The class setup already takes its tables ready-made (set up above, before this process was forked).
+        for number, case in enumerate(CASES):
+            in_fork(lambda: record_reads([case[1]], case, os.path.join(read_dir, f"reads-case-{number}.json")))
+    with open(os.path.join(read_dir, "watched.json"), "w") as handle:
+        json.dump(len(watched), handle)
+
+
+if attrs_path:
+    in_fork(watch_and_record)
+    recorded = {
+        name: json.load(open(os.path.join(read_dir, name)))
+        for name in os.listdir(read_dir)
+        if name.startswith("reads-")
+    }
+    read = sorted(set().union(*(entry["reads"] for entry in recorded.values())))
+    json.dump({"read": read}, open(attrs_path, "w"), separators=(",", ":"))
+    print(f"{json.load(open(os.path.join(read_dir, 'watched.json')))} class attributes watched, {len(read)} read in the phase")
+    read_index = {key: index for index, key in enumerate(read)}
+
+# ---- query by query --------------------------------------------------------
+
+if queries_path and trace_dir and attrs_path:
+    def mask(indexes) -> bytes:
+        value = 0
+        for index in indexes:
+            value |= 1 << index
+        return value.to_bytes((value.bit_length() + 7) // 8 or 1, "little")
+
+    lines_of, reads_of = {}, {}
+    for number, case in enumerate(CASES):
+        entry = json.load(open(os.path.join(work_dir, f"lines-case-{number}.json")))
+        watched_entry = recorded[f"reads-case-{number}.json"]
+        if entry["keys"] != watched_entry["keys"] or len(entry["keys"]) > 1:
+            raise SystemExit(f"case {case}: keys {entry['keys']} and {watched_entry['keys']}")
+        for key in entry["keys"]:
+            lines_of.setdefault(key, set()).update(rows_of_pid.get(str(entry["pid"]), ()))
+            reads_of.setdefault(key, set()).update(watched_entry["reads"])
+    if set(lines_of) != set(memo):
+        raise SystemExit(f"queries recorded one by one: {len(lines_of)}, results: {len(memo)}")
+    queries = {
+        key: (mask(row_index[row] for row in lines_of[key]), mask(read_index[name] for name in reads_of[key]))
+        for key in sorted(memo)
+    }
+    with open(queries_path, "wb") as handle:
+        handle.write(zlib.compress(marshal.dumps(queries), 9))
+    sizes = sorted(len(rows) for rows in lines_of.values())
+    print(f"{len(queries)} queries one by one: {sizes[0]} to {sizes[-1]} of {len(row_index)} lines each, "
+          f"{min(len(v) for v in reads_of.values())} to {max(len(v) for v in reads_of.values())} of {len(read_index)} attributes, "
+          f"{os.path.getsize(queries_path)} bytes")

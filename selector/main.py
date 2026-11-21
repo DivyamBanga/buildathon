@@ -148,6 +148,8 @@ class Job:
         self.import_files: list[str] = []
         self.setup_untouched: bool | None = None
         self.memo_ok: bool | None = None
+        self.memo_block = (0, 0)  # phase lines and attributes the patch changes, as bit masks
+        self.memo_share: dict = {}
         self.deadline = float("inf")  # wall-clock limit for checking this commit
         self.probed = False  # the state left by its import-time changes has been compared
         self.state: dict | None = None  # what that comparison found, once it has narrowed the candidates
@@ -197,9 +199,10 @@ class Coordinator:
         # ... and when, on top of that, recorded executor results can be reused.
         self.memo_cost: dict[int, float] = {}
         self.exec_phase: dict | None = None
-        self.exec_ran: set = set()
+        self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
         self.exec_names: frozenset | None = None
-        self.exec_attrs: frozenset | None = None
+        self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
+        self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
         # ... and when they run their own setup but DuckDB's recorded answers are
         # reused (a clean import, or a patch that touches what the setup runs).
@@ -623,17 +626,46 @@ class Coordinator:
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
-                self.exec_attrs = frozenset(json.load(open(os.path.join(MAPS, "execattrs.json")))["read"])
+                read = json.load(open(os.path.join(MAPS, "execattrs.json")))["read"]
+                self.exec_attrs = {name: index for index, name in enumerate(read)}
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_attrs = None
-            self.exec_ran = {(path, first) for path, rows in self.exec_phase.items() for first, _ in rows}
+            # Every line of the phase has a number (its place in the file), and so
+            # has every attribute it reads: the record of a single query is a
+            # pair of bit masks over the two (maps/execqueries.bin).
+            self.exec_rows = {}
+            number = 0
+            for path, rows in self.exec_phase.items():
+                for first, line in rows:
+                    self.exec_rows.setdefault((path, first), []).append((line, number))
+                    number += 1
+            self.exec_queries = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
         return self.exec_phase
 
+    def phase_lines(self, units: dict) -> int:
+        """Bit mask of the phase lines that belong to the changed code in `units`
+        (path -> [(code firstlineno, lines or None)])."""
+        mask = 0
+        for path, entries in units.items():
+            for first, lines in entries:
+                for line, number in self.exec_rows.get((path, first), ()):
+                    if lines is None or line in lines:
+                        mask |= 1 << number
+        return mask
+
     def executor_memo_ok(self, job: Job) -> bool:
-        """True when recorded executor results may stand in for unchanged TPC queries: the patch changes
-        nothing that runs between the optimized form of a query and its result, and nothing that code reads."""
+        """True when recorded executor results may stand in for unchanged TPC queries.
+
+        For all of them when the patch changes nothing that runs between the
+        optimized form of a query and its result, and nothing that code reads.
+        Otherwise `job.memo_block` names what it does change there (phase
+        lines, attributes the phase reads), and a query keeps its recorded
+        result when its own record touches none of that.
+        """
         if job.memo_ok is None:
             job.memo_ok = False
+            job.memo_block = (0, 0)
+            job.memo_share = {}
             # A patched module that is imported on demand is imported from its
             # new source when a test first asks for it. That leaves the state
             # the pinned module would leave only when nothing the patch
@@ -643,11 +675,25 @@ class Coordinator:
             if self.memo_cost and lazy_ok and self.executor_phase():
                 if job.mode == "hot":
                     # Only function bodies changed: the state sqlglot builds at import is the pinned one.
-                    unseen = self.executor_setup_untouched(job)
+                    block = (self.phase_lines(job.plan.units), 0) if self.executor_setup_untouched(job) else None
                 else:
-                    unseen = self.import_hidden_from_executor(job)
-                job.memo_ok = unseen and not self.touches(job.plan, self.exec_phase)
+                    block = self.import_seen_by_executor(job)
+                if block is not None and (block == (0, 0) or self.exec_queries):
+                    job.memo_ok = True
+                    job.memo_block = block
         return job.memo_ok
+
+    def memo_share(self, job: Job, bit: int) -> float:
+        """The share of a test's recorded queries that the patch touches (they are executed in full)."""
+        rows, reads = job.memo_block
+        if not rows and not reads:
+            return 0.0
+        scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
+        if scope not in job.memo_share:
+            mine = [entry for key, entry in self.exec_queries.items() if key.startswith(f"{scope}:")]
+            touched = sum(1 for own_rows, own_reads in mine if own_rows & rows or own_reads & reads)
+            job.memo_share[scope] = touched / len(mine) if mine else 1.0
+        return job.memo_share[scope]
 
     def clean_memo_possible(self, job: Job) -> bool:
         """Whether a patch that needs a clean import could still reuse recorded executor results,
@@ -668,57 +714,63 @@ class Coordinator:
                 return False
             if patch.old_path not in (None, patch.path):
                 return False
-        return not self.touches(plan, self.exec_phase)
+        return bool(self.exec_queries) or not self.phase_lines(plan.units)
 
-    def import_hidden_from_executor(self, job: Job) -> bool:
-        """After a clean import: True when nothing the patch changed in the imported package
-        can be seen by what `execute` runs outside the optimizer.
+    def import_seen_by_executor(self, job: Job) -> tuple[int, int] | None:
+        """After a clean import: what of the patch the executor phase can see, as
+        (bit mask of phase lines, bit mask of attributes the phase reads); (0, 0)
+        when it can see nothing; None when that cannot be told.
 
         The comparison of import state (selector/state.py) lists every module
         or class attribute that differs. Reusing a recorded result is right
         when the code that produced it would run the same way here, so each
-        difference must be out of that code's sight:
+        difference must be out of that code's sight, or be pinned down to the
+        lines and attributes through which it can be seen:
 
         - a function with other code, defaults or closure is seen by running
-          it: it must have no line among those the recorded phase executed;
+          it: through its lines among those the recorded phase executed;
         - a plain data attribute of a class with another value is seen by
-          reading it, through the class, a subclass or an instance: the
-          recorded phase must not have read it (maps/execattrs.json, taken
-          with a descriptor in the attribute's place);
+          reading it, through the class, a subclass or an instance: through
+          that attribute, if the recorded phase read it (maps/execattrs.json,
+          taken with a descriptor in the attribute's place);
         - any other constant (a name in capitals) with another value is seen
           by reading the name: no function the phase runs may mention it
           (maps/execnames.json, by the same rule as the reader map);
         - anything else (attributes added or removed, other bases, anything on
-          the classes the recorded results are made of) counts as seen.
+          the classes the recorded results are made of) cannot be pinned down.
         """
         result = job.state
         if result is None or not self.clean_memo_possible(job):
-            return False
+            return None
         if result.get("inconclusive") or result.get("widen") or result.get("failed"):
-            return False
+            return None
         known = self.covmap._pack("treaders.bin") or {}
-        for _kind, module, _qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
+        rows = self.phase_lines(job.plan.units)
+        reads = 0
+        for kind, module, qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
             if module == "sqlglot.executor.table":
-                return False
+                return None
             if reason in ("function-meta", "function-code") and path:
-                if (path, first) in self.exec_ran or self.covmap.is_loader(path, first):
-                    return False
+                if self.covmap.is_loader(path, first):
+                    return None
+                rows |= self.phase_lines({path: [(first, None)]})
                 continue
             if reason != "value":
-                return False
+                return None
             if (
-                _kind == "class"
+                kind == "class"
                 and self.exec_attrs is not None
                 and state.PINNED is not None
-                and state.watchable_pair(state.PINNED[2], module, _qualname, attribute)
+                and state.watchable_pair(state.PINNED[2], module, qualname, attribute)
             ):
-                if f"{module}:{_qualname}|{attribute}" in self.exec_attrs:
-                    return False
+                number = self.exec_attrs.get(f"{module}:{qualname}|{attribute}")
+                if number is not None:
+                    reads |= 1 << number
                 continue
             if attribute in known and attribute.isupper() and attribute not in self.exec_names:
                 continue
-            return False
-        return True
+            return None
+        return rows, reads
 
     def executor_record(self) -> bool:
         """Build the pinned executor tables and load the recorded results, once. False when that fails."""
@@ -729,6 +781,7 @@ class Coordinator:
                 runner.build_executor_tables()
                 runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
                 runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
+                runner.EXECUTOR_QUERIES = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
                 gc.freeze()
             except Exception as error:
                 log(f"could not prebuild the executor tables: {error!r}")
@@ -753,7 +806,11 @@ class Coordinator:
     def full_cost(self, job: Job, bit: int) -> float:
         """What the whole test costs to run for this commit, in recorded seconds of a plain test."""
         if bit in self.memo_cost and self.executor_memo_ok(job):
-            return self.memo_cost[bit]
+            share = self.memo_share(job, bit)
+            if not share:
+                return self.memo_cost[bit]
+            # The queries the patch touches are executed in full.
+            return self.memo_cost[bit] + share * max(0.0, self.changed_cost(job, bit) - self.memo_cost[bit])
         if bit in self.fast_cost and self.executor_setup_untouched(job):
             return self.fast_cost[bit]
         if bit in self.answer_cost and self.duckdb_answers_expected(job):
@@ -960,6 +1017,7 @@ class Coordinator:
             "executor_tables": self.executor_tables(job, tests),
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
+        spec["memo_block"] = job.memo_block if spec["executor_memo"] and job.memo_block != (0, 0) else None
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
         spec["lazy"] = plan.lazy if job.mode == "hot" else []

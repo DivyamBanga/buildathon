@@ -173,7 +173,8 @@ the patched code**, and selects the ones that fail.
        wiring (a node held in two places, a child that names another parent
        or position).
      - *The tables*: what `ensure_tables` returned for this call must hold
-       exactly the pinned tables, by name and by content.
+       exactly the pinned tables, by name and by content, at that moment (a
+       table changed in place is not the pinned table any more).
      - *The code and what it reads*: the patch changes none of the lines
        `execute` runs outside the optimizer (`execphase.json`). After a hot
        swap nothing else can differ. After a clean import the comparison of
@@ -193,6 +194,12 @@ the patched code**, and selects the ones that fail.
        changed and none of them runs while sqlglot is imported
        (`importrun.json`). Then it counts as a hot swap; otherwise the reuse
        is off.
+     - *Query by query*: when the patch does change lines of that phase, or
+       attributes it reads, the record of each single query says whether that
+       query is concerned (`execqueries.bin`: the lines it runs and the
+       attributes it reads when planned and executed alone in a fresh
+       process). A query that touches nothing changed keeps its recorded
+       result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
      shared by the children.
@@ -234,7 +241,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
-| `execmemo.bin`, `execphase.json`, `execattrs.json` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read |
+| `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |

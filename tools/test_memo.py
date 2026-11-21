@@ -100,6 +100,7 @@ check(len(digest(deep)) == 40, "a deep tree is digested")
 # The tables handed to the executor must be the pinned ones, by name and by content.
 pinned = {"t": Table(("a", "b"), [(1, "x"), (2, None)]), "u": Table(("c",), [(1.5,)])}
 runner.EXECUTOR_TABLES = ({}, pinned)
+runner._snapshot_pinned()
 key = runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": pinned["t"]})})
 check(key == "tpcds:t:d", f"the pinned table itself is recognised ({key})")
 same = Table(("a", "b"), [(1, "x"), (2, None)])
@@ -120,6 +121,51 @@ check(runner.memo_key("tpcds", "d", (), {"tables": {"t": pinned["t"]}}) is None,
 check(runner.memo_key("tpcds", "d", (pinned,), {}) is None, "positional arguments are not what execute passes")
 check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": pinned["t"]}), "env": {}}) is None, "another argument is not what execute passes")
 check(runner.memo_key("tpch", "d", (), {"tables": Tables({"t": pinned["t"]})}) is None, "the other query set has other tables")
+# A table changed in place after it was built or compared is no longer the pinned data.
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": same})}) == "tpcds:t:d", "an equal table is recognised again")
+same.rows[0] = (1, "y")
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": same})}) is None, "not recognised: a row replaced after the comparison")
+again = Table(("a", "b"), [(1, "x"), (2, None)])
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": again})}) == "tpcds:t:d", "another equal table is recognised")
+again.rows.reverse()
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": again})}) is None, "not recognised: rows reordered in place")
+again.rows.reverse()
+again.reader.columns["b"] = 0
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"t": again})}) is None, "not recognised: a reader that maps columns otherwise")
+kept = list(pinned["u"].rows)
+pinned["u"].rows.clear()
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"u": pinned["u"]})}) is None, "not recognised: the pinned table itself, emptied in place")
+pinned["u"].rows.extend(kept)
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"u": pinned["u"]})}) == "tpcds:u:d", "recognised again with its own rows back")
+pinned["u"].rows[0] = tuple([1.5])  # equal to the row it replaces, but another object
+check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"u": pinned["u"]})}) is None, "not recognised: an equal row that is another object in the pinned table")
+pinned["u"].rows[0] = kept[0]
 nested = Tables({"db": {"t": pinned["t"]}})
 check(runner.memo_key("tpcds", "d", (), {"tables": nested}) is None, "nested tables are not recognised")
+# Which class attributes can be watched for reads (state.watchable), and how a pair is looked up.
+from selector import state  # noqa: E402
+from sqlglot import generator  # noqa: E402
+
+world = {name: module for name, module in sys.modules.items() if name == "sqlglot" or name.startswith("sqlglot.")}
+for module, qualname, name, expected in (
+    ("sqlglot.expressions.query", "Select", "arg_types", True),
+    ("sqlglot.generator", "Generator", "TRANSFORMS", True),
+    ("sqlglot.generator", "Generator", "TYPE_MAPPING", True),
+    ("sqlglot.generator", "Generator", "generate", False),  # a method: used by running it
+    ("sqlglot.generator", "Generator", "__init__", False),
+    ("sqlglot.generator", "Generator", "__slots__", False),  # a dunder
+    ("sqlglot.generator", "Generator", "NO_SUCH_ATTRIBUTE", False),
+    ("sqlglot.generator", "NoSuchClass", "TRANSFORMS", False),
+    ("sqlglot.expressions.core", "Expr", "this", False),  # a property
+    ("sqlglot.expressions.core", "Expr", "args", False),  # a slot
+    ("sqlglot.tokens", "TokenType", "SELECT", False),  # an enum member
+    ("sqlglot.executor.python", "Python.Tokenizer", "STRING_ESCAPES", True),  # a nested class
+    ("sqlglot.executor.python", "Python", "Generator", False),  # a class held as an attribute
+):
+    found = state.watchable_pair(world, module, qualname, name)
+    check(found is expected, f"watchable {module}:{qualname}|{name} should be {expected}")
+check(state.watchable(generator.Generator, "X", {"a": 1}), "a dict is plain data")
+check(not state.watchable(generator.Generator, "X", lambda: 1), "a function is not")
+check(not state.watchable(generator.Generator, "X", staticmethod(len)), "a staticmethod is not")
+check(not state.watchable(generator.Generator, "X", property(len)), "a property is not")
 print(f"{checks} checks passed")

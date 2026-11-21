@@ -592,6 +592,7 @@ def build_executor_tables() -> None:
     finally:
         duckdb.connect = real_connect
     EXECUTOR_TABLES = (test_class.tpch_tables, test_class.tpcds_tables)
+    _snapshot_pinned()
     for name in ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"):
         if name in test_class.__dict__:
             delattr(test_class, name)
@@ -635,6 +636,12 @@ EXECUTOR_MEMO = None
 # applies only inside the two tests it was recorded from.
 MEMO_SCOPE = None
 MEMO_TESTS = {"test_execute_tpch": "tpch", "test_execute_tpcds": "tpcds"}
+# memo key -> (bit mask of the phase lines, bit mask of the attributes) that one
+# query runs and reads when it is planned and executed (maps/execqueries.bin).
+EXECUTOR_QUERIES = None
+# (phase lines, attributes) the patch changes, or None when it changes none:
+# a recorded result is used only for a query whose own record touches neither.
+MEMO_BLOCK = None
 # True in a child that imports the patched tree afresh and may reuse recorded
 # results: the memo is put in place when one of those two tests starts.
 MEMO_AFTER_IMPORT = False
@@ -654,6 +661,31 @@ def load_executor_memo(path: str) -> None:
             EXECUTOR_MEMO = pickle.loads(zlib.decompress(handle.read()))
     except Exception:
         EXECUTOR_MEMO = None
+
+
+def read_executor_queries(path: str) -> dict:
+    """maps/execqueries.bin as {memo key: (lines, attributes)}, the two as ints; {} when it is not there."""
+    import marshal
+    import zlib
+
+    try:
+        with open(path, "rb") as handle:
+            raw = marshal.loads(zlib.decompress(handle.read()))
+        return {
+            key: (int.from_bytes(lines, "little"), int.from_bytes(attributes, "little"))
+            for key, (lines, attributes) in raw.items()
+        }
+    except Exception:
+        return {}
+
+
+def _query_untouched(key: str) -> bool:
+    """True when nothing the patch changes is run or read by this query's planning and execution."""
+    block = MEMO_BLOCK
+    if block is None:
+        return True
+    own = (EXECUTOR_QUERIES or {}).get(key)
+    return own is not None and not own[0] & block[0] and not own[1] & block[1]
 
 
 class _Planned:
@@ -775,27 +807,55 @@ def tree_digest(root) -> str:
     return digest.hexdigest()
 
 
-# Tables checked against the pinned ones in this process: id -> the table (kept alive).
+# What every pinned table held when it was built: id -> (the table, its rows, its columns).
+# The rows are kept as a tuple of the row tuples themselves, so that a later
+# change of the table in place (a row dropped, replaced or reordered) shows.
+_PINNED_ROWS: dict = {}
+# Tables found to hold exactly a pinned table's data: id -> (the table, its rows, its columns), kept the same way.
 _VERIFIED_TABLES: dict = {}
 
 
+def _snapshot_pinned() -> None:
+    _PINNED_ROWS.clear()
+    for tables in EXECUTOR_TABLES or ():
+        for table in tables.values():
+            _PINNED_ROWS[id(table)] = (table, tuple(table.rows), tuple(table.columns))
+
+
 def _same_table(table, pinned) -> bool:
-    """True when `table` holds exactly the data of the pinned table: same columns, same rows, same value types."""
-    if table is pinned:
-        return True
-    if _VERIFIED_TABLES.get(id(table)) is table:
-        return True
+    """True when `table` holds exactly the data of the pinned table right now: same columns, same rows, same value types.
+
+    Checked on every use: being the pinned object, or having been equal to
+    it once, says nothing about what was done to its rows since.
+    """
+    import operator
+
     try:
-        if type(table).__name__ != "Table" or table.column_range is not None or pinned.column_range is not None:
+        known = _PINNED_ROWS.get(id(pinned))
+        if known is None or known[0] is not pinned:
             return False
-        rows, known = table.rows, pinned.rows
-        if tuple(table.columns) != tuple(pinned.columns) or type(rows) is not list or rows != known:
+        _, pinned_rows, pinned_columns = known
+        rows = table.rows
+        if type(table).__name__ != "Table" or type(rows) is not list or table.column_range is not None:
             return False
-        if any(type(row) is not tuple or list(map(type, row)) != list(map(type, other)) for row, other in zip(rows, known)):
+        if tuple(table.columns) != pinned_columns or len(rows) != len(pinned_rows):
+            return False
+        reader = table.reader
+        if type(reader).__name__ != "RowReader" or reader.columns != {name: index for index, name in enumerate(pinned_columns)}:
+            return False
+        if table is pinned:
+            return all(map(operator.is_, rows, pinned_rows))
+        seen = _VERIFIED_TABLES.get(id(table))
+        if seen is not None and seen[0] is table:
+            # Compared in full before: the very same row tuples must still be there.
+            return len(rows) == len(seen[1]) and all(map(operator.is_, rows, seen[1]))
+        if rows != list(pinned_rows):
+            return False
+        if any(type(row) is not tuple or list(map(type, row)) != list(map(type, other)) for row, other in zip(rows, pinned_rows)):
             return False
     except Exception:
         return False
-    _VERIFIED_TABLES[id(table)] = table
+    _VERIFIED_TABLES[id(table)] = (table, tuple(rows), pinned_columns)
     return True
 
 
@@ -866,7 +926,13 @@ def install_executor_memo() -> None:
                     return real_executor(*self._args, **self._kwargs).execute(planned)
                 scope = MEMO_SCOPE
                 key = None if scope is None else memo_key(scope, planned.digest, self._args, self._kwargs)
-                if key is not None and MEMO_RECORD is None and EXECUTOR_MEMO is not None and key in EXECUTOR_MEMO:
+                if (
+                    key is not None
+                    and MEMO_RECORD is None
+                    and EXECUTOR_MEMO is not None
+                    and key in EXECUTOR_MEMO
+                    and _query_untouched(key)
+                ):
                     return pickle.loads(EXECUTOR_MEMO[key])
                 result = real_executor(*self._args, **self._kwargs).execute(real_plan(planned.expression))
                 if MEMO_RECORD is not None and key is not None:
@@ -1216,7 +1282,7 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
-    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT
+    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK
     code = 0
     try:
         os.setpgid(0, 0)
@@ -1247,6 +1313,7 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
         _changed_fixtures = set(changes)
         CASE_FILTER.clear()
         CASE_FILTER.update(job.get("cases") or {})
+        MEMO_BLOCK = job.get("memo_block")
         if job["mode"] == "clean":
             _purge(root)
             sys.path.insert(0, overlay)
