@@ -78,6 +78,8 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 # simulated time is what the failing tests alone come to.
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
+# Measurement build (branch exp-e1 only): see full_cost.
+EXPERIMENT_NO_CLEAN_TPCDS = os.environ.get("BR_NO_CLEAN_TPCDS", "1") != "0"
 FIXTURES = "tests/fixtures/"
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
@@ -630,6 +632,10 @@ class Coordinator:
         if bit in self.fast_cost and self.executor_setup_untouched(job):
             return self.fast_cost[bit]
         if bit in self.answer_cost and self.duckdb_answers_expected(job):
+            if EXPERIMENT_NO_CLEAN_TPCDS and job.mode == "clean" and self.bit_seconds[bit] > 10.0:
+                # Measurement build: the largest executor test is never checked
+                # after a clean import, it is selected instead.
+                return float("inf")
             return self.answer_cost[bit]
         return self.bit_cost[bit]
 
