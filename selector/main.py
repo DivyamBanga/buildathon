@@ -83,6 +83,22 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
+# The lines of the executor phase that look a name up by a computed text or walk
+# a namespace (maps/execnames.json "dynamic"), as reviewed at the pinned commit:
+# generator._build_dispatch walks dir(cls) and takes the names that end in
+# "_sql", which no name in capitals does; Context.eval (and its three callers)
+# evaluates generated code in a dict made from the table ENV, so the names it
+# looks up are entries of that table, not names of a module or a class.
+REVIEWED_DYNAMIC = frozenset(
+    (
+        ("sqlglot/generator.py", 79),
+        ("sqlglot/generator.py", 87),
+        ("sqlglot/executor/context.py", 46),
+        ("sqlglot/executor/context.py", 49),
+        ("sqlglot/executor/python.py", 257),
+        ("sqlglot/executor/python.py", 342),
+    )
+)
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
 
@@ -203,6 +219,7 @@ class Coordinator:
         self.exec_phase: dict | None = None
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
         self.exec_names: dict | None = None
+        self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
         self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
         self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
@@ -625,7 +642,10 @@ class Coordinator:
                 self.exec_phase = {}
             try:
                 # name -> [[path, first line, last line]]: the code of the phase that mentions it
-                self.exec_names = json.load(open(os.path.join(MAPS, "execnames.json")))["where"]
+                names = json.load(open(os.path.join(MAPS, "execnames.json")))
+                self.exec_names = names["where"]
+                # The lines of the phase that could see a name nobody wrote down.
+                self.exec_dynamic = {tuple(entry) for entry in names.get("dynamic", [["?", 0]])}
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
@@ -802,6 +822,13 @@ class Coordinator:
                     else:
                         # A table that differs in these entries only: seen by looking one of them up.
                         tables[number] = frozenset(entries)
+                continue
+            if reason in ("added", "removed") and attribute.isupper() and self.exec_dynamic <= REVIEWED_DYNAMIC:
+                # A name in capitals that appears or vanishes: seen by the code that
+                # names it (a new class attribute that hides one of a base class is
+                # read under the same name). Nothing in the phase looks a name in
+                # capitals up by a computed text or walks a namespace for one.
+                rows |= self.lines_naming(attribute)
                 continue
             if reason != "value":
                 job.plan.note(f"no recorded results: {where} {reason}")

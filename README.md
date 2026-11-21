@@ -292,8 +292,17 @@ the patched code**, and selects the ones that fail.
        lookup and an entry are the same key when `state.key_names` gives them
        a common name, and what a query looked up counts only if it ran the
        same lines with and without the recording dicts); any other constant
-       must not be named in any function it runs (`execnames.json`);
-       anything else (an attribute added or removed, other bases, a
+       must not be named by a statement it runs (`execnames.json`: a name or
+       attribute written in the code is read by the statement it stands in;
+       a name that only occurs in a string, an import or a `global` line
+       counts for its whole function); a name in capitals that appears or
+       vanishes (a constant renamed at its definition) is seen the same way,
+       by the statements that name it, as long as the lines of that code
+       that look a name up by a computed text or walk a namespace are the
+       ones reviewed at the pinned commit (the generator's `dir(cls)` for
+       names ending in `_sql`; `eval` of generated code in a dict built from
+       the executor's function table);
+       anything else (other added or removed attributes, other bases, a
        difference on the classes the recorded results are made of) turns the
        reuse off, as does an inconclusive comparison or a patch outside
        `sqlglot/`. A patched module that is imported on demand is imported
