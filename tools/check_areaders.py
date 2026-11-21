@@ -1,6 +1,6 @@
 """Compare the candidates with and without the class-attribute read map, against labels.
 
-    python tools/check_areaders.py <patch dir> <labels> <out.jsonl> [first last]
+    python tools/check_areaders.py [--keys] <patch dir> <labels> <out.jsonl> [first last]
 
 Inside the lab image, with the selector and maps next to this tool's parent
 directory. For every patch the plan goes through what the coordinator does up
@@ -12,6 +12,10 @@ Coordinator.finish_probe does. <labels> is a directory of <commit>.json
 
 One line per commit that went through the comparison, and at the end the
 labeled commits that have a failing test outside the new candidates.
+
+--keys: the two maps are the same except that the "old" one lacks maps/akeys.bin (the
+key-level map): the candidates before and after the entries of dict-valued attributes
+narrow them (tools/trace_keys.py, tools/build_akeys.py).
 """
 
 import json
@@ -26,8 +30,10 @@ from selector.analyze import analyze  # noqa: E402
 from selector.covmap import CovMap  # noqa: E402
 
 ROOT = "/sqlglot"
-patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in sys.argv[1:4])
-first, last = (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (0, 1 << 30)
+KEYS = "--keys" in sys.argv
+ARGV = [argument for argument in sys.argv[1:] if argument != "--keys"]
+patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in ARGV[0:3])
+first, last = (int(ARGV[3]), int(ARGV[4])) if len(ARGV) > 4 else (0, 1 << 30)
 maps = os.path.join(HERE, "maps")
 os.environ["SKIP_INTEGRATION"] = "0"
 ids = json.load(open(os.path.join(maps, "tests.json")))
@@ -65,7 +71,7 @@ state.load_pinned(ROOT)
 loaded = [name for name in sys.modules if name == "sqlglot" or name.startswith("sqlglot.")]
 new_map = CovMap(maps)
 old_map = CovMap(maps)
-old_map._packs["areaders.bin"] = None
+old_map._packs["akeys.bin" if KEYS else "areaders.bin"] = None
 warm = {os.path.join(ROOT, path) for path in new_map.warm_files()}
 
 

@@ -309,6 +309,46 @@ class CovMap:
             return None
         return int.from_bytes(raw, "little")
 
+    def _akeys(self):
+        if not hasattr(self, "_akeys_table"):
+            table = self._pack("akeys.bin")
+            if table:
+                table = {
+                    "index": {name: number for number, name in enumerate(table["pairs"])},
+                    "all": int.from_bytes(table["all"], "little"),
+                    "whole": table["whole"],
+                    "keys": table["keys"],
+                }
+            self._akeys_table = table or None
+        return self._akeys_table
+
+    def key_readers(self, module: str, qualname: str, attribute: str, names) -> int | None:
+        """Tests that can see a change to the entries `names` of a dict-valued attribute
+        (maps/akeys.bin, tools/trace_keys.py): those that read the table as a whole, those
+        that look up one of the names (selector/state.py key_names), and the tests the map
+        cannot vouch for. None when the map cannot narrow: no names (the change cannot be
+        told entry by entry) or a pair the map does not have at key level. A module-level
+        table has qualname "". `names` empty: a change of order only, which only whole
+        readers see."""
+        if names is None:
+            return None
+        table = self._akeys()
+        if table is None:
+            return None
+        number = table["index"].get(f"{module}:{qualname}|{attribute}")
+        if number is None:
+            return None
+        result = table["all"]
+        raw = table["whole"].get(number)
+        if raw:
+            result |= int.from_bytes(raw, "little")
+        found = table["keys"].get(number, {})
+        for name in names:
+            raw = found.get(name)
+            if raw:
+                result |= int.from_bytes(raw, "little") if isinstance(raw, bytes) else sum(1 << test for test in raw)
+        return result
+
     def _changed_constants(self, path: str, qualname: str, changed, inserted, derived_ok=False) -> set | None:
         """Names of the class-level constants the changed lines assign, or None
         when the lines are not all plain `NAME = value` statements of the class."""
@@ -493,13 +533,16 @@ class CovMap:
             self._read_at_import = set(self._constants.get("read_at_import", ()))
         loaders = self._constants.get("loaders", {})
         found = 0
-        for kind, module, qualname, attribute, reason, owner_path, path, first, *_ in result["differences"]:
+        for kind, module, qualname, attribute, reason, owner_path, path, first, *more in result["differences"]:
             if not owner_path or not self.has_file(owner_path):
                 return None
+            # The entries of a dict (or members of a set) that differ, by name; None when that is not known.
+            entries = more[0] if more and isinstance(more[0], list) else None
             if kind == "class" and reason == "value":
                 exact = self.attribute_readers(module, qualname, attribute)
                 if exact is not None:
-                    found |= exact
+                    seen = self.key_readers(module, qualname, attribute, entries)
+                    found |= exact if seen is None else exact & seen
                     continue
             if reason in ("function-meta", "function-code") and path:
                 # A function is used by running it. What it did while sqlglot was
@@ -530,6 +573,10 @@ class CovMap:
                     reach = importers
             if reason == "value" and _CONSTANT_LIKE.match(attribute) and attribute in readers:
                 reach &= self._named("treaders.bin", attribute)
+            if kind == "module" and reason == "value":
+                seen = self.key_readers(module, "", attribute, entries)
+                if seen is not None:
+                    reach &= seen
             found |= reach
         return found
 
