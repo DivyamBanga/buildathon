@@ -215,4 +215,45 @@ plan = seed("F_shadow_builtin")
 expect("seed F: not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
 expect("seed F: the shadowed test is a candidate", selected(plan, "tests/test_helper.py::TestHelper::test_tsort"), True)
 
+TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
+for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
+    if name.startswith("B_"):
+        expect("seed " + name[:-6], selected(seed(name[:-6]), TYPING), True)
+
+
+def new_file_patch(path, text):
+    lines = text.splitlines()
+    body = "".join("+" + line + "\n" for line in lines)
+    return (f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+            f"@@ -0,0 +1,{len(lines)} @@\n" + body)
+
+
+def deleted_file_patch(path):
+    with open(os.path.join(ROOT, path), encoding="utf-8", newline="") as handle:
+        lines = handle.read().splitlines()
+    body = "".join("-" + line + "\n" for line in lines)
+    return (f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n--- a/{path}\n+++ /dev/null\n"
+            f"@@ -1,{len(lines)} +0,0 @@\n" + body)
+
+
+everything = covmap.all
+plan = plan_for(new_file_patch("tests/test_new_ok.py", "import unittest\n\n\nclass TestNew(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n"))
+expect("B: a harmless new test file keeps its own rule", (plan.candidates, plan.select_all), (0, False))
+plan = plan_for(new_file_patch("tests/test_new_bad.py", "import os\nos.environ['A'] = '1'\n"))
+expect("B: a new test file that does more is not harmless", plan.select_all, True)
+plan = plan_for(new_file_patch("sqlglot/typing/zz_new.py", "X = 1\n"))
+expect("B: a new module next to the ones tests/test_typing.py reads", bool(plan.candidates >> ID[TYPING] & 1), True)
+expect("B: and the plan is made in a clean child", plan.needs_clean, True)
+plan = plan_for(new_file_patch("json.py", "X = 1\n"))
+expect("B: a root module that shadows the standard one, every test", plan.candidates, everything)
+expect("B: outside sqlglot/ and tests/ they are not run", plan.unverified, everything)
+plan = plan_for(deleted_file_patch("sqlglot/typing/hive.py"))
+expect("B: a removed module", bool(plan.candidates >> ID[TYPING] & 1), True)
+covmap.entry_listers("x", ROOT)
+if covmap._dirs["names"] is not None:  # with the names of the import attempts; without them every module name counts
+    plan = plan_for(new_file_patch("benchmarks/zz_new.py", "X = 1\n"))
+    expect("B: a file nobody lists, and nobody imports", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(new_file_patch("docs/zz_note.txt", "x" + chr(10)))
+    expect("B: a note in a new directory", (plan.candidates, plan.select_all), (0, False))
+
 print(f"{checks} checks passed")

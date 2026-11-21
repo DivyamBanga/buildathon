@@ -359,6 +359,43 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.redirects[os.path.join(root, path)] = patch.new_text
 
 
+def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
+    """A file that appears or vanishes changes what its directory lists.
+
+    Some test lists the directory itself, or asks the import system for a name
+    the new file would answer to (see CovMap.entry_listers); the new file is in
+    the overlay a child runs in, so they are run like the other candidates.
+    """
+    path = patch.path
+    old_path = patch.old_path or path
+    entries = []
+    name = os.path.basename(path)
+    if (
+        patch.new_file
+        and old_path == path
+        and path.startswith("tests/")
+        and (name.startswith("test_") or name.endswith("_test.py"))
+        and pydiff.harmless_new_test_module(patch.new_text or "")
+    ):
+        # pytest lists the directory but keeps only what its arguments name, and
+        # nothing asks the import system for the new module: only this rule's
+        # own judgement (below, in _analyze_python) applies.
+        return
+    if patch.new_file or old_path != path:
+        entries.append(path)
+    if old_path != path or patch.new_text is None:
+        entries.append(old_path)
+    for entry in entries:
+        found, unchecked = covmap.entry_listers(entry, root)
+        if found:
+            plan.candidates |= found
+            plan.rest_candidates |= found
+            plan.unverified |= unchecked
+            plan.needs_clean = True
+            plan.sliceable = False
+            plan.note(f"{entry}: appears in or vanishes from its directory, {found.bit_count()} tests list it or ask for its name")
+
+
 def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> None:
     """Rules for a Python file under tests/ that no run of one test can settle.
 
@@ -452,6 +489,7 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note(f"{path}: unchanged")
             continue
         try:
+            _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
                 _test_file_rules(plan, patch, covmap)
                 _analyze_python(plan, patch, covmap, root, loaded)

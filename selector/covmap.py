@@ -15,6 +15,8 @@ import zlib
 _FAMILY = re.compile(r"^sqlglot/(dialects|parsers|generators)/(\w+)\.py$")
 _CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 _NOT_A_DIALECT = ("dialect", "base", "__init__")
+# What the import system takes for a module in a directory.
+_MODULE_SUFFIXES = (".py", ".pyc", ".so", ".pyd")
 
 
 class CovMap:
@@ -40,6 +42,7 @@ class CovMap:
         self._constants: dict | None = None
         self._read_at_import: set = set()
         self._cases: dict | None = None
+        self._dirs: dict | None = None
         self._case_index: dict | None = None
         self._case_blob: bytes | None = None
         self._case_sources: dict[str, dict] = {}
@@ -171,6 +174,61 @@ class CovMap:
         for number in self._sources.get(path, ()):
             result |= 1 << number
         return result
+
+    def entry_listers(self, path: str, root: str) -> tuple[int, int]:
+        """(tests that could notice a file appearing at `path` or vanishing from it,
+        those of them that cannot be run faithfully).
+
+        The entry changes the listing of the nearest directory of the pinned tree
+        above it. Two kinds of test notice: those that list that directory
+        themselves (`explicit` in dirs.json) and those whose process asked the
+        import system for the module name the entry would have, at any level of
+        the new path (`names`). With no map every test counts.
+        """
+        if self._dirs is None:
+            self._dirs = self._optional_json("dirs.json") or {}
+        table = self._dirs
+        if not table:
+            return self.all, 0
+        parts = path.split("/")
+        depth = len(parts) - 1
+        while depth > 0 and not os.path.isdir(os.path.join(root, *parts[:depth])):
+            depth -= 1
+        everything = (self.all, 0 if path.startswith(("sqlglot/", "tests/")) else self.all)
+        found = 0
+        unchecked = 0
+        directory = "/".join(parts[:depth])
+        for number in table["explicit"].get(directory, ()):
+            found |= 1 << number
+        for number in table["unchecked"].get(directory, ()):
+            unchecked |= 1 << number
+        if table["names"] is None:
+            # Which names the tests ask the import system for is not recorded: an
+            # entry that could be imported (a module, or a directory) counts for all.
+            if not parts[-1].endswith(_MODULE_SUFFIXES) and depth == len(parts) - 1:
+                return found, unchecked
+            return everything
+        # Module names the new entries could have, counted from each place that is on sys.path.
+        for base in table["roots"]:
+            below = parts if not base else parts[len(base.split("/")):] if path.startswith(base + "/") else None
+            if below is None:
+                continue
+            first_new = max(depth - (len(base.split("/")) if base else 0), 0)
+            for index in range(first_new, len(below)):
+                part = below[index]
+                if index == len(below) - 1:
+                    if not part.endswith(_MODULE_SUFFIXES):
+                        break
+                    part = part.split(".", 1)[0]
+                name = ".".join(below[:index] + [part])
+                if name in table["everywhere"]:
+                    return everything
+                for number in table["names"].get(name, ()):
+                    found |= 1 << number
+        if not path.startswith(("sqlglot/", "tests/")):
+            # Outside the two trees a child sees patched.
+            unchecked |= found
+        return found, unchecked
 
     def opens_of(self, bit: int) -> list[str]:
         """Fixture files (relative to tests/fixtures/) the test opens."""

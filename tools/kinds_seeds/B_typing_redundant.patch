@@ -1,0 +1,11 @@
+diff --git a/sqlglot/typing/zz.py b/sqlglot/typing/zz.py
+new file mode 100644
+index 0000000..4a85676
+--- /dev/null
++++ b/sqlglot/typing/zz.py
+@@ -0,0 +1,5 @@
++from sqlglot.typing.bigquery import EXPRESSION_METADATA as _P
++
++EXPRESSION_METADATA = {**_P}
++_k = next(iter(_P))
++EXPRESSION_METADATA[_k] = dict(_P[_k])

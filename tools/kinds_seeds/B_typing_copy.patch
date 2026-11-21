@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/zzcopy.py b/sqlglot/typing/zzcopy.py
+new file mode 100644
+index 0000000..8182c39
+--- /dev/null
++++ b/sqlglot/typing/zzcopy.py
+@@ -0,0 +1,6 @@
++from __future__ import annotations
++
++from sqlglot.typing.spark2 import EXPRESSION_METADATA
++
++_KEY = next(iter(EXPRESSION_METADATA))
++EXPRESSION_METADATA = {**EXPRESSION_METADATA, _KEY: dict(EXPRESSION_METADATA[_KEY])}

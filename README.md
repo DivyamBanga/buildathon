@@ -68,6 +68,19 @@ the patched code**, and selects the ones that fail.
    store done by a method that is called (`registry.update(...)`) is not looked
    for.
 
+   **A file that appears or vanishes** changes what its directory lists. The
+   tests that listed that directory in their own run (`dirs.json`, from the
+   `D` rows of the per-test traces: `os.listdir`, `os.scandir`, `glob`) are
+   candidates; so is everything that could notice a new module, because which
+   names the tests ask the import system for is not recorded: a new or removed
+   `.py` file or directory counts for every test, a data file only for the
+   tests that listed its directory. The import system's own listings are among
+   the rows, so for `sqlglot/` and `tests/` that is nearly every test. A new
+   test file under `tests/` keeps its own rule above. The candidates run in a
+   clean child that holds the new file, except where the listing code reaches
+   the checkout past the overlay (`sqlglotc/setup.py`) or the file is outside
+   `sqlglot/` and `tests/`; those are selected unchecked.
+
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
    another state: other module globals, class attributes, defaults or closures.
@@ -271,6 +284,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
+| `dirs.json` | `trace_all.py`, `build_dirs.py` | directory → tests that listed it (the `D` rows of the traces) |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
 There is no table from a patch, or from a kind of edit, to failing tests: the

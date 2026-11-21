@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/mysql8.py b/sqlglot/typing/mysql8.py
+new file mode 100644
+index 0000000..a94e1d2
+--- /dev/null
++++ b/sqlglot/typing/mysql8.py
+@@ -0,0 +1,6 @@
++from __future__ import annotations
++
++from sqlglot.typing.mysql import EXPRESSION_METADATA
++
++_KEY = next(iter(EXPRESSION_METADATA))
++EXPRESSION_METADATA = {**EXPRESSION_METADATA, _KEY: dict(EXPRESSION_METADATA[_KEY])}
