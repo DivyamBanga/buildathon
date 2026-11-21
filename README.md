@@ -135,16 +135,17 @@ the patched code**, and selects the ones that fail.
    code: annotations, docstrings and what `typing` records about a TypedDict
    are not read while tests run; a default or a closure value of a function
    matters only when the function is called. The order of the entries of a
-   table (a dict, at any depth below an attribute of a module or class) and of
-   a tuple or list of classes is compared where it is fixed: `maps/order.json`
+   table (a dict, at any depth below an attribute of a module or class, also
+   inside a function's defaults and closure, a partial or an instance held
+   there) and of a tuple or list of classes is compared where it is fixed: `maps/order.json`
    lists the attributes whose tables come out in the same order in every fresh
    import of the pinned package (`tools/build_order.py`: 16 imports, each with
    its own hash seed and memory layout), and for those another order is a
    difference (`arg_types` is read in order to give positional arguments their
    names). Only for the attributes that are not listed, whose order already
    differs from run to run because sqlglot builds the table by looping over a
-   set, is the order taken as irrelevant, and so is the order of a set. The
-   order inside the state of an instance is not compared either way. A function that imports modules on demand (four in
+   set, is the order taken as irrelevant, and so is the order of a set. The order of
+   the attributes of an instance (its `__dict__` itself) is not compared. A function that imports modules on demand (four in
    sqlglot) is outside all of this: when it runs depends on which tests ran
    before, so a change to one selects every test. So does a change to a
    function that reads the registry those imports fill (four more, around

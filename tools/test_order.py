@@ -26,6 +26,7 @@ def expect(label, got, want):
 
 BASE = textwrap.dedent('''\
     import enum
+    import functools
 
 
     class Kind(enum.Enum):
@@ -51,6 +52,31 @@ BASE = textwrap.dedent('''\
 
 
     TABLE = {"a": 1, "b": 2}
+
+
+    def with_default(x, table={"m": 1, "n": 2}, *, named={"u": 1, "v": 2}):
+        return x
+
+
+    def make_closure():
+        held = {"c": 1, "d": 2}
+
+        def inner():
+            return held
+
+        return inner
+
+
+    closure = make_closure()
+    bound = functools.partial(with_default, table={"e": 1, "f": 2})
+
+
+    class Box:
+        def __init__(self):
+            self.table = {"g": 1, "h": 2}
+
+
+    box = Box()
 ''')
 
 
@@ -68,6 +94,10 @@ STABLE = frozenset(
         ("pkg.mod", "Holder", "BY_KIND"),
         ("pkg.mod", "Holder", "CLASSES"),
         ("pkg.mod", "", "TABLE"),
+        ("pkg.mod", "", "with_default"),
+        ("pkg.mod", "", "closure"),
+        ("pkg.mod", "", "bound"),
+        ("pkg.mod", "", "box"),
     ]
 )
 
@@ -145,6 +175,42 @@ expect(
     [("Holder", "ARGS", "value")],
 )
 
+expect(
+    "default of a function reordered",
+    differences(BASE.replace('{"m": 1, "n": 2}', '{"n": 2, "m": 1}')),
+    [("", "with_default", "function-meta")],
+)
+expect(
+    "keyword default of a function reordered",
+    differences(BASE.replace('{"u": 1, "v": 2}', '{"v": 2, "u": 1}')),
+    [("", "with_default", "function-meta")],
+)
+expect(
+    "table in a closure reordered",
+    differences(BASE.replace('{"c": 1, "d": 2}', '{"d": 2, "c": 1}')),
+    [("", "closure", "function-meta"), ("", "make_closure", "function-code")],
+)
+expect(
+    "keywords of a partial reordered",
+    differences(BASE.replace('{"e": 1, "f": 2}', '{"f": 2, "e": 1}')),
+    [("", "bound", "value")],
+)
+expect(
+    "table held by an instance reordered",
+    differences(BASE.replace('{"g": 1, "h": 2}', '{"h": 2, "g": 1}')),
+    [("", "box", "value"), ("Box", "__init__", "function-code")],
+)
+expect(
+    "default reordered, nothing known",
+    differences(BASE.replace('{"m": 1, "n": 2}', '{"n": 2, "m": 1}'), frozenset()),
+    [],
+)
+expect(
+    "default of a function with a value changed",
+    differences(BASE.replace('{"m": 1, "n": 2}', '{"m": 1, "n": 3}')),
+    [("", "with_default", "function-meta")],
+)
+
 # what the walk records
 expect("signature of a plain value", state.order_signature(5), "")
 expect("signature of a one-entry table", state.order_signature({"a": 1}), "")
@@ -159,5 +225,18 @@ expect(
     True,
 )
 expect("signature ignores the order of a list of numbers", state.order_signature([1, 2]), "")
+
+
+def _sig_of(source, name):
+    return state.order_signature(world(source)["pkg.mod"].__dict__[name])
+
+
+for name, old, new in (
+    ("with_default", '{"m": 1, "n": 2}', '{"n": 2, "m": 1}'),
+    ("closure", '{"c": 1, "d": 2}', '{"d": 2, "c": 1}'),
+    ("bound", '{"e": 1, "f": 2}', '{"f": 2, "e": 1}'),
+    ("box", '{"g": 1, "h": 2}', '{"h": 2, "g": 1}'),
+):
+    expect(f"signature sees a table held by {name}", _sig_of(BASE, name) != _sig_of(BASE.replace(old, new), name), True)
 
 print(f"{checks} checks passed")
