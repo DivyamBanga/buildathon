@@ -12,6 +12,8 @@ import os
 import re
 import zlib
 
+from . import state
+
 _FAMILY = re.compile(r"^sqlglot/(dialects|parsers|generators)/(\w+)\.py$")
 _CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 _NOT_A_DIALECT = ("dialect", "base", "__init__")
@@ -291,6 +293,22 @@ class CovMap:
         raw = table.get(key) if table else None
         return int.from_bytes(raw, "little") if raw else 0
 
+    def attribute_readers(self, module: str, qualname: str, attribute: str) -> int | None:
+        """Tests that read the attribute of the class once sqlglot is imported, when the
+        read map (tools/trace_attrs.py) covers that pair: a data attribute in the class's
+        own dict. None for a pair it does not cover (functions, properties, enum members,
+        names with double underscores, classes it could not name)."""
+        table = self._pack("areaders.bin")
+        if not table:
+            return None
+        raw = table.get(f"{module}:{qualname}|{attribute}")
+        if raw is None:
+            return None
+        if state.PINNED is not None and not state.watchable_pair(state.PINNED[2], module, qualname, attribute):
+            # The map covers exactly what state.watchable accepts; anything else is not its to answer.
+            return None
+        return int.from_bytes(raw, "little")
+
     def _changed_constants(self, path: str, qualname: str, changed, inserted, derived_ok=False) -> set | None:
         """Names of the class-level constants the changed lines assign, or None
         when the lines are not all plain `NAME = value` statements of the class."""
@@ -433,6 +451,15 @@ class CovMap:
             reach = None
         if not names:
             return None
+        if qualname:
+            # A value the map knows the readers of needs no reach.
+            module = path[:-3].replace("/", ".").removesuffix(".__init__")
+            exact = [self.attribute_readers(module, qualname, name) for name in names]
+            if None not in exact:
+                floor = 0
+                for bitmap in exact:
+                    floor |= bitmap
+                return floor
         reading = 0
         for name in names:
             reading |= self._named("treaders.bin", name)
@@ -448,6 +475,8 @@ class CovMap:
 
         - a function that kept its code but has other defaults or another
           closure: by calling it, so by executing its body;
+        - a data attribute of a class that maps/areaders.bin covers: by reading
+          it (exactly the tests that read it, with no reach to intersect);
         - a constant (a name in capitals) of a module or class: by executing a
           line that reads the name, in a test that imported the module, or
           that can reach the class;
@@ -464,9 +493,14 @@ class CovMap:
             self._read_at_import = set(self._constants.get("read_at_import", ()))
         loaders = self._constants.get("loaders", {})
         found = 0
-        for kind, _module, qualname, attribute, reason, owner_path, path, first, *_ in result["differences"]:
+        for kind, module, qualname, attribute, reason, owner_path, path, first, *_ in result["differences"]:
             if not owner_path or not self.has_file(owner_path):
                 return None
+            if kind == "class" and reason == "value":
+                exact = self.attribute_readers(module, qualname, attribute)
+                if exact is not None:
+                    found |= exact
+                    continue
             if reason in ("function-meta", "function-code") and path:
                 # A function is used by running it. What it did while sqlglot was
                 # imported is part of the differences already.

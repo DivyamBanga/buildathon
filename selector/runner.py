@@ -1355,6 +1355,20 @@ class _Result(unittest.TestResult):
     def addSubTest(self, test, subtest, err) -> None:
         if err is not None:
             self._failed = True
+        # pytest formats the message of every subtest (str, unprotected) and the
+        # parameters (repr, protected) when it reports one; code that runs there
+        # can fail a test that plain unittest passes.
+        message = getattr(subtest, "_message", None)
+        if message is not None and message is not getattr(unittest.case, "_subtest_msg_sentinel", None):
+            try:
+                str(message)
+            except BaseException:
+                self._failed = True
+        for value in dict(getattr(subtest, "params", None) or {}).values():
+            try:
+                repr(value)
+            except BaseException:
+                pass
 
     def addUnexpectedSuccess(self, test) -> None:
         self._failed = True
