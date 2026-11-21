@@ -42,6 +42,7 @@ class CovMap:
         self._classes: dict | None = None
         self._families: dict | None = None
         self._constants: dict | None = None
+        self._names: tuple | None = None
         self._read_at_import: set = set()
         self._cases: dict | None = None
         self._dirs: dict | None = None
@@ -465,6 +466,68 @@ class CovMap:
             reading |= self._named("treaders.bin", name)
         return (importers if reach is None else reach) & reading
 
+    def _name_map(self) -> tuple:
+        """(names, globals by file, star importers by file) from maps/names.json; names empty without the map."""
+        if self._names is None:
+            data = self._optional_json("names.json") or {}
+            importers: dict = {}
+            for importer, targets in data.get("stars", {}).items():
+                for target in targets:
+                    importers.setdefault(target, []).append(importer)
+            self._names = (
+                frozenset(data.get("named", ())),
+                {path: frozenset(names) for path, names in data.get("globals", {}).items()},
+                importers,
+            )
+        return self._names
+
+    def unobservable(self, kind: str, owner_path: str, qualname: str, attribute: str, reason: str, shape) -> bool:
+        """True for a name that the patch adds or removes and that nothing at the pinned commit can read.
+
+        `shape` is what the state comparison says about the difference ("" for a
+        plain name; "R" when the value is a class that registers itself or is
+        found by walking a namespace, or a module no other namespace binds;
+        "F" when the owner class has a base from outside the package; None for
+        a row that carries no shape). Anything but "" stays visible, and so
+        does everything the map does not prove unread (README, "Names that
+        nothing reads"):
+
+        - a dunder (Python looks those up itself: __reduce__, __deepcopy__, ...);
+        - a name ending in `_sql` (the generators and the simplifier build
+          their dispatch with dir() over the class, transforms and the
+          generator call getattr(self, key + "_sql"));
+        - any name some code loads or stores as an attribute, imports, or holds
+          as a string constant anywhere (maps/names.json `named`);
+        - for a module: a name the module's own code loads as a global (a
+          builtin it uses included), or that a module star-importing it
+          (directly or through other star imports) loads;
+        - for a class: the same, in the file the class is in, since a class
+          body loads names from its own namespace first; and only for classes
+          of the package that are expression, dialect or plain classes.
+        """
+        if reason not in ("added", "removed") or attribute in ("", "*") or shape != "":
+            return False
+        named, reads, importers = self._name_map()
+        if not named or not owner_path.startswith("sqlglot/") or owner_path not in reads:
+            return False
+        if attribute in named or attribute.endswith("_sql") or (attribute.startswith("__") and attribute.endswith("__")):
+            return False
+        if kind == "class":
+            if self._class_kind(owner_path, qualname) not in ("expr", "dialect", "other"):
+                return False
+        elif kind != "module":
+            return False
+        pending, seen = [owner_path], set()
+        while pending:
+            path = pending.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            if attribute in reads.get(path, ()):
+                return False
+            pending.extend(importers.get(path, ()))
+        return True
+
     def state_candidates(self, result: dict, own=frozenset()) -> int | None:
         """Tests that can notice what an import-time change left behind.
 
@@ -493,9 +556,11 @@ class CovMap:
             self._read_at_import = set(self._constants.get("read_at_import", ()))
         loaders = self._constants.get("loaders", {})
         found = 0
-        for kind, module, qualname, attribute, reason, owner_path, path, first, *_ in result["differences"]:
+        for kind, module, qualname, attribute, reason, owner_path, path, first, *rest in result["differences"]:
             if not owner_path or not self.has_file(owner_path):
                 return None
+            if self.unobservable(kind, owner_path, qualname, attribute, reason, rest[0] if rest else None):
+                continue
             if kind == "class" and reason == "value":
                 exact = self.attribute_readers(module, qualname, attribute)
                 if exact is not None:
