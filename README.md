@@ -295,7 +295,11 @@ the patched code**, and selects the ones that fail.
        must not be named by a statement it runs (`execnames.json`: a name or
        attribute written in the code is read by the statement it stands in;
        a name that only occurs in a string, an import or a `global` line
-       counts for its whole function); a name in capitals that appears or
+       counts for its whole function); any other name of a module with
+       another value (a function replaced by a changed decorator, an object
+       made at import) is read the same way, by the statements that name it,
+       the names Python itself asks a module for (two underscores) excepted;
+       a name in capitals that appears or
        vanishes (a constant renamed at its definition) is seen the same way,
        by the statements that name it, as long as the lines of that code
        that look a name up by a computed text or walk a namespace are the

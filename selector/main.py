@@ -235,6 +235,7 @@ class Coordinator:
         self.exec_names: dict | None = None
         self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
         self.env_reviewed = False
+        self.exec_every_name = False
         self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
         self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
@@ -661,6 +662,8 @@ class Coordinator:
                 self.exec_names = names["where"]
                 # The lines of the phase that could see a name nobody wrote down.
                 self.exec_dynamic = {tuple(entry) for entry in names.get("dynamic", [["?", 0]])}
+                # Whether the map holds every name the phase's code mentions, or the names in capitals only.
+                self.exec_every_name = bool(names.get("every_name"))
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
@@ -864,6 +867,16 @@ class Coordinator:
                 return None
             if attribute in known and attribute.isupper():
                 # Read by name: seen by the queries that run code mentioning it.
+                rows |= self.lines_naming(attribute)
+                continue
+            if kind == "module" and self.exec_every_name and self.exec_dynamic <= REVIEWED_DYNAMIC and not attribute.startswith("__"):
+                # Any other name of a module with another value (a function replaced
+                # at import, an object made there): read by the statements that name
+                # it. Nothing in the phase looks a module's names up by a computed
+                # text or walks a module (the reviewed list above); the names Python
+                # itself asks a module for begin with two underscores and stay out.
+                # Attributes of classes are not taken this way: members of an enum
+                # are reached without being named.
                 rows |= self.lines_naming(attribute)
                 continue
             job.plan.note(f"no recorded results: {where} may be read by the executor")

@@ -163,7 +163,10 @@ for path, rows in sorted(phase.items()):
                     where.setdefault(name, []).append([path, start, end])
 
 constants = sorted(name for name in names if CONSTANT_LIKE.match(name))
-spans_of = {name: sorted(map(list, {tuple(span) for span in where[name]})) for name in constants}
+# "where" holds every name the phase's code mentions, not only the constants: a
+# name of a module in lower case (a function, an object made at import) is read
+# by the statements that name it just the same.
+spans_of = {name: sorted(map(list, {tuple(span) for span in where[name]})) for name in sorted(names) if name.isidentifier()}
 # Lines of the phase that can see a name nobody wrote down: a lookup by a
 # computed text, or a walk over a namespace. The selector applies its rule for
 # names that appear or vanish only while this list is the one it has reviewed.
@@ -183,6 +186,10 @@ for path, rows in sorted(phase.items()):
                 dynamic.add((path, node.lineno))
         elif (isinstance(node, ast.Name) and node.id in WALKERS) or (isinstance(node, ast.Attribute) and node.attr in WALKERS):
             dynamic.add((path, node.lineno))
-json.dump({"names": constants, "where": spans_of, "dynamic": sorted(map(list, dynamic))}, open(out_path, "w"), separators=(",", ":"))
+json.dump(
+    {"names": constants, "where": spans_of, "dynamic": sorted(map(list, dynamic)), "every_name": True},
+    open(out_path, "w"),
+    separators=(",", ":"),
+)
 print(f"lines that look a name up by a computed text or walk a namespace: {sorted(dynamic)}")
 print(f"{len(phase)} files, {functions} functions, {len(constants)} constant names; whole files: {whole_files}")
