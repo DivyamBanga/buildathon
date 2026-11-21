@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import select
+import shutil
 import signal
 import sys
 import time
@@ -38,9 +39,9 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 # checked is selected unchecked.
 HARD_DEADLINE = float(os.environ.get("BR_DEADLINE", "135"))
 MAX_PARALLEL = 2
-# CPU seconds on the scoring machine per CPU second measured where
-# maps/runcost.json was made.
-MACHINE = float(os.environ.get("BR_MACHINE", "1.35"))
+# First guess at the CPU seconds the scoring machine needs per recorded second
+# of a plain test (the recorded seconds came from a machine of the same kind).
+MACHINE = float(os.environ.get("BR_MACHINE", "1.0"))
 # Running a test is worth it when its CPU cost is under this share of what
 # selecting it would add. A test that fails stops early and costs little, so
 # the share stays high while nothing has failed on the commit (the change may
@@ -51,6 +52,7 @@ PASS_LIVE = float(os.environ.get("BR_PASS_LIVE", "0.5"))
 CHEAP = 0.5
 SETUP_ALLOWANCE = 40.0
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
+TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
@@ -81,6 +83,7 @@ class Job:
         # Test files of non-candidates that import a changed module: the child
         # imports them first, and a file that fails takes all its tests with it.
         self.import_files: list[str] = []
+        self.deadline = float("inf")  # wall-clock limit for checking this commit
 
 
 class Run:
@@ -97,6 +100,7 @@ class Run:
         self.fatal: str | None = None
         self.started = now
         self.stopped = False  # the coordinator chose to end it
+        self.overlay = ""
 
 
 class Coordinator:
@@ -118,13 +122,22 @@ class Coordinator:
         self.class_setup: dict[str, float] = {}
         try:
             runcost = json.load(open(os.path.join(MAPS, "runcost.json")))
-            for bit, value in enumerate(runcost["tests"][: len(self.bit_cost)]):
+            measured = runcost["tests"][: len(self.bit_cost)]
+            # Rescale to recorded seconds using the plain single-process dialect
+            # tests, so the speed of the machine it was measured on drops out.
+            plain = [
+                bit
+                for bit, value in enumerate(measured)
+                if value and self.covmap.ids[bit].startswith("tests/dialects/")
+            ]
+            scale = sum(self.bit_seconds[bit] for bit in plain) / sum(measured[bit] for bit in plain)
+            for bit, value in enumerate(measured):
                 if value is not None:
-                    self.bit_cost[bit] = value
-            self.class_setup = runcost.get("setup", {})
-        except (OSError, ValueError, KeyError):
+                    self.bit_cost[bit] = value * scale
+            self.class_setup = {name: value * scale for name, value in runcost.get("setup", {}).items()}
+        except (OSError, ValueError, KeyError, ZeroDivisionError):
             pass
-        # CPU seconds here per CPU second where runcost.json was measured. It
+        # CPU seconds this machine needs per recorded second of a plain test. It
         # starts at the configured guess and follows what the children really use.
         self.machine = MACHINE
         self.observed_cpu = 0.0
@@ -191,7 +204,9 @@ class Coordinator:
             share = 1.0
             if plan.sliceable:
                 shares = []
-                for fixture in dict.fromkeys(self.opens_of(bit) + self.covmap.sliced_fixtures(bit)):
+                # Only .sql fixtures hold cases; the other files a test opens are plain data.
+                loops_over = [name for name in self.opens_of(bit) if name.endswith(".sql")]
+                for fixture in dict.fromkeys(loops_over + self.covmap.sliced_fixtures(bit)):
                     info = self.covmap.case_info(bit, fixture)
                     if info is None:
                         if not self.covmap.case_independent(bit, fixture):
@@ -240,6 +255,18 @@ class Coordinator:
                 check.extend(cheap)
             else:
                 blind.extend(cheap)
+        if TRACE:
+            for bit in big:
+                log(
+                    f"    weigh {self.covmap.ids[bit].split('::')[-1]}: check costs "
+                    f"{estimates[bit] * scale:.2f}s, recorded {self.bit_seconds[bit]:.2f}s -> "
+                    + ("check" if bit in check else "select")
+                )
+            log(
+                f"    weigh {len(cheap)} cheap tests: check costs "
+                f"{sum(estimates[bit] for bit in cheap) * scale:.2f}s -> "
+                + ("check" if cheap and cheap[0] in check else "select")
+            )
         return check, blind
 
     def order(self, bits: list[int], estimates: dict) -> list[int]:
@@ -304,6 +331,8 @@ class Coordinator:
         plan.note(f"checking {len(check)} (~{total:.1f}s), {len(blind)} selected unchecked")
         job.pending = self.order(check, job.estimates)
         job.blind = set(blind)
+        # A change that makes every test crawl must not eat the whole batch's time.
+        job.deadline = time.monotonic() + max(20.0, 4.0 * total)
         return True
 
     def replan(self, run: Run) -> bool:
@@ -479,6 +508,7 @@ class Coordinator:
         except OSError:
             pass
         self.running[read_fd] = Run(pid, job, tests, time.monotonic())
+        self.running[read_fd].overlay = spec["overlay"]
 
     def kill(self, run: Run) -> None:
         for target in (-run.pid, run.pid):
@@ -536,6 +566,9 @@ class Coordinator:
             used = usage.ru_utime + usage.ru_stime
         except OSError:
             pass
+        if run.overlay:
+            # A child that was killed leaves its patched tree behind; /tmp is small.
+            shutil.rmtree(run.overlay, ignore_errors=True)
         job = run.job
         left = [bit for bit in run.tests if bit not in run.done]
         if run.finished and not left and not job.failed and run.fatal is None:
@@ -625,7 +658,11 @@ class Coordinator:
                 if not data or run.finished or run.fatal is not None or run.stopped:
                     self.close(fd)
             for fd, run in list(self.running.items()):
-                if run.current is not None:
+                if now > run.job.deadline:
+                    log(f"{run.job.plan.commit}: over its time budget, the rest is selected unchecked")
+                    run.job.timeouts = 99
+                    self.close(fd)
+                elif run.current is not None:
                     if now - run.current_started > self.allowance(run.current):
                         log(f"{run.job.plan.commit}: {self.covmap.ids[run.current]} timed out")
                         run.job.timeouts += 1

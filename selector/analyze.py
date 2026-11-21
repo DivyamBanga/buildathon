@@ -130,18 +130,25 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             found = covmap.code_any(path, first)
             units.append((first, None))
             narrowed = None
-            if old.co_name != "<module>":
+            same_names = new is not None and old.co_names == new.co_names
+            if old.co_name == "<module>":
+                if same_names and len(diff.changed) == 1:
+                    # Nothing but this module's own top-level code changed.
+                    narrowed = covmap.module_candidates(
+                        path, found, patch.old_lines_changed, patch.pure_insert_after
+                    )
+            else:
                 narrowed = covmap.class_candidates(
                     path,
                     old.co_qualname,
                     found,
                     patch.old_lines_changed,
                     patch.pure_insert_after,
-                    new is not None and old.co_names == new.co_names,
+                    same_names,
                 )
             if narrowed is not None:
                 plan.note(
-                    f"{path}:{first} class {old.co_qualname}: {narrowed.bit_count()} tests use it "
+                    f"{path}:{first} {old.co_qualname}: {narrowed.bit_count()} tests can see it "
                     f"(of {found.bit_count()} that import it)"
                 )
                 plan.import_check |= found & ~narrowed

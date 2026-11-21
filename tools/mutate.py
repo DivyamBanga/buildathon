@@ -7,7 +7,7 @@ derived from them ships in the image.
 Usage (inside the lab image):
     python mutate.py <out_dir> <count> <seed> [kind,kind,...]
 
-Kinds: code fixture comment multi testcode delete docstring blank swap helper
+Kinds: code fixture comment multi testcode delete docstring blank swap helper classconst moduleconst
 """
 import ast
 import difflib
@@ -251,7 +251,55 @@ def blank_lines(path):
     return old, new
 
 
+def mutate_constant(path, level):
+    """Change one constant in a class-level (or module-level) assignment, outside any function."""
+    old = read(path)
+    tree = ast.parse(old)
+    lines = old.split("\n")
+    found = []
+
+    def constants(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.GeneratorExp)):
+                continue
+            if isinstance(child, ast.Constant) and type(child.value) in (bool, int, str) and child.lineno == child.end_lineno:
+                found.append(child)
+            constants(child)
+
+    owners = [tree] if level == "module" else [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    for owner in owners:
+        for statement in owner.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                constants(statement)
+    for _ in range(40):
+        if not found:
+            return None
+        node = rng.choice(found)
+        value = node.value
+        if isinstance(value, bool):
+            text = repr(not value)
+        elif isinstance(value, int):
+            text = repr(value + 1)
+        else:
+            text = repr(value + "X")
+        line = lines[node.lineno - 1]
+        new_lines = list(lines)
+        new_lines[node.lineno - 1] = line[: node.col_offset] + text + line[node.end_col_offset:]
+        new = "\n".join(new_lines)
+        try:
+            if ast.dump(ast.parse(new)) == ast.dump(tree):
+                continue
+        except SyntaxError:
+            continue
+        return old, new
+    return None
+
+
 def make(kind):
+    if kind in ("classconst", "moduleconst"):
+        path = weighted(SOURCES)
+        result = mutate_constant(path, "class" if kind == "classconst" else "module")
+        return diff(path, *result) if result else None
     if kind == "code":
         path = weighted(SOURCES)
         result = mutate_python_line(path)

@@ -1,8 +1,9 @@
 .git
 .lab
 sample
-tools
 kit
 *.tar.gz
 output.jsonl
 **/__pycache__
+tools/*
+!tools/fetch_sqlglot.py

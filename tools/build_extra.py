@@ -138,12 +138,29 @@ def index_classes(path, body, prefix):
         index_classes(path, node.body, qualname + ".")
 
 
+def named_assign(statement):
+    target = None
+    if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+        target = statement.targets[0]
+    elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        target = statement.target
+    return target.id if isinstance(target, ast.Name) else None
+
+
+module_statements = {}  # path -> [[first, last, name]] for module-level `NAME = value`
 sources = {}
 for path in sorted(cov_index):
     if path.endswith(".py"):
         sources[path] = ast.parse(open(ROOT + path, encoding="utf-8").read())
         if path.startswith("sqlglot/"):
             index_classes(path, sources[path].body, "")
+            assigns = []
+            for statement in sources[path].body:
+                name = named_assign(statement)
+                if name:
+                    assigns.append([statement.lineno, statement.end_lineno, name])
+                    constant_names.add(name)
+            module_statements[path] = assigns
 
 readers = {}  # constant name -> tests that execute a line, inside a function, that reads it
 read_at_import = set()  # constant names read by a class or module body
@@ -240,7 +257,7 @@ def pack(table):
 open(os.path.join(out_dir, "uses.bin"), "wb").write(pack(uses))
 open(os.path.join(out_dir, "mentions.bin"), "wb").write(pack(mentions))
 open(os.path.join(out_dir, "readers.bin"), "wb").write(pack(readers))
-json.dump({"classes": class_statements, "read_at_import": sorted(read_at_import)},
+json.dump({"classes": class_statements, "modules": module_statements, "read_at_import": sorted(read_at_import)},
           open(os.path.join(out_dir, "constants.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump(classes, open(os.path.join(out_dir, "classes.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump({"affected": affected, "tops": {k: sorted(v) for k, v in top_names.items()}},

@@ -189,6 +189,31 @@ class CovMap:
             return None
         return names
 
+    def module_candidates(self, path: str, importers: int, changed, inserted) -> int | None:
+        """Tests that can see a change to module-level code, when every changed line
+        of the file gives a module constant (`NAME = value`) a new value: those
+        that execute a line reading one of the names. None otherwise."""
+        if self._constants is None:
+            self._constants = self._optional_json("constants.json") or {}
+            self._read_at_import = set(self._constants.get("read_at_import", ()))
+        assigns = self._constants.get("modules", {}).get(path)
+        if not assigns or inserted or not changed or self._pack("readers.bin") is None:
+            return None
+        names = set()
+        for line in changed:
+            for start, end, name in assigns:
+                if start <= line <= end:
+                    names.add(name)
+                    break
+            else:
+                return None
+        if not all(name.isupper() for name in names) or names & self._read_at_import:
+            return None
+        reading = 0
+        for name in names:
+            reading |= self._named("readers.bin", name)
+        return importers & reading
+
     def class_candidates(
         self, path: str, qualname: str, importers: int, changed=(), inserted=(), same_names: bool = False
     ) -> int | None:
