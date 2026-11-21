@@ -215,4 +215,26 @@ expect("a class whose metaclass defines equality has no name", state.key_names(N
 expect("neither has an object", state.key_names(object()), None)
 expect("nor a tuple that holds one", state.key_names((1, object())), None)
 
+
+def shapes(new_source, old_source=BASE):
+    """(attribute, reason, shape) of the names added or removed; the shape is what CovMap.unobservable reads."""
+    comparer = state.Comparer(world(old_source), world(new_source), "/root")
+    return sorted((row[3], row[4], row[8]) for row in comparer.run() if row[4] in ("added", "removed"))
+
+
+ERR = "\nclass Err(Exception):\n    pass\n"
+expect("added function", shapes(BASE + "\ndef extra():\n    return 1\n"), [("extra", "added", "")])
+expect("added plain class", shapes(BASE + "\nclass Plain:\n    pass\n"), [("Plain", "added", "")])
+expect("added class with a base of the package", shapes(BASE + "\nclass Sub(Base):\n    pass\n"), [("Sub", "added", "R")])
+expect("added class with a metaclass (an enum)", shapes(BASE + "\nclass Other(enum.Enum):\n    A = 1\n"), [("Other", "added", "R")])
+expect("a module that is new to every namespace", shapes(BASE + "\nimport textwrap\n"), [("textwrap", "added", "R")])
+expect("a module another name binds", shapes(BASE + "\nimport enum as en\n"), [("en", "added", "")])
+expect("a module no namespace binds any more", shapes(BASE.replace("import functools\n", "").replace("half = functools.partial(helper, scale=0.5)", "half = helper")), [("functools", "removed", "R")])
+expect(
+    "an attribute added to a class with a base from outside",
+    shapes(BASE + ERR.replace("pass", "EXTRA = 1"), BASE + ERR),
+    [("EXTRA", "added", "F")],
+)
+expect("an attribute added to a plain class", shapes(BASE.replace("FLAG = False", "FLAG = False\n    EXTRA = 1")), [("EXTRA", "added", "")])
+
 print(f"{checks} checks passed")
