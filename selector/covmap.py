@@ -306,11 +306,20 @@ class CovMap:
         return None
 
     def is_loader(self, path: str, first: int) -> bool:
-        """True for a function that imports modules on demand (found by tools/build_extra.py)."""
+        """True for a function that imports modules on demand, or that reads a
+        registry such a function fills (found by tools/build_extra.py)."""
         if self._constants is None:
             self._constants = self._optional_json("constants.json") or {}
             self._read_at_import = set(self._constants.get("read_at_import", ()))
         return first in self._constants.get("loaders", {}).get(path, ())
+
+    def is_registry_input(self, path: str, first: int) -> bool:
+        """True for code that builds what those functions read to find an entry:
+        a module's top-level code (`first` 0) or a class body (its first line)."""
+        if self._constants is None:
+            self._constants = self._optional_json("constants.json") or {}
+            self._read_at_import = set(self._constants.get("read_at_import", ()))
+        return first in self._constants.get("registry_inputs", {}).get(path, ())
 
     def best_case(self, path: str, qualname: str, importers: int, changed, inserted) -> int | None:
         """The fewest tests that comparing import state could leave for a change

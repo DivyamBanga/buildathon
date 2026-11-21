@@ -8,8 +8,9 @@ test_execute_tpch and test_execute_tpcds send every TPC query through
 recorded at the pinned commit:
 
   execmemo.bin    optimized query (hash of its serialized tree) -> the result table
-  execphase.json  every line that runs from planning to the result, and while
-                  the key is computed
+  execphase.json  every line `execute` runs outside the optimizer: preparing
+                  the tables it was given, planning, running the plan, and
+                  computing the key
 
 The selector reuses a recorded result only for a patch that changes none of
 the lines in execphase.json, and only for a query whose optimized form is

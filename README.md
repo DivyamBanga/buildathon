@@ -79,7 +79,12 @@ the patched code**, and selects the ones that fail.
    run); a default or a closure value of a function matters only when the
    function is called. A function that imports modules on demand (four in
    sqlglot) is outside all of this: when it runs depends on which tests ran
-   before, so a change to one selects every test.
+   before, so a change to one selects every test. So does a change to a
+   function that reads the registry those imports fill (four more, around
+   `Dialect._classes`), or to what those functions read to find an entry (the
+   module-level code of the two files that hold the names of the dialect
+   modules, and the enum whose values are the keys): one test file empties
+   that registry, and every later test meets it as the tests before left it.
 
 4. **Run the candidates against the patch** (`selector/runner.py`). The
    coordinator imports sqlglot and the test modules once, then forks a child
@@ -142,10 +147,11 @@ the patched code**, and selects the ones that fail.
      This holds for any patch, because it is decided by what the patched code
      really sends. The optimizer tests' small DuckDB database is held back the
      same way until a case executes a query.
-   - `sqlglot.executor.execute` optimizes a query, plans it and runs the plan.
-     For a patch that changes none of the lines that run from planning to the
-     result, a TPC query whose optimized form is exactly the pinned one is not
-     planned and executed again: its recorded result is returned.
+   - `sqlglot.executor.execute` prepares the tables it was given, optimizes
+     the query, plans it and runs the plan. For a patch that changes none of
+     the lines `execute` runs outside the optimizer, a TPC query whose
+     optimized form is exactly the pinned one is not planned and executed
+     again: its recorded result is returned.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
      shared by the children.
@@ -232,8 +238,10 @@ observed failing on the patched code or could not be ruled out.
   function, what reads a constant, what a test reads from disk, what only
   runs in suite order), each run through the selector and through pytest.
   The misses it found are the reason for the source-reader map, the
-  redirects above, the rule for code that imports modules on demand and the
-  rebuilt map of who reads a constant.
+  redirects above, the rule for code that imports modules on demand or uses
+  the registry they fill, the rebuilt map of who reads a constant, and the
+  executor results being reused only when nothing `execute` runs outside the
+  optimizer has changed.
 - The runner was run on synthetic worst cases: infinite loops in tests, in
   imports and in class bodies, unbounded allocation, `os._exit`, stack
   overflow, and binary, renamed, deleted, new and non-applying files.

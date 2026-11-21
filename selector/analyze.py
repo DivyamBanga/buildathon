@@ -204,6 +204,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             units.append((first, None))
             narrowed = None
             same_names = new is not None and old.co_names == new.co_names
+            if covmap.is_registry_input(path, 0 if old.co_name == "<module>" else first):
+                # It builds what the dialect registry is filled from or asked
+                # for, and the registry is emptied and filled again part way
+                # through the suite: a test run on its own says nothing here.
+                plan.select_all = True
+                plan.note(f"{path}:{first} {old.co_name}: the dialect registry is filled from it")
             if old.co_name == "<module>":
                 if same_names and len(diff.changed) == 1:
                     # Nothing but this module's own top-level code changed.
@@ -244,10 +250,11 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 plan.note(f"{path}:{first} {old.co_name} import-time, {found.bit_count()} tests")
         else:
             if covmap.is_loader(path, first):
-                # It imports modules on demand: when it runs depends on which
-                # tests ran before, so a test run on its own says nothing here.
+                # It imports modules on demand, or reads the registry that fills
+                # up as they are imported: what it does depends on which tests
+                # ran before, so a test run on its own says nothing here.
                 plan.select_all = True
-                plan.note(f"{path}:{first} {old.co_name} imports modules on demand")
+                plan.note(f"{path}:{first} {old.co_name} depends on what was imported on demand before")
             lines = None
             if new is not None:
                 span = covmap.func_span(path, first)

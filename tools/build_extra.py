@@ -354,6 +354,66 @@ class Visitor(ast.NodeVisitor):
 for path, tree in sources.items():
     Visitor(cov_file(path), family_of(path), tcov_file(path), path.startswith("tests/"), path).visit(tree)
 
+
+def functions(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield min([node.lineno] + [d.lineno for d in node.decorator_list]), node
+
+
+def stores_entry(node):
+    """`something.attribute[key] = value` (or `del`)."""
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        and isinstance(node.value, ast.Attribute)
+    )
+
+
+# A registry that a loader fills (Dialect._classes) is emptied by one test file
+# and filled again as dialects are asked for, so a function that reads it
+# meets a different registry depending on which tests ran before. A test run
+# on its own says as little about a change to such a function as about a
+# change to the loader, and it is listed with the loaders. (A function that
+# only stores an entry does the same whatever the registry holds.) The same
+# goes for what those functions read to find an entry, the registry inputs:
+# the module-level code of a file that assigns a constant they read (the names
+# of the dialect modules), and the body of an enum they name (its values are
+# the keys that are asked for).
+ENUMS = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag"}
+registries = set()
+for path, firsts in loaders.items():
+    if path.startswith("sqlglot/"):
+        for first, node in functions(sources[path]):
+            if first in firsts:
+                registries.update(inner.value.attr for inner in ast.walk(node) if stores_entry(inner))
+registry_reads = set()
+for path, tree in sources.items():
+    if path.startswith("sqlglot/"):
+        for first, node in functions(tree):
+            only_stored = {id(inner.value) for inner in ast.walk(node) if stores_entry(inner)}
+            if any(
+                isinstance(inner, ast.Attribute) and inner.attr in registries and id(inner) not in only_stored
+                for inner in ast.walk(node)
+            ):
+                loaders.setdefault(path, []).append(first)
+                registry_reads.update(inner.id for inner in ast.walk(node) if isinstance(inner, ast.Name))
+registry_inputs = {}  # path -> 0 for the module-level code, the first line of a class body
+for path, assigns in module_statements.items():
+    if path.startswith("sqlglot/") and any(
+        name in registry_reads and CONSTANT_LIKE.match(name) for _, _, name in assigns
+    ):
+        registry_inputs.setdefault(path, []).append(0)
+for path, tree in sources.items():
+    if path.startswith("sqlglot/"):
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name in registry_reads
+                and any((base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")) in ENUMS for base in node.bases)
+            ):
+                registry_inputs.setdefault(path, []).append(min([node.lineno] + [d.lineno for d in node.decorator_list]))
+
 # A dialect reaches another when its files name one of the other's classes.
 reach = {family: {family} for family in top_names}
 for family, names in family_names.items():
@@ -384,7 +444,8 @@ open(os.path.join(out_dir, "readers.bin"), "wb").write(pack(readers))
 if tcov_index is not None:
     open(os.path.join(out_dir, "treaders.bin"), "wb").write(pack(test_readers))
 json.dump({"classes": class_statements, "modules": module_statements, "read_at_import": sorted(read_at_import),
-           "loaders": {path: sorted(set(firsts)) for path, firsts in sorted(loaders.items())}},
+           "loaders": {path: sorted(set(firsts)) for path, firsts in sorted(loaders.items())},
+           "registry_inputs": {path: sorted(firsts) for path, firsts in sorted(registry_inputs.items())}},
           open(os.path.join(out_dir, "constants.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump(classes, open(os.path.join(out_dir, "classes.json"), "w"), separators=(",", ":"), sort_keys=True)
 json.dump({"affected": affected, "tops": {k: sorted(v) for k, v in top_names.items()}},

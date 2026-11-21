@@ -662,9 +662,10 @@ class _Planned:
 def install_executor_memo() -> None:
     """Skip planning and executing a TPC query that is unchanged since the pinned commit.
 
-    `sqlglot.executor.execute` optimizes the query, plans it and runs the plan.
-    The plan and its result depend only on the optimized query and on the
-    planner and executor code. This is installed only for a patch that touches
+    `sqlglot.executor.execute` prepares the tables, optimizes the query, plans
+    it and runs the plan. The result depends only on the optimized query and
+    on everything else `execute` runs: the code that prepares the tables, the
+    planner and the executor. This is installed only for a patch that touches
     none of that code (maps/execphase.json), so a query whose optimized form is
     exactly the pinned one must give the pinned result, which is returned
     without running it. Any other query is planned and executed as usual.
@@ -726,6 +727,25 @@ def install_executor_memo() -> None:
 
     executor.Plan = plan
     executor.PythonExecutor = Executor
+    if MEMO_PHASE is not None:
+        # Recording only. The executor also runs on tables that `execute`
+        # prepares before the query is optimized, so that code decides the
+        # result too: everything `execute` does counts, except optimizing.
+        real_tables = executor.ensure_tables
+        real_optimize = executor.optimize
+
+        def ensure_tables(*args, **kwargs):
+            if MEMO_SCOPE is not None:
+                MEMO_PHASE("X")
+            return real_tables(*args, **kwargs)
+
+        def optimize(*args, **kwargs):
+            if MEMO_SCOPE is not None:
+                MEMO_PHASE("L")
+            return real_optimize(*args, **kwargs)
+
+        executor.ensure_tables = ensure_tables
+        executor.optimize = optimize
 
 
 # (module, attribute, case name): module-level collections a test loops over,
