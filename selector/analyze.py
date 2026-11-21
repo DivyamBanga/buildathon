@@ -104,6 +104,11 @@ def load_old_code(absolute: str, old_text: str):
 def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str, loaded) -> None:
     path = patch.path
     old_path = patch.old_path or path
+    readers = covmap.source_readers(old_path)
+    if readers:
+        # Tests that read or run this source as a file see any change to its text.
+        plan.candidates |= readers
+        plan.note(f"{old_path}: read as a file by {readers.bit_count()} tests")
     if patch.old_text is None:
         # A new module. Nothing at the pinned commit imports it, so on its own it
         # reaches a test only through other changed files or through pytest.

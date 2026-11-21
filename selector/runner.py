@@ -160,6 +160,46 @@ def _install_redirects(redirects: dict) -> None:
 
     builtins.open = patched_open
     io.open = patched_open
+    # runpy and friends read code through io.open_code. The import system has
+    # its own reference to the real one, so imports are not affected.
+    real_open_code = io.open_code
+
+    def patched_open_code(path):
+        if not _bypass_redirects and type(path) is str:
+            target = _redirects.get(os.path.abspath(path))
+            if target is not None:
+                path = target
+        return real_open_code(path)
+
+    io.open_code = patched_open_code
+
+
+def _keep_resolved_paths_in(overlay: str, root: str) -> None:
+    """Make a path resolved through the overlay's symlinks stay inside the overlay.
+
+    The overlay is a tree of links into the pinned checkout. A test that
+    resolves its own location (`Path(__file__).resolve()`) would land in the
+    pinned tree and, from there, reach pinned copies of patched files. In a
+    real checkout a resolved path of the tree is still a path of the tree, so
+    here a resolved path under the pinned checkout is given back as the same
+    path under the overlay (pathlib resolves through os.path.realpath).
+    """
+    real = os.path.realpath
+    prefix = root.rstrip("/") + "/"
+    stem = root.rstrip("/")
+
+    def realpath(path, *args, **kwargs):
+        result = real(path, *args, **kwargs)
+        try:
+            text = os.fsdecode(result)
+        except Exception:
+            return result
+        if text == stem or text.startswith(prefix):
+            mapped = overlay.rstrip("/") + text[len(stem):]
+            return mapped if isinstance(result, str) else os.fsencode(mapped)
+        return result
+
+    os.path.realpath = realpath
 
 
 def _apply_swaps(swaps, function_index) -> None:
@@ -185,7 +225,9 @@ class _PatchedLoader(importlib.machinery.SourceFileLoader):
         self._text = text
 
     def get_code(self, fullname):
-        return compile(self._text, self.path, "exec", dont_inherit=True)
+        # From bytes, as the file itself would be read: an encoding declaration
+        # in its first two lines is honoured, or makes the import fail.
+        return compile(self._text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
 
     def get_source(self, fullname):
         return self._text
@@ -1026,6 +1068,8 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             _purge(root)
             sys.path.insert(0, overlay)
             os.chdir(overlay)
+            if changes:
+                _keep_resolved_paths_in(overlay, root)
         else:
             lazy = list(job.get("lazy") or ())
             swaps = []
@@ -1038,10 +1082,15 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             if lazy:
                 _serve_patched(lazy, root)
             _apply_swaps(swaps, function_index)
-            if job["redirects"]:
-                _install_redirects(
-                    {path: os.path.join(overlay, os.path.relpath(path, root)) for path in job["redirects"]}
-                )
+            # Whatever opens a patched file by its path in the pinned tree gets the
+            # patched text: fixtures, and source files that a test reads or runs as data.
+            present = {
+                os.path.join(root, path): os.path.join(overlay, path)
+                for path, text in changes.items()
+                if text is not None
+            }
+            if present:
+                _install_redirects(present)
             if job.get("executor_tables") and EXECUTOR_TABLES is not None:
                 _use_executor_tables()
                 if job.get("executor_memo") and EXECUTOR_MEMO:

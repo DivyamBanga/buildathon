@@ -30,6 +30,9 @@ the patched code**, and selects the ones that fail.
 
    - it executed a changed statement of a changed function, or
    - it opened a changed fixture file, or
+   - it opens the changed Python source as a file, to read, parse or run it
+     (one test parses the `sqlglot/typing` modules, three run
+     `sqlglotc/setup.py`): the text is data to it, whatever lines execute, or
    - for a change to a class body: it built an instance of that class or of a
      subclass, or executed a line naming it (for the classes of a dialect: it
      used that dialect or one built on it); and, when the change only gives a
@@ -85,6 +88,14 @@ the patched code**, and selects the ones that fail.
      again from an overlay tree of symlinks plus the patched files. It first
      imports every test file that imports a changed module: a file that can no
      longer be imported fails all of its tests, as it does under pytest.
+
+   A test that reaches a patched file through the file system must find the
+   patched text too. In a child that keeps the pinned modules, `open` and
+   `io.open_code` (which `runpy` reads code through) are redirected for every
+   patched file. After a clean import the tree is an overlay of symlinks, and a
+   test that resolves its own location would follow them out into the pinned
+   checkout, so a resolved path under the pinned checkout is handed back as
+   the same path under the overlay.
 
    Tests run under `unittest` with fail-fast, so a failing test stops at its
    first failure. A test that hangs, burns far more CPU than it normally costs
@@ -152,6 +163,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | --- | --- | --- |
 | `cov.bin`, `cov.json` | `trace_all.py`, `build_map.py` | (code object, line) → tests that executed it |
 | `opens.json` | same | fixture file → tests that open it |
+| `sources.json` | `build_sources.py` | Python source → tests that open it as a file |
 | `funcs.json` | `build_map.py` | first and last line of every `def` |
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
@@ -192,6 +204,23 @@ observed failing on the patched code or could not be ruled out.
 - `tools/test_duckprobe.py` holds the unit checks for the DuckDB stand-in: what
   the caller sees and what really reaches DuckDB, in order, for every way a
   connection can leave the recorded setup.
+- `tools/test_runner_paths.py` holds the unit checks for how a child finds
+  patched files: redirected `open` and `io.open_code`, resolved paths that
+  stay in the overlay, and modules imported on demand from patched text.
+- `tools/trace_suite.py` traces the whole suite in one process, in collection
+  order, and `tools/build_suite.py` compares it test by test with the runs
+  alone. Of 2.59 million (test, line) pairs, 121 are executed in the suite but
+  not alone: 16 lines, all in `Dialect._try_load`, where a dialect is
+  registered again after another test emptied the registry. That function is
+  one of those a change to which selects every test. (The other direction is
+  large and harmless: alone, a test also runs the imports.)
+- An audit of the selector itself: patches written to break one assumption
+  each (where a comment lands, what a fixture edit shifts, what holds an old
+  function, what reads a constant, what a test reads from disk, what only
+  runs in suite order), each run through the selector and through pytest.
+  The misses it found are the reason for the source-reader map, the
+  redirects above, the rule for code that imports modules on demand and the
+  rebuilt map of who reads a constant.
 - The runner was run on synthetic worst cases: infinite loops in tests, in
   imports and in class bodies, unbounded allocation, `os._exit`, stack
   overflow, and binary, renamed, deleted, new and non-applying files.

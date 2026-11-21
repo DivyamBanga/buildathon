@@ -25,6 +25,7 @@ class CovMap:
         self.all = (1 << self.count) - 1
         self._index: dict[str, list[int]] = self._json("cov.json")
         self._opens: dict[str, list[int]] = self._json("opens.json")
+        self._sources: dict[str, list[int]] = self._optional_json("sources.json") or {}
         self._funcs: dict | None = None
         self._tindex: dict | None = None
         self._tblob: bytes | None = None
@@ -146,6 +147,14 @@ class CovMap:
             return None
         result = 0
         for number in numbers:
+            result |= 1 << number
+        return result
+
+    def source_readers(self, path: str) -> int:
+        """Tests that open this Python source as a file (to read, parse or run it):
+        its text is data to them, whichever of its lines are ever executed."""
+        result = 0
+        for number in self._sources.get(path, ()):
             result |= 1 << number
         return result
 
