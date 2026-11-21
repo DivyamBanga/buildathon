@@ -141,7 +141,10 @@ the patched code**, and selects the ones that fail.
    comparison accounts for. The comparison says "different" for anything it
    does not know how to compare, and the candidates fall back to the rule
    above when it is inconclusive (too many differences, state outside the
-   package changed). When a module no longer imports at all, every test that
+   package changed: the environment, logging, warning filters, the recursion
+   limit, or any builtin). A module that binds a `__builtins__` of its own
+   counts as a difference every test importing it can see: the names its code
+   leaves to the builtins may mean something else. When a module no longer imports at all, every test that
    imports it or a module that depends on it is a candidate, whether or not it
    could "see" the changed class: the comparison is therefore always run
    before tests are left out for that reason.
@@ -330,7 +333,12 @@ the patched code**, and selects the ones that fail.
        result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
-     shared by the children.
+     shared by the children. A child that imports the patched tree afresh
+     cannot take the tables (their class may have changed), but for a patch
+     that touches no file outside `sqlglot/` the rows are what they were:
+     the files and the test code that parses them are untouched. Such a child
+     skips the parsing only and builds every table with the patched class
+     from the rows parsed at the pinned commit.
 
 6. **Weigh running against selecting** (`selector/main.py`). Running a test
    costs CPU seconds; selecting it costs its recorded seconds on a worker. A

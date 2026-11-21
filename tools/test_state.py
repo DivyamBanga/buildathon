@@ -215,4 +215,18 @@ expect("a class whose metaclass defines equality has no name", state.key_names(N
 expect("neither has an object", state.key_names(object()), None)
 expect("nor a tuple that holds one", state.key_names((1, object())), None)
 
+expect(
+    "a module that binds its own builtins",
+    differences(BASE.replace("LIMIT = 10\n", "LIMIT = 10\n__builtins__ = {**__builtins__, 'any': all}\n")),
+    [("", "__builtins__", "value")],
+)
+before = state.outside_state()
+import builtins  # noqa: E402
+
+builtins.any, kept = all, builtins.any
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+builtins.any = kept
+expect("a builtin replaced for everyone", changed, ["the builtins"])
+expect("and put back", state.outside_state(), before)
+
 print(f"{checks} checks passed")

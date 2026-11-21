@@ -470,8 +470,8 @@ class Coordinator:
         classes = {self.bit_class[bit] for bit in bits}
         setup = 0.0
         for name in classes:
-            if name == EXECUTOR_CLASS and self.executor_setup_untouched(job):
-                setup += self.fast_setup.get(name, 0.15)  # its tables come ready-made
+            if name == EXECUTOR_CLASS and (self.executor_setup_untouched(job) or self.rows_reusable(job)):
+                setup += self.fast_setup.get(name, 0.15)  # its tables, or their rows, come ready-made
             else:
                 setup += self.class_setup.get(name, 0.0)
         return setup + (0.45 if job.mode == "clean" else 0.05)
@@ -855,11 +855,21 @@ class Coordinator:
                         # A table that differs in these entries only: seen by looking one of them up.
                         tables[number] = frozenset(entries)
                 continue
-            if reason in ("added", "removed") and attribute.isupper() and self.exec_dynamic <= REVIEWED_DYNAMIC:
+            if (
+                reason in ("added", "removed")
+                and self.exec_dynamic <= REVIEWED_DYNAMIC
+                and attribute.isidentifier()
+                and (attribute.isupper() or (kind == "module" and self.exec_every_name and not attribute.startswith("__")))
+            ):
                 # A name in capitals that appears or vanishes: seen by the code that
                 # names it (a new class attribute that hides one of a base class is
                 # read under the same name). Nothing in the phase looks a name in
-                # capitals up by a computed text or walks a namespace for one.
+                # capitals up by a computed text or walks a namespace for one. The
+                # same holds for any other name of a module (a function renamed at
+                # its definition; a new one that hides a builtin is found by the
+                # statements that name the builtin), not for other attributes of
+                # classes: the generator looks its "_sql" methods up by a computed
+                # name.
                 rows |= self.lines_naming(attribute)
                 continue
             if reason != "value":
@@ -869,7 +879,13 @@ class Coordinator:
                 # Read by name: seen by the queries that run code mentioning it.
                 rows |= self.lines_naming(attribute)
                 continue
-            if kind == "module" and self.exec_every_name and self.exec_dynamic <= REVIEWED_DYNAMIC and not attribute.startswith("__"):
+            if (
+                kind == "module"
+                and self.exec_every_name
+                and self.exec_dynamic <= REVIEWED_DYNAMIC
+                and attribute.isidentifier()
+                and not attribute.startswith("__")
+            ):
                 # Any other name of a module with another value (a function replaced
                 # at import, an object made there): read by the statements that name
                 # it. Nothing in the phase looks a module's names up by a computed
@@ -967,6 +983,30 @@ class Coordinator:
             self.setup_map[EXECUTOR_CLASS] = None
             return False
         return True
+
+    def rows_reusable(self, job: Job) -> bool:
+        """After a clean import: are the rows the executor tests' class setup parses the pinned ones?
+
+        The setup reads the TPC fixtures with the test module's own code and
+        the standard library; only the tables it then builds are sqlglot's.
+        A patch that touches no file outside sqlglot/ leaves the fixtures and
+        the test code what they were; the child checks that what the setup
+        parses with is what it was (runner._setup_as_pinned) and still builds
+        the tables with the patched class.
+        """
+        if job.mode != "clean":
+            return False
+        for patch in job.plan.files:
+            for path in (patch.path, patch.old_path or patch.path):
+                if not path or not path.startswith("sqlglot/"):
+                    return False
+        return True
+
+    def executor_rows(self, job: Job, tests: list[int]) -> bool:
+        """Whether the child, after its clean import, may skip the CSV parsing of the executor tests' setup."""
+        if not any(self.bit_class[bit] == EXECUTOR_CLASS for bit in tests):
+            return False
+        return self.rows_reusable(job) and self.executor_record()
 
     def wants_probe(self, job: Job) -> bool:
         """Whether to compare import state before deciding what to run for the commit."""
@@ -1127,6 +1167,7 @@ class Coordinator:
             "cases": self.case_filter(job, tests),
             "imports": job.import_files if job.mode == "clean" else [],
             "executor_tables": self.executor_tables(job, tests),
+            "executor_rows": self.executor_rows(job, tests),
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
         spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None
