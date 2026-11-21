@@ -31,7 +31,8 @@ from selector.covmap import CovMap  # noqa: E402
 
 ROOT = "/sqlglot"
 KEYS = "--keys" in sys.argv
-ARGV = [argument for argument in sys.argv[1:] if argument != "--keys"]
+DUMP = "--dump" in sys.argv
+ARGV = [argument for argument in sys.argv[1:] if argument not in ("--keys", "--dump")]
 patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in ARGV[0:3])
 first, last = (int(ARGV[3]), int(ARGV[4])) if len(ARGV) > 4 else (0, 1 << 30)
 maps = os.path.join(HERE, "maps")
@@ -142,6 +143,7 @@ with open(output, "w") as log:
             "differences": len(result["differences"]),
             "inconclusive": result["inconclusive"],
             "pairs": pairs[:12],
+            "entries": [row[8] if len(row) > 8 else "-" for row in result["differences"]][:12],
             "old": None if old is None else old.bit_count(),
             "new": None if new is None else new.bit_count(),
             "left_s": None if old is None or new is None else round(cost(old & ~new), 2),
@@ -150,6 +152,11 @@ with open(output, "w") as log:
             "slow_old": [t for t in SLOW if old is not None and old >> index[t] & 1],
             "slow_new": [t for t in SLOW if new is not None and new >> index[t] & 1],
         }
+        if DUMP and old is not None and new is not None:
+            # for labelling by real pytest: the test files of the old candidates, the new candidates by number
+            record["old_files"] = sorted({ids[bit].split("::")[0] for bit in CovMap.bits(old)})
+            record["new_bits"] = list(CovMap.bits(new))
+            record["old_bits"] = list(CovMap.bits(old))
         if commit in truth:
             failing = truth[commit]
             record["failing"] = len(failing)
