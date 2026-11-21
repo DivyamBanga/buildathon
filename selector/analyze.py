@@ -13,13 +13,16 @@ import marshal
 import os
 import re
 import posixpath
+import subprocess
+import sys
+import tempfile
 
 from . import patchlib, pydiff
 from .covmap import CovMap
 
 # Files that configure pytest itself. The runner executes tests with unittest,
 # so a change to how pytest is configured cannot be reproduced by running.
-_PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py")
+_PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py", "pytest.toml", ".pytest.toml")
 _MAYBE_PYTEST_CONFIG = ("pyproject.toml", "setup.cfg")
 # What only pytest honours in a unittest-based test file: its name, the xunit hooks (the runner calls
 # setUpModule and setUp, never these), marks, fixtures, collection switches.
@@ -359,23 +362,81 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         plan.needs_clean = True
 
 
+def _searched(path: str) -> bool:
+    """Is this a directory pytest looks in for its settings?
+
+    It starts at the directory of its arguments (a test file's directory, or the
+    root) and goes up: the root and every directory under tests/ qualify, so
+    does nothing else in the checkout (sqlglotc/, sqlglot/).
+    """
+    return "/" not in path or path.startswith("tests/")
+
+
+# Run in a separate interpreter: importing pytest here would change what sqlglot
+# decides at import (it looks for unittest and pytest in sys.modules).
+_CFG_PROBE = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "try:\n"
+    "    from _pytest.config.findpaths import CONFIG_LOADERS_BY_NAME as L\n"
+    "    out = ['none' if L[n](Path(p)) is None else 'config' for n, p in zip(sys.argv[1::2], sys.argv[2::2])]\n"
+    "except BaseException:\n"
+    "    out = ['error']\n"
+    "print(' '.join(out))\n"
+)
+
+
+def _config_may_break(patch: patchlib.FilePatch, path: str, old_path: str) -> bool:
+    """Must a change to pyproject.toml or setup.cfg select every test?
+
+    pytest parses every such file it meets while it looks for its settings, with
+    its own loader (_pytest.config.findpaths); a file that does not parse stops
+    it before any test runs. Everything is selected unless the file is edited in
+    place and pytest's loader finds no configuration in either text, and raises on
+    neither. Any doubt selects everything.
+    """
+    if patch.old_text is None or patch.new_text is None or path != old_path:
+        return True  # appears, vanishes or moves: what pytest finds there changes
+    name = os.path.basename(path)
+    try:
+        with tempfile.TemporaryDirectory(prefix="brcfg") as scratch:
+            args = []
+            for label, text in (("old", patch.old_text), ("new", patch.new_text)):
+                os.mkdir(os.path.join(scratch, label))
+                target = os.path.join(scratch, label, name)
+                with open(target, "wb") as handle:
+                    handle.write(text.encode("utf-8"))
+                args += [name, target]
+            done = subprocess.run(
+                [sys.executable, "-I", "-c", _CFG_PROBE, *args],
+                capture_output=True, text=True, timeout=30, cwd=scratch,
+            )
+        return done.returncode != 0 or done.stdout.split() != ["none", "none"]
+    except Exception:
+        return True
+
+
 def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     path = patch.path
     old_path = patch.old_path or path
     name = os.path.basename(path)
-    if name in _PYTEST_CONFIG:
+    if name in _PYTEST_CONFIG or os.path.basename(old_path) in _PYTEST_CONFIG:
         plan.select_all = True
         plan.note(f"pytest config {path}")
         return
-    if name in _MAYBE_PYTEST_CONFIG and "/" not in path:
+    maybe = [p for p in {path, old_path} if os.path.basename(p) in _MAYBE_PYTEST_CONFIG and _searched(p)]
+    if maybe:
         touched = "".join(
             row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-"
         ).lower()
         if "pytest" in touched or "unittest" in touched:
             plan.select_all = True
             plan.note(f"pytest config in {path}")
+        elif _config_may_break(patch, path, old_path):
+            plan.select_all = True
+            plan.note(f"{path}: pytest may not start, or may find configuration, with this file")
         else:
-            plan.note(f"{path}: packaging config, no test reads it")
+            plan.note(f"{path}: packaging config, pytest parses it and finds nothing")
         return
     if patch.old_text is None and patch.new_file:
         plan.needs_clean = True

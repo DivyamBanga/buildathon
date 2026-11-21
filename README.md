@@ -56,7 +56,10 @@ the patched code**, and selects the ones that fail.
    imports it when it is a helper module. Added and removed lines count. The
    runner uses unittest, which ignores all of these, so running the test says
    nothing. (A new or changed `conftest.py` and the pytest configuration files
-   select everything, as before.)
+   select everything, as before. So does a `pyproject.toml` or `setup.cfg`, at the
+   root or under `tests/`, that appears, vanishes, moves, or is edited so that
+   pytest's own loader raises on it or finds pytest settings in either text;
+   a valid edit with no pytest settings selects nothing.)
 
    **New tests and helpers in a test file.** A file that only gained whole new
    tests, test classes or helper functions selects nothing, but only if what
