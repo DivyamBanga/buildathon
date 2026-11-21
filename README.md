@@ -214,11 +214,17 @@ the patched code**, and selects the ones that fail.
      are what they were at the pinned commit, the recorded result is returned
      and the query is not planned and executed again. Each is checked, not
      assumed:
-     - *The query*: a digest taken from the tree itself, with no sqlglot code
-       involved (`runner.tree_digest`): every node's class, arguments in
-       order, type, comments and meta, the type of every leaf value, and the
-       wiring (a node held in two places, a child that names another parent
-       or position).
+     - *The query*: two digests taken from the tree itself, with no sqlglot
+       code involved (`runner.tree_digests`). The first covers every node's
+       class, arguments in order, comments and meta, the type of every leaf
+       value, and the wiring (a node held in two places, a child that names
+       another parent or position); it is the key. The second adds the type
+       annotation of every node. Planning and executing a query can see an
+       annotation only by asking a node for its type (`Expr.is_type`, the
+       `type` property); the record of each query says whether it does, and
+       if so the second digest must be the recorded one as well. (The
+       builder fails over to "every query asks" when any other executed line
+       reads the annotation; copying it along with a node does not count.)
      - *The tables*: what `ensure_tables` returned for this call must hold
        exactly the pinned tables, by name and by content, at that moment (a
        table changed in place is not the pinned table any more).

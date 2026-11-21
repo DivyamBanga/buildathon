@@ -703,7 +703,7 @@ class Coordinator:
         scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
         if scope not in job.memo_share:
             mine = [entry for key, entry in self.exec_queries.items() if key.startswith(f"{scope}:")]
-            touched = sum(1 for own_rows, own_reads in mine if own_rows & rows or own_reads & reads)
+            touched = sum(1 for own_rows, own_reads, _ in mine if own_rows & rows or own_reads & reads)
             job.memo_share[scope] = touched / len(mine) if mine else 1.0
             if mine:
                 job.plan.note(f"the patch concerns the execution of {touched} of {len(mine)} recorded {scope} queries")

@@ -637,7 +637,9 @@ EXECUTOR_MEMO = None
 MEMO_SCOPE = None
 MEMO_TESTS = {"test_execute_tpch": "tpch", "test_execute_tpcds": "tpcds"}
 # memo key -> (bit mask of the phase lines, bit mask of the attributes) that one
-# query runs and reads when it is planned and executed (maps/execqueries.bin).
+# query runs and reads when it is planned and executed, and the digest of its
+# tree with type annotations if that execution asks a node for its type, else ""
+# (maps/execqueries.bin).
 EXECUTOR_QUERIES = None
 # (phase lines, attributes) the patch changes, or None when it changes none:
 # a recorded result is used only for a query whose own record touches neither.
@@ -664,7 +666,7 @@ def load_executor_memo(path: str) -> None:
 
 
 def read_executor_queries(path: str) -> dict:
-    """maps/execqueries.bin as {memo key: (lines, attributes)}, the two as ints; {} when it is not there."""
+    """maps/execqueries.bin as {memo key: (lines, attributes, typed digest or "")}, the masks as ints; {} when it is not there."""
     import marshal
     import zlib
 
@@ -672,46 +674,55 @@ def read_executor_queries(path: str) -> dict:
         with open(path, "rb") as handle:
             raw = marshal.loads(zlib.decompress(handle.read()))
         return {
-            key: (int.from_bytes(lines, "little"), int.from_bytes(attributes, "little"))
-            for key, (lines, attributes) in raw.items()
+            key: (int.from_bytes(lines, "little"), int.from_bytes(attributes, "little"), typed)
+            for key, (lines, attributes, typed) in raw.items()
         }
     except Exception:
         return {}
 
 
-def _query_untouched(key: str) -> bool:
-    """True when nothing the patch changes is run or read by this query's planning and execution."""
-    block = MEMO_BLOCK
-    if block is None:
-        return True
+def _query_untouched(key: str, typed: str) -> bool:
+    """True when the recorded result of this query stands for the tree at hand.
+
+    The key says the tree is the recorded one but for its type annotations.
+    When planning and executing this query asks a node for its type, the
+    annotations must be the recorded ones too. And nothing the patch changes
+    may be run or read by this query's planning and execution.
+    """
     own = (EXECUTOR_QUERIES or {}).get(key)
-    return own is not None and not own[0] & block[0] and not own[1] & block[1]
+    if own is None or (own[2] and own[2] != typed):
+        return False
+    block = MEMO_BLOCK
+    return block is None or (not own[0] & block[0] and not own[1] & block[1])
 
 
 class _Planned:
     """Stands in for the plan of a query until its executor decides whether the result is known."""
 
-    def __init__(self, expression, digest: str) -> None:
+    def __init__(self, expression, digest: str, typed: str) -> None:
         self.expression = expression
-        self.digest = digest
+        self.digest = digest  # of the tree without its type annotations: the key
+        self.typed = typed  # of the tree with them
 
 
-def tree_digest(root) -> str:
-    """A digest of an expression tree, read off the nodes themselves.
+def tree_digests(root) -> tuple[str, str]:
+    """Two digests of an expression tree, read off the nodes themselves: (without the type annotations, with them).
 
-    It covers everything a node holds: its class, every argument in order
-    (absent, None and an empty list are three different things), its type,
-    comments and meta, and the type of every leaf value. It also covers how the
-    nodes of the tree are wired: a node that sits in two places is written as
-    a reference to its first occurrence, and a child whose parent, argument
-    name or index is not the place it was found in is marked. Two trees with
-    the same digest are the same data structure to any code that walks them.
-    No sqlglot code is called (a patch cannot change what the digest says),
-    only attributes are read.
+    Each covers everything a node holds: its class, every argument in order
+    (absent, None and an empty list are three different things), comments and
+    meta, and the type of every leaf value. It also covers how the nodes of
+    the tree are wired: a node that sits in two places is written as a
+    reference to its first occurrence, and a child whose parent, argument name
+    or index is not the place it was found in is marked. Two trees with the
+    same digest are the same data structure to any code that walks them. No
+    sqlglot code is called (a patch cannot change what a digest says), only
+    attributes are read.
 
-    The type annotation of a node is written by value: sqlglot hands the same
-    type object to many nodes, and which nodes share one depends on what the
-    process did before, not on the query.
+    The second digest also covers the type annotation of every node, written
+    by value: sqlglot hands the same type object to many nodes, and which
+    nodes share one depends on what the process did before, not on the query.
+    The first leaves the annotations out: it is the right one for code that
+    never asks a node for its type.
 
     Raises ValueError for a tree that hangs under another node (what is above
     it is not part of the digest) and for a type nested absurdly deep.
@@ -721,30 +732,30 @@ def tree_digest(root) -> str:
 
     if getattr(root, "parent", None) is not None:
         raise ValueError("not the root of its tree")
-    digest = hashlib.sha1()
-    write = digest.update
+    plain = hashlib.sha1()
+    full = hashlib.sha1()
     seen: dict = {}
-    # (value, parent, argument name, index or depth, mode); mode 0: a plain
-    # value, 1: a child found at that place, 2: inside a type annotation (by
-    # value, `index` counts the depth), 3: punctuation.
-    todo = [(root, None, None, None, 0)]
+    # (value, parent, argument name, index or depth, mode, typed); mode 0: a
+    # plain value, 1: a child found at that place, 2: inside a type annotation
+    # (by value, `index` counts the depth), 3: punctuation. `typed`: part of a
+    # type annotation, so it goes into the second digest only.
+    todo = [(root, None, None, None, 0, False)]
     while todo:
-        value, parent, key, index, mode = todo.pop()
+        value, parent, key, index, mode, typed = todo.pop()
         kind = type(value)
         if mode == 3:
-            write(value)
+            data = value
         elif value is None:
-            write(b"N;")
+            data = b"N;"
         elif kind is bool:
-            write(b"T;" if value else b"F;")
+            data = b"T;" if value else b"F;"
         elif kind is int:
-            write(b"i%d;" % value)
+            data = b"i%d;" % value
         elif kind is str:
-            data = value.encode("utf-8", "surrogatepass")
-            write(b"s%d:" % len(data))
-            write(data)
+            text = value.encode("utf-8", "surrogatepass")
+            data = b"s%d:" % len(text) + text
         elif kind is float:
-            write(("f" + repr(value) + ";").encode())
+            data = ("f" + repr(value) + ";").encode()
         elif type(getattr(value, "args", None)) is dict and hasattr(value, "parent"):
             inner = 1
             depth = 0
@@ -753,58 +764,72 @@ def tree_digest(root) -> str:
                 depth = index + 1
                 if depth > 100:
                     raise ValueError("type nested too deep")
+                data = b""
             else:
                 ordinal = seen.get(id(value))
                 if ordinal is not None:
-                    write(b"@%d;" % ordinal)
+                    data = b"@%d;" % ordinal
+                    full.update(data)
+                    if not typed:
+                        plain.update(data)
                     continue
                 seen[id(value)] = len(seen)
-            write(("E" + kind.__module__ + "." + kind.__qualname__).encode())
+                data = b""
+            data += ("E" + kind.__module__ + "." + kind.__qualname__).encode()
             if mode == 1:
                 if value.parent is not parent:
-                    write(b"!p%d" % seen.get(id(value.parent), -1))
+                    data += b"!p%d" % seen.get(id(value.parent), -1)
                 if value.arg_key != key:
-                    write(("!k" + repr(value.arg_key)).encode())
+                    data += ("!k" + repr(value.arg_key)).encode()
                 if value.index != index:
-                    write(("!i" + repr(value.index)).encode())
-            tasks: list = [(b"(", None, None, None, 3)]
+                    data += ("!i" + repr(value.index)).encode()
+            tasks: list = [(b"(", None, None, None, 3, typed)]
             for name, argument in value.args.items():
-                tasks.append((name, None, None, None, 0))
+                tasks.append((name, None, None, None, 0, typed))
                 if type(argument) is list:
-                    tasks.append((b"[", None, None, None, 3))
+                    tasks.append((b"[", None, None, None, 3, typed))
                     for position, item in enumerate(argument):
-                        tasks.append((item, value, name, depth if inner == 2 else position, inner))
-                    tasks.append((b"]", None, None, None, 3))
+                        tasks.append((item, value, name, depth if inner == 2 else position, inner, typed))
+                    tasks.append((b"]", None, None, None, 3, typed))
                 else:
-                    tasks.append((argument, value, name, depth if inner == 2 else None, inner))
-            tasks.append((b"|", None, None, None, 3))
+                    tasks.append((argument, value, name, depth if inner == 2 else None, inner, typed))
+            tasks.append((b"|", None, None, None, 3, typed))
             annotation = getattr(value, "_type", None)
             if annotation is value:
-                tasks.append((b"self;", None, None, None, 3))
+                tasks.append((b"self;", None, None, None, 3, True))
             else:
-                tasks.append((annotation, None, None, depth, 2))
-            tasks.append((getattr(value, "comments", None), None, None, None, 0))
-            tasks.append((getattr(value, "_meta", None), None, None, None, 0))
-            tasks.append((b")", None, None, None, 3))
+                tasks.append((annotation, None, None, depth, 2, True))
+            tasks.append((getattr(value, "comments", None), None, None, None, 0, typed))
+            tasks.append((getattr(value, "_meta", None), None, None, None, 0, typed))
+            tasks.append((b")", None, None, None, 3, typed))
             todo.extend(reversed(tasks))
         elif isinstance(value, enum.Enum):
-            write(("e" + kind.__module__ + "." + kind.__qualname__ + "." + value.name + ";").encode())
+            data = ("e" + kind.__module__ + "." + kind.__qualname__ + "." + value.name + ";").encode()
         elif kind is list or kind is tuple:
-            tasks = [(b"[" if kind is list else b"<", None, None, None, 3)]
-            tasks.extend((item, None, None, index, 2 if mode == 2 else 0) for item in value)
-            tasks.append((b"]", None, None, None, 3))
+            tasks = [(b"[" if kind is list else b"<", None, None, None, 3, typed)]
+            tasks.extend((item, None, None, index, 2 if mode == 2 else 0, typed) for item in value)
+            tasks.append((b"]", None, None, None, 3, typed))
             todo.extend(reversed(tasks))
+            continue
         elif kind is dict:
-            tasks = [(b"{", None, None, None, 3)]
+            tasks = [(b"{", None, None, None, 3, typed)]
             for name, item in value.items():
-                tasks.append((name, None, None, None, 0))
-                tasks.append((item, None, None, index, 2 if mode == 2 else 0))
-            tasks.append((b"}", None, None, None, 3))
+                tasks.append((name, None, None, None, 0, typed))
+                tasks.append((item, None, None, index, 2 if mode == 2 else 0, typed))
+            tasks.append((b"}", None, None, None, 3, typed))
             todo.extend(reversed(tasks))
+            continue
         else:
-            text = "o" + kind.__module__ + "." + kind.__qualname__ + ":" + repr(value) + ";"
-            write(text.encode("utf-8", "backslashreplace"))
-    return digest.hexdigest()
+            data = ("o" + kind.__module__ + "." + kind.__qualname__ + ":" + repr(value) + ";").encode("utf-8", "backslashreplace")
+        full.update(data)
+        if not typed:
+            plain.update(data)
+    return plain.hexdigest(), full.hexdigest()
+
+
+def tree_digest(root) -> str:
+    """The digest of an expression tree with its type annotations (see tree_digests)."""
+    return tree_digests(root)[1]
 
 
 # What every pinned table held when it was built: id -> (the table, its rows, its columns).
@@ -909,7 +934,7 @@ def install_executor_memo() -> None:
         if MEMO_PHASE is not None:
             MEMO_PHASE("X")
         try:
-            return _Planned(expression, tree_digest(expression))
+            return _Planned(expression, *tree_digests(expression))
         except Exception:
             return real_plan(expression)
 
@@ -931,14 +956,14 @@ def install_executor_memo() -> None:
                     and MEMO_RECORD is None
                     and EXECUTOR_MEMO is not None
                     and key in EXECUTOR_MEMO
-                    and _query_untouched(key)
+                    and _query_untouched(key, planned.typed)
                 ):
                     return pickle.loads(EXECUTOR_MEMO[key])
                 result = real_executor(*self._args, **self._kwargs).execute(real_plan(planned.expression))
                 if MEMO_RECORD is not None and key is not None:
                     name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{len(os.listdir(MEMO_RECORD))}")
                     with open(name, "wb") as handle:
-                        pickle.dump((key, pickle.dumps(result, protocol=4)), handle)
+                        pickle.dump((key, planned.typed, pickle.dumps(result, protocol=4)), handle)
                 return result
             finally:
                 if MEMO_PHASE is not None and MEMO_SCOPE is not None:
