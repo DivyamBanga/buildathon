@@ -467,17 +467,22 @@ class CovMap:
         return (importers if reach is None else reach) & reading
 
     def _name_map(self) -> tuple:
-        """(names, globals by file, star importers by file) from maps/names.json; names empty without the map."""
+        """(names, globals by file, star importers by file, lower-case keys) from maps/names.json; names empty without the map.
+
+        The keys are what an expression class is called once lower-cased (`Expr.key`): the
+        lower-cased names of all classes defined in the tree and of all names it reads."""
         if self._names is None:
             data = self._optional_json("names.json") or {}
             importers: dict = {}
             for importer, targets in data.get("stars", {}).items():
                 for target in targets:
                     importers.setdefault(target, []).append(importer)
+            named = frozenset(data.get("named", ()))
             self._names = (
-                frozenset(data.get("named", ())),
+                named,
                 {path: frozenset(names) for path, names in data.get("globals", {}).items()},
                 importers,
+                frozenset(name.lower() for name in named) | frozenset(name.lower() for name in data.get("classes", ())),
             )
         return self._names
 
@@ -493,9 +498,11 @@ class CovMap:
         nothing reads"):
 
         - a dunder (Python looks those up itself: __reduce__, __deepcopy__, ...);
-        - a name ending in `_sql` (the generators and the simplifier build
-          their dispatch with dir() over the class, transforms and the
-          generator call getattr(self, key + "_sql"));
+        - a name ending in `_sql` whose stem can be an expression key (the
+          generators and the simplifier build their dispatch with dir() over the
+          class, and transforms and the generator call getattr(self, key + "_sql"),
+          with the key of an expression class: the lower-cased name of a class
+          defined anywhere in the tree, or a name the tree reads);
         - any name some code loads or stores as an attribute, imports, or holds
           as a string constant anywhere (maps/names.json `named`);
         - for a module: a name the module's own code loads as a global (a
@@ -507,10 +514,12 @@ class CovMap:
         """
         if reason not in ("added", "removed") or attribute in ("", "*") or shape != "":
             return False
-        named, reads, importers = self._name_map()
+        named, reads, importers, keys = self._name_map()
         if not named or not owner_path.startswith("sqlglot/") or owner_path not in reads:
             return False
-        if attribute in named or attribute.endswith("_sql") or (attribute.startswith("__") and attribute.endswith("__")):
+        if attribute in named or (attribute.startswith("__") and attribute.endswith("__")):
+            return False
+        if attribute.endswith("_sql") and attribute[:-4].lower() in keys:
             return False
         if kind == "class":
             if self._class_kind(owner_path, qualname) not in ("expr", "dialect", "other"):
@@ -527,6 +536,37 @@ class CovMap:
                 return False
             pending.extend(importers.get(path, ()))
         return True
+
+    def moved_readers(self, module: str, qualname: str, attribute: str, reason: str) -> int | None:
+        """Tests that read a class attribute the patch removes, or one it adds under a name an
+        ancestor already defines (so that a read through the class finds another value),
+        taken from maps/areaders.bin; None when that map cannot answer.
+
+        - removed: the readers of that (class, attribute) pair. A test that reads it finds
+          what an ancestor has, or nothing; no other test reads it;
+        - added: the readers of the same name on every ancestor that defines it (reads of an
+          attribute are credited to the class whose dict holds it, whichever subclass or
+          instance the read went through), narrowed to the tests that can reach the class
+          where the map of reaches knows them. A name no ancestor defines is not answered
+          here: nobody has read it from this class yet (that is maps/names.json's question).
+        """
+        if state.PINNED is None:
+            return None
+        if reason == "removed":
+            return self.attribute_readers(module, qualname, attribute)
+        found = state.PINNED[2].get(module)
+        for part in qualname.split("."):
+            found = vars(found).get(part) if found is not None and hasattr(found, "__dict__") else None
+        if not isinstance(found, type) or "<locals>" in qualname:
+            return None
+        readers = None
+        for base in found.__mro__[1:]:
+            if attribute in vars(base):
+                exact = self.attribute_readers(base.__module__, base.__qualname__, attribute)
+                if exact is None:
+                    return None
+                readers = (readers or 0) | exact
+        return readers
 
     def state_candidates(self, result: dict, own=frozenset()) -> int | None:
         """Tests that can notice what an import-time change left behind.
@@ -566,6 +606,17 @@ class CovMap:
                 if exact is not None:
                     found |= exact
                     continue
+            if kind == "class" and reason in ("added", "removed") and not (rest[0] if rest else None):
+                exact = self.moved_readers(module, qualname, attribute, reason)
+                if exact is not None:
+                    if reason == "added":
+                        # Only what can reach the class sees the new value.
+                        class_kind = self._class_kind(owner_path, qualname)
+                        reach = self._reach(owner_path, qualname, class_kind) if class_kind in ("expr", "dialect") else None
+                        if reach is not None:
+                            exact &= reach
+                    found |= exact
+                    continue
             if reason in ("function-meta", "function-code") and path:
                 # A function is used by running it. What it did while sqlglot was
                 # imported is part of the differences already.
@@ -593,7 +644,7 @@ class CovMap:
                     reach = self._named_users(owner_path, qualname)
                 if reach is None:
                     reach = importers
-            if reason == "value" and _CONSTANT_LIKE.match(attribute) and attribute in readers:
+            if reason in ("value", "added", "removed") and _CONSTANT_LIKE.match(attribute) and attribute in readers:
                 reach &= self._named("treaders.bin", attribute)
             found |= reach
         return found

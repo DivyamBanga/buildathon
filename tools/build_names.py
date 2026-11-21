@@ -16,6 +16,9 @@ Writes names.json:
            import. A name the module's own code reads this way, or a builtin
            it uses, is read by that code and by the code of nothing else.
   stars    source path -> the source paths it star-imports (`from m import *`)
+  classes  the name of every class defined anywhere under the root (the key of an
+           expression class is its lower-cased name: CovMap.unobservable asks
+           whether the stem of an added `<stem>_sql` can be one)
 
 Everything under the root is read (the package, its tests, sqlglotc, the
 integration tests, setup files): a reader outside the package counts as much
@@ -105,6 +108,7 @@ def main(root, out_dir):
                 files[relative] = (dotted[: -len(".__init__")] if is_package else dotted, is_package)
     by_module = {dotted: relative for relative, (dotted, _) in files.items()}
     named: set = set()
+    classes: set = set()
     reads: dict = {}
     stars: dict = {}
     for relative, (dotted, is_package) in sorted(files.items()):
@@ -118,6 +122,7 @@ def main(root, out_dir):
             print("not compiled:", relative, error, file=sys.stderr)
             named.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source.decode("utf-8", "replace")))
             continue
+        classes.update(node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef))
         read: set = set()
         walk(code, named, read)
         reads[relative] = read
@@ -130,7 +135,7 @@ def main(root, out_dir):
         globals_by_file.setdefault(path, [])
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "names.json"), "w") as handle:
-        json.dump({"named": sorted(named), "globals": globals_by_file, "stars": stars}, handle, separators=(",", ":"))
+        json.dump({"named": sorted(named), "globals": globals_by_file, "stars": stars, "classes": sorted(classes)}, handle, separators=(",", ":"))
     print(len(named), "names,", len(globals_by_file), "files with globals,", len(stars), "star importers")
 
 

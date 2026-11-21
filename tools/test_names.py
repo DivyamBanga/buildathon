@@ -70,6 +70,9 @@ FILES = {
     "tests/test_x.py": """
         import sqlglot.alpha as alpha
 
+        class FromTest:
+            pass
+
         def test_it():
             alpha.read_by_test
     """,
@@ -123,6 +126,7 @@ expect("a defined name is not named", "UNREAD" in names or "ONLY_STORED" in name
 expect("string constants are named", {"by_string", "key", "dotted", "part", "a", "b", "c", "m", "entry"} <= names, True)
 expect("a sentence of more than eight words is not split", "three" in names or "nine" in names, False)
 expect("builtins read by a file are its globals", "max" in data["globals"]["sqlglot/alpha.py"], True)
+expect("classes are listed", {"Thing"} <= set(data["classes"]), True)
 expect("stars are resolved", data["stars"]["sqlglot/alpha.py"], ["sqlglot/beta.py", "sqlglot/gamma.py"])
 
 # modules
@@ -142,7 +146,9 @@ expect("a global loaded through a star import chain", module("m", "DELTA_NAME", 
 expect("a name only the star importer defines", module("m", "from_beta_unread", file="sqlglot/delta.py"), True)
 expect("a dunder", module("m", "__zz__"), False)
 expect("a dunder with an unread name", module("m", "__reduce__"), False)
-expect("a *_sql name", module("m", "zzadded_sql"), False)
+expect("a *_sql name whose stem is the key of a class", module("m", "thing_sql"), False)
+expect("a *_sql name whose stem is a name something reads", module("m", "attr_read_sql"), False)
+expect("a *_sql name whose stem is no key", module("m", "zzadded_sql"), True)
 expect("a changed value is no business of the rule", module("m", "ZZ_ADDED", "value"), False)
 expect("a whole-module removal", module("m", "*", "removed"), False)
 expect("a file the map does not know", module("m", "ZZ_ADDED", file="sqlglot/new.py"), False)
@@ -160,14 +166,62 @@ expect("a builtin the file calls", klass("max"), False)
 expect("an owner with a base from outside", klass("ZZ_FLAG", shape="F"), False)
 expect("a registering class value", klass("ZzClass", shape="R"), False)
 expect("a dunder on a class", klass("__len__"), False)
-expect("a _sql method", klass("zzadded_sql"), False)
+expect("a _sql method whose stem is a key", klass("thing_sql"), False)
+expect("a _sql method whose stem is a key, in any case", klass("Thing_sql"), False)
+expect("a _sql method whose stem is no key", klass("zzadded_sql"), True)
+expect("the classes of the tests count as keys", klass("fromtest_sql"), False)
 expect("an enum owner", klass("ZZ_FLAG", qualname="Mode"), False)
 expect("an unknown class", klass("ZZ_FLAG", qualname="Nope"), False)
 expect("a class defined in a function", klass("ZZ_FLAG", qualname="f.<locals>.C"), False)
 expect("class owner outside the package", klass("ZZ_FLAG", file="tests/test_x.py"), False)
 
+# who reads a class attribute that is removed, or added under the name of an inherited one
+import types  # noqa: E402
+
+from selector import state  # noqa: E402
+
+fake = types.ModuleType("pkg.m")
+
+
+class Base:
+    FLAG = 1
+    OTHER = 2
+    mid = 3
+
+
+class Child(Base):
+    pass
+
+
+class Grand(Child):
+    FLAG = 4
+
+
+class Leaf(Grand):
+    pass
+
+
+for klass_ in (Base, Child, Grand, Leaf):
+    klass_.__module__ = "pkg.m"
+    klass_.__qualname__ = klass_.__name__
+    setattr(fake, klass_.__name__, klass_)
+state.PINNED = ("/root", [], {"pkg.m": fake}, {}, {}, 0)
+bitmaps = {("pkg.m", "Base", "FLAG"): 0b0110, ("pkg.m", "Base", "OTHER"): 0b1000, ("pkg.m", "Grand", "FLAG"): 0b10000}
+covmap.attribute_readers = lambda module, qualname, attribute: bitmaps.get((module, qualname, attribute))
+expect("removed: the readers of the pair", covmap.moved_readers("pkg.m", "Base", "FLAG", "removed"), 0b0110)
+expect("removed: a pair the map does not cover", covmap.moved_readers("pkg.m", "Base", "mid", "removed"), None)
+expect("added over an inherited name: the readers of the ancestor", covmap.moved_readers("pkg.m", "Child", "OTHER", "added"), 0b1000)
+expect("added over a name two ancestors define: both", covmap.moved_readers("pkg.m", "Leaf", "FLAG", "added"), 0b10110)
+expect("added over a name one ancestor defines", covmap.moved_readers("pkg.m", "Child", "FLAG", "added"), 0b0110)
+expect("added over a name an ancestor defines and the map does not cover", covmap.moved_readers("pkg.m", "Child", "mid", "added"), None)
+expect("added under a name no ancestor defines", covmap.moved_readers("pkg.m", "Child", "NEW_ONE", "added"), None)
+expect("added to a class the pinned world does not have", covmap.moved_readers("pkg.m", "Nope", "FLAG", "added"), None)
+expect("an uncovered ancestor next to a covered one", covmap.moved_readers("pkg.m", "Leaf", "mid", "added"), None)
+state.PINNED = None
+expect("without the pinned world nothing is answered", covmap.moved_readers("pkg.m", "Base", "FLAG", "removed"), None)
+
 # without the map nothing is unobservable
 empty = CovMap(covmap.directory)
-empty._names = (frozenset(), {}, {})
+empty._names = (frozenset(), {}, {}, frozenset())
 expect("no map", empty.unobservable("module", "sqlglot/alpha.py", "", "ZZ_ADDED", "added", ""), False)
 print(f"{checks} checks passed")
