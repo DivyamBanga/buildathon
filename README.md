@@ -301,7 +301,14 @@ the patched code**, and selects the ones that fail.
        that look a name up by a computed text or walk a namespace are the
        ones reviewed at the pinned commit (the generator's `dir(cls)` for
        names ending in `_sql`; `eval` of generated code in a dict built from
-       the executor's function table);
+       the executor's function table); that function table itself (`ENV` in
+       `executor/env.py`) is copied by every query, and a query uses of it
+       only the entries its code names, so a table that differs in some
+       entries concerns the queries whose evaluated code names one of them
+       (all names of every piece of code a query evaluates are recorded,
+       and the key of the one lookup by a computed name; used only while the
+       lines of the package that mention the table or a copy of it are the
+       ones this was read off);
        anything else (other added or removed attributes, other bases, a
        difference on the classes the recorded results are made of) turns the
        reuse off, as does an inconclusive comparison or a patch outside

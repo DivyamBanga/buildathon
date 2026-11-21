@@ -99,6 +99,20 @@ REVIEWED_DYNAMIC = frozenset(
         ("sqlglot/executor/python.py", 342),
     )
 )
+# The executor's function table: ENV in sqlglot/executor/env.py, held under that
+# name by two more modules. Every query copies it; the entries a query uses are
+# recorded as the keys of a pseudo attribute (tools/build_executor_memo.py). That
+# rests on a reading of every line of the package that mentions the table or a
+# copy of it (two copies, eval of generated code in a copy, one lookup by a
+# computed key, writes of "scope" and of three entries of its own), so it is
+# used only while the map lists exactly these lines.
+ENV_PAIR = "sqlglot.executor.env:|ENV"
+ENV_HOLDERS = ("sqlglot.executor.env", "sqlglot.executor.context", "sqlglot.executor.python")
+REVIEWED_ENV_USES = frozenset(
+    [("sqlglot/executor/context.py", line) for line in (5, 43, 46, 73, 80, 99, 104, 109)]
+    + [("sqlglot/executor/python.py", line) for line in (9, 20, 26, 202, 223)]
+    + [("sqlglot/executor/env.py", 249)]
+)
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
 
@@ -220,6 +234,7 @@ class Coordinator:
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
         self.exec_names: dict | None = None
         self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
+        self.env_reviewed = False
         self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
         self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
         self.record_failed = False
@@ -649,8 +664,10 @@ class Coordinator:
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_names = None
             try:
-                read = json.load(open(os.path.join(MAPS, "execattrs.json")))["read"]
+                attrs = json.load(open(os.path.join(MAPS, "execattrs.json")))
+                read = attrs["read"]
                 self.exec_attrs = {name: index for index, name in enumerate(read)}
+                self.env_reviewed = {tuple(use) for use in attrs.get("env_uses", [["?", 0]])} == REVIEWED_ENV_USES
             except (OSError, ValueError, KeyError, TypeError):
                 self.exec_attrs = None
             # Every line of the phase has a number (its place in the file), and so
@@ -795,6 +812,18 @@ class Coordinator:
                 # What the recorded results are made of.
                 job.plan.note(f"no recorded results: {where} differs")
                 return None
+            if kind == "module" and attribute == "ENV" and module in ENV_HOLDERS and reason == "value":
+                # The executor's function table differs in some entries: a query
+                # sees that through the entries its code names.
+                number = self.exec_attrs.get(ENV_PAIR) if self.exec_attrs is not None and self.env_reviewed else None
+                entries = more[0] if more else None
+                if entries is not None and any("'__" in name and name.endswith("__'") for name in entries):
+                    # An entry such as "__builtins__" decides how every other name is
+                    # found, and no code names it: the table counts as a whole.
+                    entries = None
+                if number is not None and entries is not None:
+                    tables[number] = tables.get(number, frozenset()) | frozenset(entries)
+                    continue
             if reason in ("function-meta", "function-code") and path:
                 if self.covmap.is_loader(path, first):
                     job.plan.note(f"no recorded results: {where} imports on demand")
