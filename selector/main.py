@@ -148,7 +148,9 @@ class Job:
         self.import_files: list[str] = []
         self.setup_untouched: bool | None = None
         self.memo_ok: bool | None = None
-        self.memo_block = (0, 0)  # phase lines and attributes the patch changes, as bit masks
+        # What the patch changes of the executor phase: lines and attributes as bit
+        # masks, and {attribute: names of the entries that differ} for tables.
+        self.memo_block = (0, 0, {})
         self.memo_share: dict = {}
         self.deadline = float("inf")  # wall-clock limit for checking this commit
         self.probed = False  # the state left by its import-time changes has been compared
@@ -676,7 +678,7 @@ class Coordinator:
         """
         if job.memo_ok is None:
             job.memo_ok = False
-            job.memo_block = (0, 0)
+            job.memo_block = (0, 0, {})
             job.memo_share = {}
             # A patched module that is imported on demand is imported from its
             # new source when a test first asks for it. That leaves the state
@@ -687,23 +689,22 @@ class Coordinator:
             if self.memo_cost and lazy_ok and self.executor_phase():
                 if job.mode == "hot":
                     # Only function bodies changed: the state sqlglot builds at import is the pinned one.
-                    block = (self.phase_lines(job.plan.units), 0) if self.executor_setup_untouched(job) else None
+                    block = (self.phase_lines(job.plan.units), 0, {}) if self.executor_setup_untouched(job) else None
                 else:
                     block = self.import_seen_by_executor(job)
-                if block is not None and (block == (0, 0) or self.exec_queries):
+                if block is not None and (not any(block) or self.exec_queries):
                     job.memo_ok = True
                     job.memo_block = block
         return job.memo_ok
 
     def memo_share(self, job: Job, bit: int) -> float:
         """The share of a test's recorded queries that the patch touches (they are executed in full)."""
-        rows, reads = job.memo_block
-        if not rows and not reads:
+        if not any(job.memo_block):
             return 0.0
         scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
         if scope not in job.memo_share:
             mine = [entry for key, entry in self.exec_queries.items() if key.startswith(f"{scope}:")]
-            touched = sum(1 for own_rows, own_reads, _ in mine if own_rows & rows or own_reads & reads)
+            touched = sum(1 for own in mine if runner.query_touched(own, job.memo_block))
             job.memo_share[scope] = touched / len(mine) if mine else 1.0
             if mine:
                 job.plan.note(f"the patch concerns the execution of {touched} of {len(mine)} recorded {scope} queries")
@@ -730,10 +731,11 @@ class Coordinator:
                 return False
         return bool(self.exec_queries) or not self.phase_lines(plan.units)
 
-    def import_seen_by_executor(self, job: Job) -> tuple[int, int] | None:
+    def import_seen_by_executor(self, job: Job) -> tuple[int, int, dict] | None:
         """After a clean import: what of the patch the executor phase can see, as
-        (bit mask of phase lines, bit mask of attributes the phase reads); (0, 0)
-        when it can see nothing; None when that cannot be told.
+        (bit mask of phase lines, bit mask of attributes the phase reads,
+        {attribute: names of its entries that differ}); all three empty when
+        it can see nothing; None when that cannot be told.
 
         The comparison of import state (selector/state.py) lists every module
         or class attribute that differs. Reusing a recorded result is right
@@ -746,7 +748,10 @@ class Coordinator:
         - a plain data attribute of a class with another value is seen by
           reading it, through the class, a subclass or an instance: through
           that attribute, if the recorded phase read it (maps/execattrs.json,
-          taken with a descriptor in the attribute's place);
+          taken with a descriptor in the attribute's place); when it holds a
+          table (a dict or a set) that differs in some entries only, by a
+          query that walked the table or looked one of those entries up
+          (maps/execqueries.bin, taken with tools/recdict.py);
         - any other constant (a name in capitals) with another value is seen
           by reading the name: through the lines of the code that mentions it
           (maps/execnames.json, by the same rule as the reader map);
@@ -763,7 +768,8 @@ class Coordinator:
         rows = self.phase_lines(job.plan.units)
         own = {(path, first) for path, entries in job.plan.units.items() for first, _ in entries}
         reads = 0
-        for kind, module, qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
+        tables: dict = {}
+        for kind, module, qualname, attribute, reason, _owner, path, first, *more in result["differences"]:
             where = f"{module}:{qualname}.{attribute}" if qualname else f"{module}.{attribute}"
             if module == "sqlglot.executor.table" and reason not in ("function-meta", "function-code"):
                 # What the recorded results are made of.
@@ -790,7 +796,12 @@ class Coordinator:
                 # Another value, or gone: either way only a read of it can tell.
                 number = self.exec_attrs.get(f"{module}:{qualname}|{attribute}")
                 if number is not None:
-                    reads |= 1 << number
+                    entries = more[0] if more and reason == "value" else None
+                    if entries is None:
+                        reads |= 1 << number
+                    else:
+                        # A table that differs in these entries only: seen by looking one of them up.
+                        tables[number] = frozenset(entries)
                 continue
             if reason != "value":
                 job.plan.note(f"no recorded results: {where} {reason}")
@@ -801,7 +812,7 @@ class Coordinator:
                 continue
             job.plan.note(f"no recorded results: {where} may be read by the executor")
             return None
-        return rows, reads
+        return rows, reads, {number: names for number, names in tables.items() if not reads >> number & 1}
 
     def executor_record(self) -> bool:
         """Build the pinned executor tables and load the recorded results, once. False when that fails."""
@@ -1048,7 +1059,7 @@ class Coordinator:
             "executor_tables": self.executor_tables(job, tests),
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
-        spec["memo_block"] = job.memo_block if spec["executor_memo"] and job.memo_block != (0, 0) else None
+        spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
         spec["lazy"] = plan.lazy if job.mode == "hot" else []

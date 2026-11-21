@@ -185,20 +185,59 @@ check(runner.memo_key("tpcds", "d", (), {"tables": Tables({"u": pinned["u"]})}) 
 pinned["u"].rows[0] = kept[0]
 nested = Tables({"db": {"t": pinned["t"]}})
 check(runner.memo_key("tpcds", "d", (), {"tables": nested}) is None, "nested tables are not recognised")
+# Cached hashes: a recorded result is not for a tree in which one of them is out of date.
+hashed = parse_one("SELECT a FROM t WHERE a = 1")
+hash(hashed)
+check(runner.hashes_fresh(hashed), "a tree whose cached hashes are the true ones")
+equality = hashed.args["where"].this
+cached = equality._hash
+check(cached is not None, "the comparison has a cached hash")
+equality.this.args["this"] = exp.to_identifier("b")  # a change below it that clears no cache
+check(not runner.hashes_fresh(hashed), "a cached hash that predates a change below it is found")
+check(equality._hash == cached and hashed._hash is not None, "and every cache is left as it was")
+bare = parse_one("SELECT a FROM t")
+check(runner.hashes_fresh(bare) and bare._hash is None and bare.expressions[0]._hash is None, "a tree with no cached hash is fresh and stays without one")
+typed_node = parse_one("SELECT a FROM t")
+typed_node.expressions[0].type = exp.DataType.build("array<int>")
+hash(typed_node.expressions[0].type)
+check(runner.hashes_fresh(typed_node), "annotations are looked at as well")
+typed_node.expressions[0].type.expressions[0].args["this"] = exp.DataType.Type.TEXT
+check(not runner.hashes_fresh(typed_node), "and a stale hash inside one is found")
 # Query by query: a recorded result is used only when the query's own record touches nothing the patch changes.
-runner.EXECUTOR_QUERIES = {"k": (0b0110, 0b01, ("", "", "")), "t": (0b0110, 0b01, ("typed", "", "")), "c": (1, 1, ("", "noted", ""))}
+runner.EXECUTOR_QUERIES = {
+    "k": (0b0110, 0b01, ("", "", ""), {}),
+    "t": (0b0110, 0b01, ("typed", "", ""), {}),
+    "c": (1, 1, ("", "noted", ""), {}),
+    # reads attribute 0 whole and attribute 2 by two keys only
+    "d": (0b0001, 0b101, ("", "", ""), {2: frozenset(("str:'a'", "num:7", "int:7"))}),
+}
 runner.MEMO_BLOCK = None
 check(runner._query_untouched("k", ("x", "y", "z")), "nothing changed in the phase: a query that reads no slot keeps its result")
 check(runner._query_untouched("t", ("typed", "y", "z")), "a query that asks for types keeps its result with the recorded annotations")
 check(not runner._query_untouched("t", ("other", "y", "z")), "and is executed with other annotations")
 check(runner._query_untouched("c", ("x", "noted", "z")) and not runner._query_untouched("c", ("x", "y", "z")), "the same for comments")
 check(not runner._query_untouched("unknown", ("typed", "", "")), "a query with no record of its own is executed")
-for block, expected in (((0b1000, 0), True), ((0b0100, 0), False), ((0, 0b01), False), ((0b1001, 0b10), True), ((0b0010, 0b10), False)):
+for block, expected in (
+    ((0b1000, 0, {}), True), ((0b0100, 0, {}), False), ((0, 0b01, {}), False), ((0b1001, 0b10, {}), True), ((0b0010, 0b10, {}), False),
+):
     runner.MEMO_BLOCK = block
     check(runner._query_untouched("k", ("x", "y", "z")) is expected, f"lines and attributes {block}: kept is {expected}")
+for block, expected, why in (
+    ((0, 0, {2: frozenset(("str:'b'",))}), True, "a table read by key, another entry differs"),
+    ((0, 0, {2: frozenset(("str:'a'",))}), False, "an entry that was looked up differs"),
+    ((0, 0, {2: frozenset(("enum:m:E:SEVEN", "num:7"))}), False, "an entry under an equal key differs"),
+    ((0, 0b100, {}), False, "the table differs as a whole"),
+    ((0, 0, {0: frozenset(("str:'b'",))}), False, "a table this query walked differs in an entry"),
+    ((0, 0, {1: frozenset(("str:'a'",))}), True, "a table this query never read differs"),
+):
+    runner.MEMO_BLOCK = block
+    check(runner._query_untouched("d", ("x", "y", "z")) is expected, f"{why}: kept is {expected}")
 runner.MEMO_BLOCK = None
 queries = runner.read_executor_queries("/repo/maps/execqueries.bin")
-check(len(queries) == 57 and all(type(a) is int and type(b) is int and len(c) == 3 and a for a, b, c in queries.values()), "the per-query record reads back")
+check(
+    len(queries) == 57 and all(type(a) is int and type(b) is int and len(c) == 3 and type(d) is dict and a for a, b, c, d in queries.values()),
+    "the per-query record reads back",
+)
 asking = [sum(1 for entry in queries.values() if entry[2][position]) for position in range(3)]
 check(0 < asking[0] < 57 and 0 < asking[1] < 57 and asking[2] < 57, f"only some queries read a slot: {asking}")
 check(runner.read_executor_queries("/repo/maps/no-such-file") == {}, "a missing per-query record is an empty one")

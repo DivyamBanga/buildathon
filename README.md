@@ -207,22 +207,6 @@ the patched code**, and selects the ones that fail.
      This holds for any patch, because it is decided by what the patched code
      really sends. The optimizer tests' small DuckDB database is held back the
      same way until a case executes a query.
-   - A patch that changes how a TPC query is written for DuckDB sends texts
-     the record does not have. The setup's views read gzip CSV files anew for
-     every query (15 CPU seconds for the 57 TPC-DS queries, 0.4 for the
-     queries themselves). So a plain SELECT with no recorded answer, sent
-     after a recognised setup, is run on tables that hold exactly what the
-     views show: made by the setup's own `READ_CSV` calls, same rows, same
-     order, same types. What DuckDB may vary between a view and a table is
-     the plan, hence the order of rows where the query leaves it open and the
-     last digits of floating-point sums. The query is therefore run a second
-     time on copies of the tables that store the rows in reverse, and the
-     answer is used only when both frames agree (exactly, sums to nine
-     digits); a result that depends on the order rows arrive in does not
-     pass that, and then, after any error, or for a text that could tell a
-     table from a view (`rowid`, the catalog), the views are asked as before.
-     This is an assumption, stated here: a result that survives reversing
-     every table is what the views give too.
    - `sqlglot.executor.execute` prepares the tables it was given, optimizes
      the query, plans it and runs the plan. The result of the last two steps
      depends on three things: the optimized query, the tables, and the code
@@ -249,7 +233,15 @@ the patched code**, and selects the ones that fail.
        behave differently either, a slot of an unusual shape stays in the
        key (comments that are not a list of strings, meta that is not a flat
        dictionary of plain values, an annotation that is the node itself or
-       holds something that is not an expression).
+       holds something that is not an expression). A node also caches its
+       hash, and the planner hashes nodes. A cached hash is a number of one
+       process, so no digest can cover it; it cannot be seen as long as it
+       is the true one. A patched optimizer can leave a node whose cached
+       hash predates a change below it, in a tree that is otherwise the
+       pinned one (found with a one-token edit of `simplify`). So before a
+       recorded result is used, every cached hash in the tree is compared
+       with a fresh one computed by the node's own class, and put back; one
+       stale hash and the query is executed (`runner.hashes_fresh`).
      - *The tables*: what `ensure_tables` returned for this call must hold
        exactly the pinned tables, by name and by content, at that moment (a
        table changed in place is not the pinned table any more).
@@ -264,7 +256,13 @@ the patched code**, and selects the ones that fail.
        other code must not be one it runs); a plain data
        attribute of a class must not be one it read (`execattrs.json`:
        recorded with a descriptor in the attribute's place that notes every
-       read through the class, a subclass or an instance); any other constant
+       read through the class, a subclass or an instance; when the attribute
+       holds a table, a dict that differs in some entries only, the query
+       must have walked the table or looked one of those entries up:
+       `tools/recdict.py` puts a recording dict in the table's place, a
+       lookup and an entry are the same key when `state.key_names` gives them
+       a common name, and what a query looked up counts only if it ran the
+       same lines with and without the recording dicts); any other constant
        must not be named in any function it runs (`execnames.json`);
        anything else (an attribute added or removed, other bases, a
        difference on the classes the recorded results are made of) turns the

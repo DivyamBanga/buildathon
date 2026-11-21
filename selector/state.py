@@ -374,7 +374,7 @@ class Comparer:
         if isinstance(value, type):
             return ("class", value.__module__, value.__qualname__)
         if kind is tuple or kind is frozenset:
-            parts = [self._token(item) for item in value]
+            parts = [Comparer._token(self, item) for item in value]
             if any(part is None for part in parts):
                 return None
             return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
@@ -398,15 +398,21 @@ class Comparer:
                 token = self._token(key)
                 if token is None or token in named:
                     return None
-                named[token] = table[key] if kind is dict else key
+                named[token] = (key, table[key] if kind is dict else key)
             sides.append(named)
         left, right = sides
-        changed = [
-            token
-            for token in list(left) + [token for token in right if token not in left]
-            if token not in left or token not in right or not self.same(left[token], right[token])
-        ]
-        return sorted(token_text(token) for token in changed)
+        names: set = set()
+        for token in list(left) + [token for token in right if token not in left]:
+            if token in left and token in right and self.same(left[token][1], right[token][1]):
+                continue
+            for side in sides:
+                if token in side:
+                    # Every name an equal key could be looked up under (see key_names).
+                    found = key_names(side[token][0])
+                    if found is None:
+                        return None
+                    names |= found
+        return sorted(names)
 
     def _members(self, a, b) -> bool:
         if len(a) != len(b):
@@ -682,6 +688,56 @@ class Comparer:
                 reported.add(key)
                 self.report(("module", function.__module__, ""), function.__qualname__, reason, function)
         return self.differences
+
+
+def _plain_key(key):
+    """What a key is to a dict: the same for any two keys a dict would take for one.
+
+    A dict finds an entry by hash and ==, and sqlglot has keys that are equal
+    across types: a member of an enum that is also a str or an int equals
+    its value, and 1 == True == 1.0. Returns None for a key that cannot be
+    named, and for a class whose metaclass defines its own equality (a dialect
+    class equals the string that names it).
+    """
+    kind = type(key)
+    if isinstance(key, str) and (kind is str or isinstance(key, enum.Enum)):
+        return ("str", repr(str.__str__(key)))
+    if isinstance(key, (bool, int, float)) and (kind in (bool, int, float) or isinstance(key, enum.Enum)):
+        number = float(key) if isinstance(key, float) else int(key)
+        if isinstance(number, float) and number.is_integer():
+            number = int(number)
+        return ("num", repr(number))
+    if kind is complex:
+        return _plain_key(key.real) if key.imag == 0 else ("complex", repr(key))
+    if kind in _PLAIN:
+        return (kind.__name__, repr(key))
+    if isinstance(key, enum.Enum):
+        return ("enum", kind.__module__, kind.__qualname__, key.name)
+    if isinstance(key, type):
+        if type(key).__eq__ is not type.__eq__ or type(key).__hash__ is not type.__hash__:
+            return None
+        return ("class", key.__module__, key.__qualname__)
+    if kind is tuple or kind is frozenset:
+        parts = [_plain_key(item) for item in key]
+        if any(part is None for part in parts):
+            return None
+        return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
+    return None
+
+
+def key_names(key) -> frozenset | None:
+    """The names of a key of a table (dict, set): the one the comparison gives
+    it, and the one any equal key shares with it (see _plain_key).
+
+    Whoever looked a key up and whoever changed an entry mean the same entry
+    when their names intersect. None: the key cannot be named, the table
+    counts as a whole.
+    """
+    plain = _plain_key(key)
+    token = Comparer._token(None, key)
+    if plain is None or token is None:
+        return None
+    return frozenset((token_text(token), token_text(plain)))
 
 
 def token_text(token) -> str:

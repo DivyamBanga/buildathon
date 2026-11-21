@@ -13,9 +13,11 @@ pinned commit:
   execattrs.json   every plain data attribute of a sqlglot class that those lines read
   execqueries.bin  the same two, query by query: memo key -> (which of the
                    lines, which of the attributes) as bit masks over the two
-                   lists, and the digests of the slots that query reads
-                   (type annotation, comments, meta; from tools/trace_slots.py,
-                   whose slots.json is the optional fifth argument)
+                   lists, the digests of the slots that query reads (type
+                   annotation, comments, meta; from tools/trace_slots.py,
+                   whose slots.json is the optional fifth argument), and for
+                   an attribute that holds a table (a dict) and is only ever
+                   looked up by key, the names of those keys (tools/recdict.py)
 
 The selector reuses a recorded result only for a query whose optimized form is
 exactly the recorded one, run on tables that hold exactly the pinned data, and
@@ -221,15 +223,72 @@ def watch_and_record() -> None:
                     continue
                 watched[key] = (cls, attr)
     runner.MEMO_RECORD = os.path.join(read_dir, "results")
-    runner.MEMO_PHASE = lambda kind: recording.__setitem__(0, kind == "X")
+    import recdict
+
+    descriptors = {key: vars(cls)[attr] for key, (cls, attr) in watched.items()}
+    del value, pending  # nothing here may still hold a table (see recdict.wrap)
+    key_pairs: list = []
+    lines_phase = getattr(tracer, "_phase", None)
+    noted = {"keys": set(), "whole": set()}
+
+    def phase(kind) -> None:
+        on = kind == "X"
+        if on != recording[0]:
+            if on:
+                recdict.open_window()
+            else:
+                keys, whole = recdict.close_window()
+                noted["keys"] |= keys
+                noted["whole"] |= whole
+        recording[0] = on
+        if lines_phase is not None:
+            lines_phase(kind)
+
+    runner.MEMO_PHASE = phase
 
     def record_reads(order, case, out) -> None:
         keys = run(order, case)
+        if hasattr(tracer, "_dump"):
+            tracer._dump()
         # An attribute that was assigned anew is no longer watched: count it as read.
         gone = [key for key, (cls, attr) in watched.items() if type(vars(cls).get(attr)) is not Watch]
+        # A table that was only ever asked for single keys: which keys. A table
+        # that was walked, measured, copied or compared, or fetched and never
+        # looked into (passed on, compared by identity), counts as read whole.
+        by_table: dict = {}
+        for table_id, key in noted["keys"]:
+            by_table.setdefault(table_id, []).append(key)
+        keyed = {}
+        for pair in key_pairs:
+            table = descriptors[pair].value
+            if pair not in reads or id(table) in noted["whole"] or id(table) not in by_table:
+                continue
+            names: set = set()
+            for key in by_table[id(table)]:
+                # A lookup that found an entry is named by the key the table holds.
+                found = state.key_names(recdict.stored(table, key))
+                if found is None:
+                    names = None
+                    break
+                names |= found
+            if names is not None:
+                keyed[pair] = sorted(names)
         with open(out, "w") as handle:
-            json.dump({"keys": keys, "reads": sorted(reads | set(gone))}, handle)
+            json.dump({"pid": os.getpid(), "keys": keys, "reads": sorted(reads | set(gone)), "keyed": keyed}, handle)
 
+    if queries_path and hasattr(tracer, "_DIR"):
+        # Once with the tables as they are: the lines each query runs here, to be
+        # compared with the lines it runs when recording stand-ins are in place.
+        tracer._DIR = os.path.join(read_dir, "rows-plain")
+        os.makedirs(tracer._DIR)
+        for number, case in enumerate(CASES):
+            in_fork(lambda: record_reads([case[1]], case, os.path.join(read_dir, f"plain-case-{number}.json")))
+        tracer._DIR = os.path.join(read_dir, "rows-keyed")
+        os.makedirs(tracer._DIR)
+        found_pairs, left_whole = recdict.wrap(descriptors, slot="value")
+        key_pairs.extend(found_pairs)
+        with open(os.path.join(read_dir, "tables.json"), "w") as handle:
+            json.dump({"keyed": found_pairs, "whole": left_whole}, handle)
     for number, order in enumerate(ORDERS):
         in_fork(lambda: record_reads(order, None, os.path.join(read_dir, f"reads-order-{number}.json")))
     if queries_path:
@@ -261,15 +320,48 @@ if queries_path and trace_dir and attrs_path:
             value |= 1 << index
         return value.to_bytes((value.bit_length() + 7) // 8 or 1, "little")
 
-    lines_of, reads_of = {}, {}
+    def phase_rows(directory, pid) -> set:
+        """The phase lines one process ran, from the line tracer's file for it."""
+        found = set()
+        try:
+            with open(os.path.join(read_dir, directory, f"{pid}.txt"), encoding="utf-8") as handle:
+                for row in handle:
+                    if row.startswith("X "):
+                        found.add(row)
+        except OSError:
+            return {"no trace"}
+        return found
+
+    lines_of, reads_of, keyed_of = {}, {}, {}
+    diverged = 0
     for number, case in enumerate(CASES):
         entry = json.load(open(os.path.join(work_dir, f"lines-case-{number}.json")))
         watched_entry = recorded[f"reads-case-{number}.json"]
         if entry["keys"] != watched_entry["keys"] or len(entry["keys"]) > 1:
             raise SystemExit(f"case {case}: keys {entry['keys']} and {watched_entry['keys']}")
+        keyed = watched_entry.get("keyed", {})
+        plain_file = os.path.join(read_dir, f"plain-case-{number}.json")
+        if keyed and entry["keys"]:
+            # The stand-ins must not have changed what the query runs: the same
+            # lines with and without them, or every table counts as read whole.
+            plain_entry = json.load(open(plain_file)) if os.path.exists(plain_file) else None
+            same = (
+                plain_entry is not None
+                and plain_entry["keys"] == watched_entry["keys"]
+                and plain_entry["reads"] == watched_entry["reads"]
+                and phase_rows("rows-plain", plain_entry["pid"]) == phase_rows("rows-keyed", watched_entry["pid"])
+            )
+            if not same:
+                diverged += 1
+                keyed = {}
         for key in entry["keys"]:
             lines_of.setdefault(key, set()).update(rows_of_pid.get(str(entry["pid"]), ()))
             reads_of.setdefault(key, set()).update(watched_entry["reads"])
+            if key in keyed_of:
+                # The same query twice: a table is keyed only if it was both times.
+                keyed_of[key] = {pair: sorted(set(names) | set(keyed[pair])) for pair, names in keyed_of[key].items() if pair in keyed}
+            else:
+                keyed_of[key] = dict(keyed)
     if set(lines_of) != set(memo):
         raise SystemExit(f"queries recorded one by one: {len(lines_of)}, results: {len(memo)}")
     # Does planning and executing a query ask a node for its type? Only then do
@@ -318,9 +410,16 @@ if queries_path and trace_dir and attrs_path:
             mask(row_index[row] for row in lines_of[key]),
             mask(read_index[name] for name in reads_of[key]),
             tuple(wanted),
+            {read_index[pair]: names for pair, names in sorted(keyed_of[key].items())},
         )
     for position, slot in enumerate(runner.SLOTS):
         print(f"{sum(1 for entry in queries.values() if entry[2][position])} of {len(queries)} queries read {slot}")
+    tables = json.load(open(os.path.join(read_dir, "tables.json"))) if os.path.exists(os.path.join(read_dir, "tables.json")) else {}
+    read_tables = sorted(pair for pair in tables.get("keyed", ()) if pair in read_index)
+    by_key_only = sorted({pair for found in keyed_of.values() for pair in found})
+    print(f"tables among the attributes read: {len(read_tables)} with a stand-in, "
+          f"{sorted(pair for pair in tables.get('whole', {}) if pair in read_index)} left alone; "
+          f"looked up by key only in some query: {by_key_only}; {diverged} queries ran other lines with stand-ins")
     if traced and set(traced) != set(memo):
         print(f"slot trace and record disagree on the queries: {len(set(traced) ^ set(memo))} keys in one only")
     with open(queries_path, "wb") as handle:
