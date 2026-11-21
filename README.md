@@ -88,6 +88,24 @@ the patched code**, and selects the ones that fail.
    defines elsewhere, or the name of any test in the suite. Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
 
+   **An edited test that leaves state behind.** The rule above compares the
+   statements of the new text with those of the old one, so it sees neither a
+   restore that was removed nor a changed line of a cleanup that stores
+   nothing itself (`finally: BigQuery.NORMALIZATION_STRATEGY = ...` replaced
+   by `pass`: the edited test passes, and in the whole suite 26 tests of
+   seven files fail). For an edited test file, the lines that changed, on the old
+   side and on the new side, select every test when one of them stores to an
+   attribute or subscript of anything but `self` and the fresh locals of its
+   def (a local that holds a parameter, a loop or `with` target, an unpacked
+   value or `x = y.z` counts as the thing it names, and so does a store one
+   level further down), registers a cleanup (`addCleanup`, `enterContext`,
+   `callback`), or sits in `tearDown`, `tearDownClass`, `tearDownModule`, a
+   `finally` block or a function handed to `addCleanup`. A test, helper or
+   class that is new as a whole (every line added, under a name the old file
+   does not have) is not an edit: the rule above judges it, and its own
+   `finally` or `tearDown` only undoes what it did itself. Of one that is
+   removed as a whole, only the stores still count.
+
    **A file that appears or vanishes** changes what its directory lists. The
    tests that listed that directory in their own run (`dirs.json`, from the
    `D` rows of the per-test traces: `os.listdir`, `os.scandir`, `glob`) are

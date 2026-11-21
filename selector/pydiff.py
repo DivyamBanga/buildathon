@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import re
 import dis
 import types
@@ -729,6 +730,17 @@ def _global_effects(tree, scope: str = "", method_ok: bool = False, statement=No
     return found
 
 
+@functools.lru_cache(maxsize=2)
+def _parse(text: str):
+    """The tree of a source text. The rules for test files each need the trees of the same two
+    texts and only read them; `analyze` drops them when it is done with a commit."""
+    return ast.parse(text)
+
+
+def forget_trees() -> None:
+    _parse.cache_clear()
+
+
 def new_global_effects(old_text: str, new_text: str) -> bool:
     """True when the new text has a statement that stores outside the local scope
     (see `_global_effects`) which the old text did not have in that place.
@@ -738,13 +750,233 @@ def new_global_effects(old_text: str, new_text: str) -> bool:
     store into a class, a module or a registry reaches tests of other files.
     """
     try:
-        new_tree = ast.parse(new_text)
-        old_tree = ast.parse(old_text) if old_text else None
+        new_tree = _parse(new_text)
+        old_tree = _parse(old_text) if old_text else None
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     old_found = Counter(_global_effects(old_tree)) if old_tree is not None else Counter()
     new_found = Counter(_global_effects(new_tree))
     return any(count > old_found[signature] for signature, count in new_found.items())
+
+
+# ---- an edited test that leaves something behind ---------------------------------------
+#
+# `new_global_effects` looks at the statements the new text has and the old one had not. It
+# sees neither a restore that was removed nor a changed line of a cleanup that stores nothing
+# itself. These work from the changed lines instead, on both sides of the edit.
+
+_CLEANUP_DEFS = frozenset(("teardown", "teardownclass", "teardownmodule", "docleanups", "doclasscleanups", "domodulecleanups"))
+_CLEANUP_CALLS = frozenset(("addCleanup", "addClassCleanup", "addModuleCleanup", "enterContext", "enterClassContext", "callback", "push"))
+# What a name is bound to when it holds something made on the spot. A name, an attribute, a
+# subscript, a conditional or an `or` hands on a thing that exists elsewhere.
+_FRESH_VALUES = (
+    ast.Constant, ast.JoinedStr, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp,
+    ast.GeneratorExp, ast.Call, ast.BinOp, ast.Compare, ast.UnaryOp,
+)
+_TRY = (ast.Try, getattr(ast, "TryStar", ast.Try))
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _source_lines(text: str) -> list:
+    """The lines of a source text as the compiler numbers them (a form feed does not end one)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _changed_lines(old_text: str, new_text: str) -> tuple:
+    """(1-based lines of the old text that were removed or changed, the same for the new text)."""
+    import difflib
+
+    old_lines = _source_lines(old_text)
+    new_lines = _source_lines(new_text)
+    # What the two share at both ends needs no matching: an edit is a few lines of a long file.
+    limit = min(len(old_lines), len(new_lines))
+    head = 0
+    while head < limit and old_lines[head] == new_lines[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and old_lines[-1 - tail] == new_lines[-1 - tail]:
+        tail += 1
+    removed: set = set()
+    added: set = set()
+    matcher = difflib.SequenceMatcher(None, old_lines[head:len(old_lines) - tail], new_lines[head:len(new_lines) - tail])
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            removed.update(range(head + i1 + 1, head + i2 + 1))
+            added.update(range(head + j1 + 1, head + j2 + 1))
+    return removed, added
+
+
+def _aliasing_names(func) -> set:
+    """Names bound in the def other than by giving them a value made on the spot: parameters, loop
+    and with targets, imports, unpacked values, and `x = y.z` style names for something that exists elsewhere."""
+    names: set = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            names |= {n.id for n in ast.walk(node.target) if isinstance(n, ast.Name)}
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    names |= {n.id for n in ast.walk(item.optional_vars) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(node.value, _FRESH_VALUES):
+                    # also the name stored into: `d[k] = shared` makes `d` hold something shared
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                elif not isinstance(target, ast.Name):
+                    # `a, b = shared, {}`: a tuple made on the spot hands on what it was made of
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None and not isinstance(node.value, _FRESH_VALUES) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.NamedExpr):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= {(alias.asname or alias.name).split(".")[0] for alias in node.names}
+        elif isinstance(node, _DEFS):
+            if node is not func:
+                names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+    return names
+
+
+def _def_paths(tree) -> set:
+    """The dotted path of every def and class in the tree, nested ones included."""
+    found: set = set()
+
+    def walk(node, path: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEFS):
+                found.add(path + "." + child.name)
+                walk(child, path + "." + child.name)
+            elif isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                walk(child, path)
+
+    walk(tree, "")
+    return found
+
+
+def _stores_state_in(tree, lines: set, other_tree, added: bool) -> bool:
+    """True when one of `lines` of this text touches what outlasts the test (see `edit_leaves_state`).
+
+    `other_tree` is the other side of the edit and `added` says that this is the new side. A def or
+    class that the other side does not have, and every line of which is among `lines`, is new (or
+    gone) as a whole and not an edit: on the new side rule K judges it, on the old side only the
+    stores it made still count.
+    """
+    if not lines:
+        return False
+    first, last = min(lines), max(lines)
+    other_paths: list = []
+
+    def touched(node) -> bool:
+        start = getattr(node, "lineno", None)
+        if start is None:
+            return True  # no position of its own (arguments, a comprehension clause): look inside
+        end = getattr(node, "end_lineno", None) or start
+        if end < first or start > last:
+            return False
+        return any(line in lines for line in range(start, end + 1))
+
+    def whole(node, path: str) -> bool:
+        if not all(line in lines for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)):
+            return False
+        if not other_paths:
+            other_paths.append(_def_paths(other_tree))
+        return path not in other_paths[0]
+
+    def visit(node, fresh, self_ok, cleanup: bool, path: str, entire: bool) -> bool:
+        """fresh: the fresh locals of the enclosing def (None outside any def); self_ok: "class"
+        directly in a class body, else whether `self` is the enclosing method's own instance;
+        entire: an enclosing def or class is new or gone as a whole."""
+        if not touched(node):
+            return False
+        if isinstance(node, _DEFS + (ast.Lambda,)):
+            name = getattr(node, "name", "<lambda>")
+            here = path + "." + name
+            is_class = isinstance(node, ast.ClassDef)
+            inside_cleanup = cleanup or (not is_class and name.lower() in _CLEANUP_DEFS)
+            if inside_cleanup and not is_class and not entire:
+                # tearDown and its like, in a class (or module) that was there before: also when
+                # the def itself is new or gone, since it then replaces or uncovers an inherited one.
+                return True
+            entire_here = entire or (not isinstance(node, ast.Lambda) and whole(node, here))
+            if entire_here and added:
+                return False
+            if is_class:
+                return any(visit(child, None, "class", cleanup, here, entire_here) for child in ast.iter_child_nodes(node))
+            if isinstance(node, ast.Lambda):
+                local_names: set = set()
+            else:
+                local_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                local_names -= _aliasing_names(node)
+            own = not isinstance(node, ast.Lambda) and self_ok == "class" and _own_self(node)
+            for child in ast.iter_child_nodes(node):
+                if visit(child, local_names, own, inside_cleanup, here, entire_here):
+                    return True
+            if not entire_here:
+                # a def handed to addCleanup and the like runs after the test, wherever it stands
+                callbacks = {
+                    call.args[0].id
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and getattr(call.func, "attr", getattr(call.func, "id", "")) in _CLEANUP_CALLS
+                    and call.args and isinstance(call.args[0], ast.Name)
+                }
+                for inner in ast.walk(node):
+                    if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)) and inner.name in callbacks and touched(inner):
+                        return True
+            return False
+        if not entire:
+            if isinstance(node, _TRY) and any(touched(statement) for statement in node.finalbody):
+                return True
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in _CLEANUP_CALLS:
+                return True
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if not isinstance(root, ast.Name):
+                return True
+            if root.id == "self":
+                if not (self_ok is True and isinstance(node, ast.Attribute) and node.value is root):
+                    return True
+            elif fresh is None or root.id not in fresh or node.value is not root:
+                # not a fresh local, or a store one level further down, into what it holds
+                return True
+        return any(visit(child, fresh, self_ok, cleanup, path, entire) for child in ast.iter_child_nodes(node))
+
+    return visit(tree, None, None, False, "", False)
+
+
+def edit_leaves_state(old_text: str, new_text: str) -> bool:
+    """True when an edit to a test file touches what outlasts the test it is in.
+
+    pytest runs every test in one process, so a test that no longer puts back what it changed
+    fails tests of other files, and a child that runs one test sees nothing of it. Looked for
+    on the lines the edit removed or changed (old side) and on those it added (new side):
+
+    - a store to (or `del` of) an attribute or subscript of anything but `self` in its own
+      method and the fresh locals of its def (a parameter, a loop or `with` target, an
+      unpacked value and `x = y.z` count as the thing they name);
+    - a call that registers a cleanup (`addCleanup`, `enterContext`, `callback`, ...), and a
+      def handed to one;
+    - any line of `tearDown`, `tearDownClass`, `tearDownModule` and the like;
+    - any statement of a `finally` block.
+
+    A test, helper or class that is new as a whole is not an edit: rule K
+    (`new_global_effects`, `only_new_definitions`) judges it, and its own `finally` or
+    `tearDown` only undoes what it did itself. Of one that is gone as a whole, only the
+    stores still count (a later test may have relied on what they left).
+    """
+    try:
+        old_tree = _parse(old_text)
+        new_tree = _parse(new_text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    removed, added = _changed_lines(old_text, new_text)
+    return _stores_state_in(old_tree, removed, new_tree, False) or _stores_state_in(new_tree, added, old_tree, True)
 
 
 def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple) -> bool:
@@ -871,8 +1103,8 @@ def only_new_definitions(old_text: str, new_text: str, known: set, reserved=()) 
     behaves differently, so no test needs to run.
     """
     try:
-        old_tree = ast.parse(old_text)
-        new_tree = ast.parse(new_text)
+        old_tree = _parse(old_text)
+        new_tree = _parse(new_text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     return _only_new_definitions(old_tree.body, new_tree.body, known, "", _taken_names(old_tree, reserved))

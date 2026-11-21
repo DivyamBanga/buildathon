@@ -192,6 +192,123 @@ expect("K: new file, a helper that a test calls", k_file(K_HEAD + "\n\ndef build
 expect("K: new file, the logging level", k_file(K_HEAD + "\n\ndef test_a():\n    logging.disable(50)\n"), (False, True))
 expect("K: new file, a helper that clears a class table", k_file(K_HEAD + "\n\ndef reset():\n    exp.Expr.arg_types.clear()\n\n\ndef test_a():\n    reset()\n"), (False, True))
 
+# ---- L: an edited test that leaves state behind --------------------------------
+
+L_OLD = textwrap.dedent('''\
+    import unittest
+    from sqlglot import Parser
+
+    ORIGINAL = Parser.FUNCTIONS
+
+
+    class TestA(unittest.TestCase):
+        def setUp(self):
+            self.n = 1
+
+        def tearDown(self):
+            self.n = 0
+
+        def test_one(self):
+            d = {}
+            d["a"] = 1
+            self.n = 2
+            try:
+                Parser.FUNCTIONS = {}
+                self.assertEqual(self.n, 2)
+            finally:
+                Parser.FUNCTIONS = ORIGINAL
+
+        def test_two(self):
+            cls = Parser
+            cls.X = 1
+            self.addCleanup(print, 1)
+
+        def test_three(self):
+            def restore():
+                print(1)
+            self.addCleanup(restore)
+            self.assertEqual(1, 1)
+
+        def test_four(self):
+            handle = open("f")
+            try:
+                self.assertTrue(handle)
+            finally:
+                handle.close()
+
+        def test_five(self):
+            first, second = Parser.FUNCTIONS, {}
+            first["A"] = 1
+            either = second or Parser.FUNCTIONS
+            either["B"] = 2
+
+
+    class TestB(unittest.TestCase):
+        def tearDown(self):
+            print("done")
+
+        def test_six(self):
+            try:
+                self.assertEqual(1, 1)
+            finally:
+                print("six")
+''')
+
+
+def edited(old, new, text=L_OLD):
+    if text.count(old) != 1:
+        raise SystemExit(f"FAIL the edit {old!r} must match once, matches {text.count(old)} times")
+    return pydiff.edit_leaves_state(text, text.replace(old, new))
+
+
+for label, old, new, want in (
+    ("value of a store in finally", "Parser.FUNCTIONS = ORIGINAL", "Parser.FUNCTIONS = {}", True),
+    ("removed store in finally", "Parser.FUNCTIONS = ORIGINAL", "pass", True),
+    ("value of a store in a test body", "Parser.FUNCTIONS = {}", "Parser.FUNCTIONS = {1: 2}", True),
+    ("a store to self", "self.n = 2", "self.n = 3", False),
+    ("a store to a fresh local", 'd["a"] = 1', 'd["a"] = 2', False),
+    ("a removed store to a fresh local", '        d["a"] = 1\n', "", False),
+    ("an alias of a class", "cls.X = 1", "cls.X = 2", True),
+    ("a removed store through an alias", "        cls.X = 1\n", "", True),
+    ("an unpacked value is an alias", '        first["A"] = 1\n', "", True),
+    ("the result of `or` is an alias", '        either["B"] = 2\n', "", True),
+    ("an assertion", "self.assertEqual(self.n, 2)", "self.assertEqual(self.n, 3)", False),
+    ("tearDown", "self.n = 0", "self.n = 5", True),
+    ("addCleanup call", "self.addCleanup(print, 1)", "self.addCleanup(print, 2)", True),
+    ("a removed addCleanup call", "        self.addCleanup(print, 1)\n", "", True),
+    ("addCleanup callback", "print(1)\n        self.addCleanup(restore)", "print(2)\n        self.addCleanup(restore)", True),
+    ("a comment", "self.n = 2", "self.n = 2  # same", False),
+    ("a new store in the body", "self.assertEqual(1, 1)\n\n    def test_four", "Parser.Z = 1\n\n    def test_four", True),
+    ("setUp, self only", "self.n = 1", "self.n = 4", False),
+    ("a call in finally that stores nothing, changed", "handle.close()", "handle.flush()", True),
+    ("a call in finally that stores nothing, removed", "handle.close()", "pass", True),
+    ("a line added to a finally block", "            handle.close()\n", "            handle.close()\n            print(2)\n", True),
+    ("the try block of a finally, not the finally", "self.assertTrue(handle)", "self.assertFalse(handle)", False),
+    ("a tearDown that stores nothing, changed", 'print("done")', 'print("over")', True),
+    ("a tearDown taken out of a class that stays", '    def tearDown(self):\n        print("done")\n\n', "", True),
+):
+    expect("L: " + label, edited(old, new), want)
+expect("L: text that does not parse", pydiff.edit_leaves_state(L_OLD, "def (:\n"), False)
+expect("L: a new helper at the end", pydiff.edit_leaves_state(L_OLD, L_OLD + "\n\ndef helper(x):\n    return x\n"), False)
+# What is new as a whole is rule K's, and what is gone as a whole keeps only its stores.
+NEW_TEST = "\n    def test_new(self):\n        handle = open('g')\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()\n"
+expect("L: a new test with a finally of its own", pydiff.edit_leaves_state(L_OLD, L_OLD + NEW_TEST), False)
+expect("L: and rule K accepts it", pydiff.only_new_definitions(L_OLD, L_OLD + NEW_TEST, set()), True)
+NEW_CLASS = "\n\nclass TestC(unittest.TestCase):\n    def setUp(self):\n        self.handle = open('g')\n\n    def tearDown(self):\n        self.handle.close()\n\n    def test_c(self):\n        self.assertTrue(self.handle)\n"
+expect("L: a new class with a tearDown of its own", pydiff.edit_leaves_state(L_OLD, L_OLD + NEW_CLASS), False)
+expect("L: a tearDown added to a class that was there", edited("    def test_two(self):", "    def tearDownClass(cls):\n        pass\n\n    def test_two(self):"), True)
+expect("L: a test with a finally, removed whole", edited(
+    "    def test_four(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()\n\n", ""), False)
+expect("L: a class with a tearDown, removed whole", pydiff.edit_leaves_state(L_OLD, L_OLD[:L_OLD.index("class TestB")].rstrip("\n") + "\n"), False)
+expect("L: a test that stored into a class, removed whole", edited(
+    "    def test_two(self):\n        cls = Parser\n        cls.X = 1\n        self.addCleanup(print, 1)\n\n", ""), True)
+expect("L: a renamed test whose finally also changed", edited(
+    "def test_four(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()",
+    "def test_fourth(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            pass"), True)
+expect("L: a form feed in a line does not shift the line numbers", pydiff.edit_leaves_state(
+    L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n"),
+    L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n").replace("Parser.FUNCTIONS = ORIGINAL", "pass")), True)
+
 # ---- F: a new name must not change what existing code finds ---------------
 
 expect("F: new global is a builtin", added("\n\ndef set(*args):\n    return {'x'}\n"), False)
@@ -320,7 +437,7 @@ for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
         expect("seed " + name[:-6] + ": selected", plan.select_all or plan.candidates != 0, True)
 
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
-    if name.startswith("K_"):
+    if name.startswith(("K_", "L_")):
         expect("seed " + name[:-6], seed(name[:-6]).select_all, True)
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"

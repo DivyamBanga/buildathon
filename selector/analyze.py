@@ -550,6 +550,13 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
         return
     if patch.old_text is None:
         return
+    if pydiff.edit_leaves_state(patch.old_text, patch.new_text or ""):
+        # The edit touches a store outside the locals, or code that runs as cleanup
+        # (tearDown, finally, addCleanup): what the test leaves behind, or no longer
+        # puts back, reaches the tests that run after it in the whole suite.
+        plan.select_all = True
+        plan.note(f"{path}: an edited line stores outside its locals or runs as cleanup")
+        return
     touched = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-")
     if _PYTEST_ONLY.search(touched):
         # Added or removed lines that speak to pytest (marks, skips, fixtures, the
@@ -639,4 +646,5 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
         except Exception as error:
             plan.select_all = True
             plan.note(f"{path}: analysis raised {error!r}")
+    pydiff.forget_trees()
     return plan
