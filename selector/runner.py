@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import importlib.machinery
+import importlib.util
 import io
 import os
 import shutil
@@ -158,6 +160,46 @@ def _install_redirects(redirects: dict) -> None:
 
     builtins.open = patched_open
     io.open = patched_open
+    # runpy and friends read code through io.open_code. The import system has
+    # its own reference to the real one, so imports are not affected.
+    real_open_code = io.open_code
+
+    def patched_open_code(path):
+        if not _bypass_redirects and type(path) is str:
+            target = _redirects.get(os.path.abspath(path))
+            if target is not None:
+                path = target
+        return real_open_code(path)
+
+    io.open_code = patched_open_code
+
+
+def _keep_resolved_paths_in(overlay: str, root: str) -> None:
+    """Make a path resolved through the overlay's symlinks stay inside the overlay.
+
+    The overlay is a tree of links into the pinned checkout. A test that
+    resolves its own location (`Path(__file__).resolve()`) would land in the
+    pinned tree and, from there, reach pinned copies of patched files. In a
+    real checkout a resolved path of the tree is still a path of the tree, so
+    here a resolved path under the pinned checkout is given back as the same
+    path under the overlay (pathlib resolves through os.path.realpath).
+    """
+    real = os.path.realpath
+    prefix = root.rstrip("/") + "/"
+    stem = root.rstrip("/")
+
+    def realpath(path, *args, **kwargs):
+        result = real(path, *args, **kwargs)
+        try:
+            text = os.fsdecode(result)
+        except Exception:
+            return result
+        if text == stem or text.startswith(prefix):
+            mapped = overlay.rstrip("/") + text[len(stem):]
+            return mapped if isinstance(result, str) else os.fsencode(mapped)
+        return result
+
+    os.path.realpath = realpath
 
 
 def _apply_swaps(swaps, function_index) -> None:
@@ -167,6 +209,61 @@ def _apply_swaps(swaps, function_index) -> None:
             new = mapping.get(function.__code__)
             if new is not None:
                 function.__code__ = new
+
+
+def _module_name(path: str, root: str) -> str:
+    """The name a source file of the checkout is imported under."""
+    name = os.path.relpath(path, root)[:-3].replace(os.sep, ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
+
+
+class _PatchedLoader(importlib.machinery.SourceFileLoader):
+    """Loads a module from text held in memory, under the path it has in the pinned tree."""
+
+    def __init__(self, name: str, path: str, text: str) -> None:
+        super().__init__(name, path)
+        self._text = text
+
+    def get_code(self, fullname):
+        # From bytes, as the file itself would be read: an encoding declaration
+        # in its first two lines is honoured, or makes the import fail.
+        return compile(self._text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
+
+    def get_source(self, fullname):
+        return self._text
+
+
+class _PatchedFinder:
+    def __init__(self, sources: dict) -> None:
+        self._sources = sources  # module name -> (path in the pinned tree, patched text)
+
+    def find_spec(self, name, path=None, target=None):
+        entry = self._sources.get(name)
+        if entry is None:
+            return None
+        origin, text = entry
+        return importlib.util.spec_from_file_location(name, origin, loader=_PatchedLoader(name, origin, text))
+
+
+def _serve_patched(modules, root: str) -> None:
+    """Have patched modules that were never imported here come from their new source.
+
+    sqlglot imports most of its dialects only when one is first used, so the
+    coordinator, which has imported sqlglot and the test modules, has never
+    run them. Nothing of such a module exists in this process: importing the
+    patched source when a test first asks for it is exactly what a fresh
+    process would do, whatever the patch changes in it (function bodies, class
+    bodies, module-level code). A module that is already imported cannot be
+    treated this way, and the caller starts over with a clean import.
+    """
+    sources = {}
+    for path, text in modules:
+        name = _module_name(path, root)
+        if name in sys.modules:
+            raise RuntimeError(f"{name} is already imported")
+        sources[name] = (path, text)
+    if sources:
+        sys.meta_path.insert(0, _PatchedFinder(sources))
 
 
 def _purge(root: str) -> None:
@@ -260,7 +357,8 @@ class _Answer:
 
     def __getattr__(self, name):
         # Anything else is asked of DuckDB itself.
-        return getattr(self._connection.execute(self._query), name)
+        run = getattr(self._connection, "_run", None) or self._connection.execute
+        return getattr(run(self._query), name)
 
 
 class _AnsweringConnection:
@@ -293,6 +391,186 @@ class _NoConnection:
 
     def close(self) -> None:
         pass
+
+
+# {"tpch_conn": {"statements": [...], "files": [...]}, ...}: the statements the
+# tests' class setups send to each DuckDB connection they open at the pinned
+# commit, with the checkout's path written as ROOT_MARK (maps/ducksetup.json).
+DUCKDB_SETUPS = None
+ROOT_MARK = "<ROOT>"
+
+
+def load_duckdb_setups(path: str) -> None:
+    global DUCKDB_SETUPS
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            DUCKDB_SETUPS = json.load(handle)["connections"]
+    except Exception:
+        DUCKDB_SETUPS = None
+
+
+def _only_reads(query: str) -> bool:
+    """True for a single plain SELECT: it cannot change what a later query sees."""
+    text = query.strip().rstrip(";").strip()
+    if ";" in text:
+        return False
+    head = text.lstrip("( \t\r\n")[:6].upper()
+    if not head.startswith(("SELECT", "WITH")):
+        return False
+    lowered = text.lower()
+    return not any(word in lowered for word in ("nextval", "currval", "setseed", "into ", "pragma", "attach"))
+
+
+class _ProbingConnection:
+    """Stands in for a DuckDB connection until DuckDB is really needed.
+
+    What a connection holds is decided by the statements it was sent. As long
+    as those are, one for one, the statements a pinned class setup sends (the
+    same tables, the same views over the same unchanged files), nothing is
+    opened and nothing is executed: at the pinned commit those statements
+    succeed on a fresh connection, so they will here, whenever they are run.
+    Once the whole setup has been sent, a query the record has DuckDB's answer
+    for is given that answer (the executor tests' TPC queries, maps/duckdb.bin).
+
+    Anything else, a statement that is not the setup's next one, a query with
+    no recorded answer, any other use of the connection, opens the real
+    connection, sends it what was held back, and is passed on. After a
+    statement that is neither recognised nor a plain SELECT nothing is
+    answered from the record any more.
+
+    This is checked on what is really sent, in this process, by whatever code
+    the patch left: nothing is assumed about the patch.
+    """
+
+    def __init__(self, connect, setups: dict, roots: list) -> None:
+        self._connect = connect
+        self._setups = setups  # tuple of setup statements -> {query: pickled answer}
+        self._roots = roots
+        self._connection = None
+        self._held: list = []  # statements not yet sent to DuckDB, as given
+        self._sent: list | None = []  # the same with the checkout's path marked; None: no longer a known setup
+        self._answers = None
+
+    def _real(self):
+        """The real connection, brought to where this one stands."""
+        connection = self._connection
+        if connection is None:
+            connection = self._connection = self._connect()
+            held, self._held = self._held, []
+            for query in held:
+                connection.execute(query)
+        return connection
+
+    def _forget(self) -> None:
+        self._sent = None
+        self._answers = None
+
+    def execute(self, query, *args, **kwargs):
+        if args or kwargs or type(query) is not str:
+            self._forget()
+            return self._real().execute(query, *args, **kwargs)
+        answers = self._answers
+        if answers is not None:
+            data = answers.get(query)
+            if data is not None:
+                return _Answer(self, query, data)
+            if not _only_reads(query):
+                self._forget()
+            return self._real().execute(query)
+        sent = self._sent
+        if sent is None:
+            return self._real().execute(query)
+        text = query
+        for prefix in self._roots:
+            text = text.replace(prefix, ROOT_MARK + "/")
+        key = tuple(sent) + (text,)
+        found = self._setups.get(key)
+        if found is None and not any(len(other) > len(key) and other[: len(key)] == key for other in self._setups):
+            # Not the next statement of a setup we know.
+            self._sent = None
+            return self._real().execute(query)
+        sent.append(text)
+        if found is not None:
+            self._sent = None
+            self._answers = found
+        if self._connection is None:
+            self._held.append(query)
+            return self
+        return self._connection.execute(query)
+
+    def _run(self, query):
+        """Really execute a query that was answered from the record (the caller wants more than its frame)."""
+        return self._real().execute(query)
+
+    def close(self):
+        if self._connection is not None:
+            return self._connection.close()
+        self._held = []
+        self._forget()
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        # Any other use may depend on, or change, what the connection holds.
+        self._forget()
+        return getattr(self._real(), name)
+
+
+# (setup statements, files they read, answers) for every recorded setup; built
+# once by the coordinator (prepare_duck_probe) and inherited by its children.
+_DUCK_TABLE: list = []
+
+
+def prepare_duck_probe() -> bool:
+    """Work out, once, which recorded setups can be recognised. True when there is one."""
+    del _DUCK_TABLE[:]
+    for name, setup in (DUCKDB_SETUPS or {}).items():
+        statements = setup.get("statements")
+        if not statements:
+            continue
+        answers = (DUCKDB_ANSWERS or {}).get(name) or {}
+        if not all(_only_reads(query) for query in answers):
+            # An answered statement that changes the connection would be skipped: recognise the setup only.
+            answers = {}
+        _DUCK_TABLE.append((tuple(statements), frozenset(setup.get("files", ())), answers))
+    return bool(_DUCK_TABLE)
+
+
+def _install_duck_probe(roots, changed) -> None:
+    """Have every plain duckdb.connect() return a _ProbingConnection.
+
+    `roots` are the paths the checkout is seen under (the overlay, the pinned
+    tree); `changed` holds the files the patch replaces or removes. A setup
+    that hands one of those to DuckDB is not looked for.
+    """
+    setups = {statements: answers for statements, files, answers in _DUCK_TABLE if files.isdisjoint(changed)}
+    if not setups:
+        return
+    import duckdb
+
+    connect = duckdb.connect
+    if getattr(connect, "_br_probing", False):
+        return
+    prefixes = sorted({root.rstrip("/") + "/" for root in roots if root}, key=len, reverse=True)
+
+    def probing_connect(*args, **kwargs):
+        if args or kwargs:
+            return connect(*args, **kwargs)
+        return _ProbingConnection(connect, setups, prefixes)
+
+    probing_connect._br_probing = True
+    probing_connect._br_capped = True
+    duckdb.connect = probing_connect
 
 
 def build_executor_tables() -> None:
@@ -343,7 +621,7 @@ def _use_executor_tables() -> None:
         cls.tpcds_tables = dict(tpcds_tables)
         if DUCKDB_ANSWERS:
             for name, answers in DUCKDB_ANSWERS.items():
-                if name in cls.__dict__ and answers:
+                if name in cls.__dict__ and answers and not isinstance(cls.__dict__[name], _ProbingConnection):
                     setattr(cls, name, _AnsweringConnection(getattr(cls, name), answers))
 
     test_class.setUpClass = classmethod(setUpClass)
@@ -790,16 +1068,35 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             _purge(root)
             sys.path.insert(0, overlay)
             os.chdir(overlay)
+            if changes:
+                _keep_resolved_paths_in(overlay, root)
         else:
-            _apply_swaps(job["swaps"], function_index)
-            if job["redirects"]:
-                _install_redirects(
-                    {path: os.path.join(overlay, os.path.relpath(path, root)) for path in job["redirects"]}
-                )
+            lazy = list(job.get("lazy") or ())
+            swaps = []
+            for path, pairs in job["swaps"]:
+                if _module_name(path, root) in sys.modules:
+                    swaps.append((path, pairs))
+                else:
+                    # Not imported after all: there are no functions to swap, the new source is imported instead.
+                    lazy.append((path, changes[os.path.relpath(path, root).replace(os.sep, "/")]))
+            if lazy:
+                _serve_patched(lazy, root)
+            _apply_swaps(swaps, function_index)
+            # Whatever opens a patched file by its path in the pinned tree gets the
+            # patched text: fixtures, and source files that a test reads or runs as data.
+            present = {
+                os.path.join(root, path): os.path.join(overlay, path)
+                for path, text in changes.items()
+                if text is not None
+            }
+            if present:
+                _install_redirects(present)
             if job.get("executor_tables") and EXECUTOR_TABLES is not None:
                 _use_executor_tables()
                 if job.get("executor_memo") and EXECUTOR_MEMO:
                     install_executor_memo()
+        if job.get("duckdb_probe"):
+            _install_duck_probe((overlay if changes else "", root), set(changes))
         for path in job.get("imports") or ():
             # pytest fails every test of a file it cannot import.
             try:

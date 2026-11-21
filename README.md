@@ -30,6 +30,9 @@ the patched code**, and selects the ones that fail.
 
    - it executed a changed statement of a changed function, or
    - it opened a changed fixture file, or
+   - it opens the changed Python source as a file, to read, parse or run it
+     (one test parses the `sqlglot/typing` modules, three run
+     `sqlglotc/setup.py`): the text is data to it, whatever lines execute, or
    - for a change to a class body: it built an instance of that class or of a
      subclass, or executed a line naming it (for the classes of a dialect: it
      used that dialect or one built on it); and, when the change only gives a
@@ -85,11 +88,27 @@ the patched code**, and selects the ones that fail.
    - *hot*: when only function bodies changed (and none of them already ran
      while the tests were imported), the child swaps the new code objects into
      the functions already in memory and runs the tests at once.
-   - *clean*: when import-time code changed, the child drops sqlglot and the
-     tests from `sys.modules` and imports them again from an overlay tree of
-     symlinks plus the patched files. It first imports every test file that
-     imports a changed module: a file that can no longer be imported fails all
-     of its tests, as it does under pytest.
+   - *on demand*: sqlglot imports most of its dialects only when one is first
+     used, so about half of its modules have never run in the coordinator.
+     Nothing of such a module exists in the child, whatever the patch changes
+     in it (function bodies, class bodies, module-level code): the child stays
+     as it is and imports the patched source when a test first asks for the
+     module, which is what a fresh process does. The child checks for itself
+     that the module is not in `sys.modules`; if it is, the commit is checked
+     with a clean import instead.
+   - *clean*: when import-time code of an already imported module changed, the
+     child drops sqlglot and the tests from `sys.modules` and imports them
+     again from an overlay tree of symlinks plus the patched files. It first
+     imports every test file that imports a changed module: a file that can no
+     longer be imported fails all of its tests, as it does under pytest.
+
+   A test that reaches a patched file through the file system must find the
+   patched text too. In a child that keeps the pinned modules, `open` and
+   `io.open_code` (which `runpy` reads code through) are redirected for every
+   patched file. After a clean import the tree is an overlay of symlinks, and a
+   test that resolves its own location would follow them out into the pinned
+   checkout, so a resolved path under the pinned checkout is handed back as
+   the same path under the overlay.
 
    Tests run under `unittest` with fail-fast, so a failing test stops at its
    first failure. A test that hangs, burns far more CPU than it normally costs
@@ -110,7 +129,19 @@ the patched code**, and selects the ones that fail.
      only the cases that reach the changed code, plus any case the patch itself
      edits, are run.
    - The executor tests compare sqlglot's executor with DuckDB. DuckDB's answer
-     depends only on the SQL text it is given, so it is recorded once per text.
+     depends on the SQL text it is given and on what the connection holds, and
+     what a connection holds is decided by the statements it was sent. The
+     answers are recorded once per text, together with the statements the
+     pinned class setup sends. In a child, `duckdb.connect()` returns a
+     stand-in that watches what it is sent: while that is, one for one, a
+     recorded setup (the same views over the same unchanged files), DuckDB is
+     not even opened, and once the whole setup has been sent a recorded query
+     gets its recorded answer. Anything else opens the real connection, sends
+     it what was held back, and is passed on; after a statement that is
+     neither recognised nor a plain SELECT nothing is answered from the record.
+     This holds for any patch, because it is decided by what the patched code
+     really sends. The optimizer tests' small DuckDB database is held back the
+     same way until a case executes a query.
    - `sqlglot.executor.execute` optimizes a query, plans it and runs the plan.
      For a patch that changes none of the lines that run from planning to the
      result, a TPC query whose optimized form is exactly the pinned one is not
@@ -145,6 +176,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | --- | --- | --- |
 | `cov.bin`, `cov.json` | `trace_all.py`, `build_map.py` | (code object, line) → tests that executed it |
 | `opens.json` | same | fixture file → tests that open it |
+| `sources.json` | `build_sources.py` | Python source → tests that open it as a file |
 | `funcs.json` | `build_map.py` | first and last line of every `def` |
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
@@ -154,6 +186,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
+| `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | optimized TPC query → executor result; the lines that produce it |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
@@ -181,6 +214,26 @@ observed failing on the patched code or could not be ruled out.
   `tools/state_probe.py` shows what a given patch changes at import (for the
   unchanged tree: nothing). `tools/mutate_import.py` generates one-token
   patches to code that runs at import, labeled like the others.
+- `tools/test_duckprobe.py` holds the unit checks for the DuckDB stand-in: what
+  the caller sees and what really reaches DuckDB, in order, for every way a
+  connection can leave the recorded setup.
+- `tools/test_runner_paths.py` holds the unit checks for how a child finds
+  patched files: redirected `open` and `io.open_code`, resolved paths that
+  stay in the overlay, and modules imported on demand from patched text.
+- `tools/trace_suite.py` traces the whole suite in one process, in collection
+  order, and `tools/build_suite.py` compares it test by test with the runs
+  alone. Of 2.59 million (test, line) pairs, 121 are executed in the suite but
+  not alone: 16 lines, all in `Dialect._try_load`, where a dialect is
+  registered again after another test emptied the registry. That function is
+  one of those a change to which selects every test. (The other direction is
+  large and harmless: alone, a test also runs the imports.)
+- An audit of the selector itself: patches written to break one assumption
+  each (where a comment lands, what a fixture edit shifts, what holds an old
+  function, what reads a constant, what a test reads from disk, what only
+  runs in suite order), each run through the selector and through pytest.
+  The misses it found are the reason for the source-reader map, the
+  redirects above, the rule for code that imports modules on demand and the
+  rebuilt map of who reads a constant.
 - The runner was run on synthetic worst cases: infinite loops in tests, in
   imports and in class bodies, unbounded allocation, `os._exit`, stack
   overflow, and binary, renamed, deleted, new and non-applying files.

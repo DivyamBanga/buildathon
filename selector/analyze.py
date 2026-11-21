@@ -70,6 +70,9 @@ class Plan:
         # patched file can no longer be imported they fail all the same, so the
         # runner must try importing their test files.
         self.import_check = 0
+        # (absolute path, new text) of patched modules the coordinator never
+        # imports: a hot child imports the new source when a test asks for it.
+        self.lazy: list[tuple[str, str]] = []
         self.notes: list[str] = []
 
     def note(self, text: str) -> None:
@@ -101,6 +104,12 @@ def load_old_code(absolute: str, old_text: str):
 def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str, loaded) -> None:
     path = patch.path
     old_path = patch.old_path or path
+    readers = covmap.source_readers(old_path)
+    if readers:
+        # Tests that read or run this source as a file see any change to its text.
+        plan.candidates |= readers
+        plan.rest_candidates |= readers
+        plan.note(f"{old_path}: read as a file by {readers.bit_count()} tests")
     if patch.old_text is None:
         # A new module. Nothing at the pinned commit imports it, so on its own it
         # reaches a test only through other changed files or through pytest.
@@ -285,7 +294,10 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             if seen.setdefault(old, new) != new:
                 hot = False
                 break
-    if hot:
+    if absolute not in loaded:
+        # Whatever changed in it, nothing of this module exists in the coordinator.
+        plan.lazy.append((absolute, patch.new_text))
+    elif hot:
         plan.swaps.append((absolute, diff.pairs))
     else:
         plan.needs_clean = True
