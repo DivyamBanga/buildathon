@@ -1,0 +1,17 @@
+diff --git a/tests/dialects/test_athena.py b/tests/dialects/test_athena.py
+index 32e08fa..a26becf 100644
+--- a/tests/dialects/test_athena.py
++++ b/tests/dialects/test_athena.py
+@@ -10,6 +10,12 @@
+ class TestAthena(Validator):
+     dialect = "athena"
+     maxDiff = None
++
++    def test_aaa_g(self):
++        import sqlglot.generator as g
++
++        g.logger.setLevel(60)
++        self.assertEqual(1, 1)
+ 
+     def test_athena(self):
+         self.validate_identity(r"SELECT '\d+'")

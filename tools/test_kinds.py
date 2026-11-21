@@ -125,6 +125,73 @@ expect("E: a store to self in a new class", added("\n\nclass B:\n    def setUp(s
 expect("E: a class whose setUp clears a table", added(
     "\n\nclass B:\n    def setUp(self):\n        import sqlglot\n        sqlglot.Parser.FUNCTIONS.clear()\n"), False)
 
+# ---- K: an ordinary new test costs nothing; one that changes shared state selects everything ----
+#
+# The rule looks for stores and for calls on a list of names, nothing more. An allowlist of
+# calls (anything not on it selects everything) was tried on a branch and not taken: it turned
+# down a quarter of the suite's own tests. These checks hold both ends in place.
+
+K_OLD = textwrap.dedent('''\
+    import unittest
+    from unittest import mock
+    from sqlglot import exp, parse_one
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.tokens import Tokenizer
+
+
+    def helper(x):
+        return x
+
+
+    class TestA(unittest.TestCase):
+        def test_one(self):
+            self.assertEqual(helper(1), 1)
+''')
+
+
+def k_new(body, text=K_OLD):
+    """(accepted as only new tests?, stores outside its locals?) for one new test method with this body."""
+    new = text + METHOD.format("\n".join("        " + row for row in body.split("\n")))
+    return pydiff.only_new_definitions(text, new, {"TestA::test_one"}), pydiff.new_global_effects(text, new)
+
+
+def k_file(text):
+    return pydiff.harmless_new_test_module(text), pydiff.new_global_effects("", text)
+
+
+for label, body in (
+    ("assertion", "self.assertEqual(helper(1), 1)"),
+    ("module function and a local", "x = helper(2)\nself.assertTrue(x)"),
+    ("method on a result", "self.assertEqual(str(helper(1)).lower(), '1')"),
+    ("builtins", "self.assertEqual(len(sorted([2, 1])), 2)"),
+    ("assertRaises", "with self.assertRaises(ValueError):\n    helper(1)"),
+    ("subTest in a loop", "for sql in ('a', 'b'):\n    with self.subTest(sql):\n        self.assertEqual(parse_one(sql).sql(), sql)"),
+    ("validate_identity and validate_all", "self.validate_identity('SELECT 1')\nself.validate_all('SELECT 1', write={'duckdb': 'SELECT 1'})"),
+    ("a class method of sqlglot", "self.assertEqual(exp.Literal.number(1).sql(), '1')"),
+    ("a method of a new instance", "tokens = Tokenizer().tokenize('SELECT 1')\nself.assertEqual(len(tokens), 2)"),
+    ("mock.patch.object as a context manager", "with mock.patch.object(Dialect, 'get', return_value=None):\n    self.assertIsNone(Dialect.get('x'))"),
+    ("find on a parsed tree", "self.assertIsNotNone(parse_one('select 1').find(exp.Select))"),
+    ("locals and a loop", "total = 0\nfor i in range(3):\n    total += i\nself.assertEqual(total, 3)"),
+    ("transform with a lambda", "tree = parse_one('select a').transform(lambda node: node)\nself.assertEqual(tree.sql(), 'SELECT a')"),
+    ("assertLogs", "with self.assertLogs('sqlglot') as logs:\n    helper(1)\nself.assertTrue(logs)"),
+    ("try and finally with no store", "handle = helper(1)\ntry:\n    self.assertTrue(handle)\nfinally:\n    handle.close()"),
+):
+    expect("K: an ordinary new test, " + label, k_new(body), (True, False))
+for label, body in (
+    ("logging.disable", "import logging\n\nlogging.disable(logging.CRITICAL)"),
+    ("a store into os.environ", "import os\n\nos.environ['SQLGLOT_X'] = '1'"),
+    ("a logger's level", "import sqlglot.generator as g\n\ng.logger.setLevel(60)"),
+    ("setattr on a class", "setattr(Dialect, 'LIMIT_FETCH', 'FETCH')"),
+    ("a class table cleared", "Dialect.TRANSFORMS.clear()"),
+    ("a store through the patched object", "with mock.patch.object(Dialect, 'get') as get:\n    get.return_value = None"),
+):
+    expect("K: a new test that changes shared state, " + label, k_new(body), (False, True))
+K_HEAD = "import unittest\nimport logging\nfrom sqlglot import exp, parse_one\n"
+expect("K: new file, plain tests", k_file(K_HEAD + "\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(exp.column('a').sql(), 'a')\n        self.assertIsNotNone(parse_one('select 1').find(exp.Select))\n"), (True, False))
+expect("K: new file, a helper that a test calls", k_file(K_HEAD + "\n\ndef build(sql):\n    return parse_one(sql)\n\n\ndef test_a():\n    assert build('select 1').sql() == 'SELECT 1'\n"), (True, False))
+expect("K: new file, the logging level", k_file(K_HEAD + "\n\ndef test_a():\n    logging.disable(50)\n"), (False, True))
+expect("K: new file, a helper that clears a class table", k_file(K_HEAD + "\n\ndef reset():\n    exp.Expr.arg_types.clear()\n\n\ndef test_a():\n    reset()\n"), (False, True))
+
 # ---- F: a new name must not change what existing code finds ---------------
 
 expect("F: new global is a builtin", added("\n\ndef set(*args):\n    return {'x'}\n"), False)
@@ -251,6 +318,10 @@ for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
         plan = seed(name[:-6])
         expect("seed " + name[:-6] + ": not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
         expect("seed " + name[:-6] + ": selected", plan.select_all or plan.candidates != 0, True)
+
+for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
+    if name.startswith("K_"):
+        expect("seed " + name[:-6], seed(name[:-6]).select_all, True)
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
