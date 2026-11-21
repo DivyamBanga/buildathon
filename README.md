@@ -21,7 +21,9 @@ the patched code**, and selects the ones that fail.
    (runs only when called) or a module or class body (ran at import). Inside a
    changed function, the old and new source of that function are parsed and
    compared statement by statement, to name the old lines a test must execute
-   to see the change.
+   to see the change. A function that binds other names afterwards (its local,
+   cell or free names differ as sets) counts as changed in full, and so does any
+   line whose instructions differ although its text does not.
 
 3. **Name the candidate tests** (`selector/analyze.py`, `selector/covmap.py`).
    `maps/` records, for every test run alone at the pinned commit, each line it

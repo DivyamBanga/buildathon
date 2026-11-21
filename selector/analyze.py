@@ -286,9 +286,11 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                     new_first = patch.new_line(first)
                     new_last = patch.new_line(span[1])
                     if new_first is not None and new_last is not None and new_last >= new_first:
-                        lines = pydiff.changed_lines_in_function(
-                            old_lines, new_lines, (first, span[1]), (new_first, new_last)
+                        lines = pydiff.lines_to_run(
+                            old, new, old_lines, new_lines, (first, span[1]), (new_first, new_last), patch.new_line
                         )
+                        if lines is None and pydiff.bindings_differ(old, new):
+                            plan.note(f"{path}:{first} {old.co_name} binds other names")
             units.append((first, lines))
             if lines is None:
                 found = covmap.code_any(path, first)
