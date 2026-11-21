@@ -599,7 +599,10 @@ class Coordinator:
         the patch changes nothing that runs between the optimized form of a query and its result."""
         if job.memo_ok is None:
             job.memo_ok = False
-            if self.memo_cost and self.executor_setup_untouched(job):
+            # Not for a patched module that is imported on demand: its class and
+            # module bodies are not lines the recorded phase could have executed,
+            # yet what they define can be read there.
+            if self.memo_cost and not job.plan.lazy and self.executor_setup_untouched(job):
                 if self.exec_phase is None:
                     try:
                         self.exec_phase = json.load(open(os.path.join(MAPS, "execphase.json")))
@@ -822,6 +825,7 @@ class Coordinator:
         }
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
+        spec["lazy"] = plan.lazy if job.mode == "hot" else []
         read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:

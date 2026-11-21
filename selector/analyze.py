@@ -70,6 +70,9 @@ class Plan:
         # patched file can no longer be imported they fail all the same, so the
         # runner must try importing their test files.
         self.import_check = 0
+        # (absolute path, new text) of patched modules the coordinator never
+        # imports: a hot child imports the new source when a test asks for it.
+        self.lazy: list[tuple[str, str]] = []
         self.notes: list[str] = []
 
     def note(self, text: str) -> None:
@@ -274,7 +277,10 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             if seen.setdefault(old, new) != new:
                 hot = False
                 break
-    if hot:
+    if absolute not in loaded:
+        # Whatever changed in it, nothing of this module exists in the coordinator.
+        plan.lazy.append((absolute, patch.new_text))
+    elif hot:
         plan.swaps.append((absolute, diff.pairs))
     else:
         plan.needs_clean = True

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import importlib.machinery
+import importlib.util
 import io
 import os
 import shutil
@@ -167,6 +169,59 @@ def _apply_swaps(swaps, function_index) -> None:
             new = mapping.get(function.__code__)
             if new is not None:
                 function.__code__ = new
+
+
+def _module_name(path: str, root: str) -> str:
+    """The name a source file of the checkout is imported under."""
+    name = os.path.relpath(path, root)[:-3].replace(os.sep, ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
+
+
+class _PatchedLoader(importlib.machinery.SourceFileLoader):
+    """Loads a module from text held in memory, under the path it has in the pinned tree."""
+
+    def __init__(self, name: str, path: str, text: str) -> None:
+        super().__init__(name, path)
+        self._text = text
+
+    def get_code(self, fullname):
+        return compile(self._text, self.path, "exec", dont_inherit=True)
+
+    def get_source(self, fullname):
+        return self._text
+
+
+class _PatchedFinder:
+    def __init__(self, sources: dict) -> None:
+        self._sources = sources  # module name -> (path in the pinned tree, patched text)
+
+    def find_spec(self, name, path=None, target=None):
+        entry = self._sources.get(name)
+        if entry is None:
+            return None
+        origin, text = entry
+        return importlib.util.spec_from_file_location(name, origin, loader=_PatchedLoader(name, origin, text))
+
+
+def _serve_patched(modules, root: str) -> None:
+    """Have patched modules that were never imported here come from their new source.
+
+    sqlglot imports most of its dialects only when one is first used, so the
+    coordinator, which has imported sqlglot and the test modules, has never
+    run them. Nothing of such a module exists in this process: importing the
+    patched source when a test first asks for it is exactly what a fresh
+    process would do, whatever the patch changes in it (function bodies, class
+    bodies, module-level code). A module that is already imported cannot be
+    treated this way, and the caller starts over with a clean import.
+    """
+    sources = {}
+    for path, text in modules:
+        name = _module_name(path, root)
+        if name in sys.modules:
+            raise RuntimeError(f"{name} is already imported")
+        sources[name] = (path, text)
+    if sources:
+        sys.meta_path.insert(0, _PatchedFinder(sources))
 
 
 def _purge(root: str) -> None:
@@ -972,7 +1027,17 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             sys.path.insert(0, overlay)
             os.chdir(overlay)
         else:
-            _apply_swaps(job["swaps"], function_index)
+            lazy = list(job.get("lazy") or ())
+            swaps = []
+            for path, pairs in job["swaps"]:
+                if _module_name(path, root) in sys.modules:
+                    swaps.append((path, pairs))
+                else:
+                    # Not imported after all: there are no functions to swap, the new source is imported instead.
+                    lazy.append((path, changes[os.path.relpath(path, root).replace(os.sep, "/")]))
+            if lazy:
+                _serve_patched(lazy, root)
+            _apply_swaps(swaps, function_index)
             if job["redirects"]:
                 _install_redirects(
                     {path: os.path.join(overlay, os.path.relpath(path, root)) for path in job["redirects"]}

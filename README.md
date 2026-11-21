@@ -72,11 +72,19 @@ the patched code**, and selects the ones that fail.
    - *hot*: when only function bodies changed (and none of them already ran
      while the tests were imported), the child swaps the new code objects into
      the functions already in memory and runs the tests at once.
-   - *clean*: when import-time code changed, the child drops sqlglot and the
-     tests from `sys.modules` and imports them again from an overlay tree of
-     symlinks plus the patched files. It first imports every test file that
-     imports a changed module: a file that can no longer be imported fails all
-     of its tests, as it does under pytest.
+   - *on demand*: sqlglot imports most of its dialects only when one is first
+     used, so about half of its modules have never run in the coordinator.
+     Nothing of such a module exists in the child, whatever the patch changes
+     in it (function bodies, class bodies, module-level code): the child stays
+     as it is and imports the patched source when a test first asks for the
+     module, which is what a fresh process does. The child checks for itself
+     that the module is not in `sys.modules`; if it is, the commit is checked
+     with a clean import instead.
+   - *clean*: when import-time code of an already imported module changed, the
+     child drops sqlglot and the tests from `sys.modules` and imports them
+     again from an overlay tree of symlinks plus the patched files. It first
+     imports every test file that imports a changed module: a file that can no
+     longer be imported fails all of its tests, as it does under pytest.
 
    Tests run under `unittest` with fail-fast, so a failing test stops at its
    first failure. A test that hangs, burns far more CPU than it normally costs
