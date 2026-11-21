@@ -117,6 +117,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     if not diff.changed:
         plan.note(f"{path}: no code change")
         return
+    if path.startswith("tests/") and not diff.isomorphic:
+        prefix = path + "::"
+        known = {test_id[len(prefix):] for test_id in covmap.ids if test_id.startswith(prefix)}
+        if pydiff.only_new_definitions(patch.old_text, patch.new_text, known):
+            plan.note(f"{path}: only new tests or helpers were added")
+            return
     old_lines = patch.old_text.splitlines(keepends=True)
     new_lines = patch.new_text.splitlines(keepends=True)
     warm = covmap.warm(path)

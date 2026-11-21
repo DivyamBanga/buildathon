@@ -295,7 +295,126 @@ def mutate_constant(path, level):
     return None
 
 
+def add_test(path):
+    """Append a new test method to a random test class of the file."""
+    old = read(path)
+    tree = ast.parse(old)
+    lines = old.split("\n")
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name.startswith("Test")]
+    if not classes:
+        return None
+    node = rng.choice(classes)
+    body = ["", "    def test_added_by_patch(self):", f"        self.assertEqual({rng.randrange(9)} + 1, {rng.randrange(1, 9)})"]
+    new = "\n".join(lines[: node.end_lineno] + body + lines[node.end_lineno:])
+    ast.parse(new)
+    return old, new
+
+
+def rename_local(path):
+    """Rename one local variable throughout a function."""
+    import io
+    import tokenize
+
+    old = read(path)
+    tree = ast.parse(old)
+    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if not functions:
+        return None
+    for _ in range(60):
+        node = rng.choice(functions)
+        arguments = {a.arg for a in ast.walk(node.args) if isinstance(a, ast.arg)}
+        nested = [n for n in ast.walk(node) if n is not node and isinstance(n, (ast.FunctionDef, ast.Lambda, ast.ClassDef))]
+        special = {n for stmt in ast.walk(node) if isinstance(stmt, (ast.Global, ast.Nonlocal)) for n in stmt.names}
+        stored = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        candidates = sorted(stored - arguments - special)
+        if nested or not candidates:
+            continue
+        name = rng.choice(candidates)
+        fresh = name + "_renamed"
+        out = []
+        previous = None
+        changed = False
+        for token in tokenize.generate_tokens(io.StringIO(old).readline):
+            text = token.string
+            inside = node.lineno <= token.start[0] <= node.end_lineno
+            if inside and token.type == tokenize.NAME and text == name and previous != ".":
+                text = fresh
+                changed = True
+            out.append((token.type, text, token.start, token.end, token.line))
+            if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT):
+                previous = token.string
+        if not changed:
+            continue
+        lines = old.split("\n")
+        # Rebuild only the lines of the function, token by token, to keep the layout.
+        new_lines = list(lines)
+        for row in range(node.lineno, node.end_lineno + 1):
+            pieces = [t for t in out if t[2][0] == row and t[3][0] == row and t[0] == tokenize.NAME and t[1] == fresh]
+            line = lines[row - 1]
+            for piece in sorted(pieces, key=lambda t: -t[2][1]):
+                line = line[: piece[2][1]] + fresh + line[piece[2][1] + len(name):]
+            new_lines[row - 1] = line
+        new = "\n".join(new_lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        if new != old:
+            return old, new
+    return None
+
+
+def change_annotation(path):
+    old = read(path)
+    if "from __future__ import annotations" not in old:
+        return None
+    lines = old.split("\n")
+    rows = [i for i, line in enumerate(lines) if line.lstrip().startswith("def ") and ") -> " in line and line.rstrip().endswith(":")]
+    if not rows:
+        return None
+    index = rng.choice(rows)
+    head, _sep, _tail = lines[index].rpartition(") -> ")
+    new_lines = list(lines)
+    new_lines[index] = head + ") -> t.Any:"
+    new = "\n".join(new_lines)
+    try:
+        ast.parse(new)
+    except SyntaxError:
+        return None
+    return (old, new) if new != old else None
+
+
+def swap_imports(path):
+    old = read(path)
+    lines = old.split("\n")
+    rows = [i for i in range(len(lines) - 1)
+            if lines[i].startswith(("import ", "from ")) and lines[i + 1].startswith(("import ", "from "))
+            and "(" not in lines[i] and "(" not in lines[i + 1] and "__future__" not in lines[i] + lines[i + 1]]
+    if not rows:
+        return None
+    index = rng.choice(rows)
+    new_lines = list(lines)
+    new_lines[index], new_lines[index + 1] = lines[index + 1], lines[index]
+    return old, "\n".join(new_lines)
+
+
 def make(kind):
+    if kind == "newtest":
+        path = weighted(TESTS)
+        result = add_test(path)
+        return diff(path, *result) if result else None
+    if kind == "rename":
+        path = weighted(SOURCES)
+        result = rename_local(path)
+        return diff(path, *result) if result else None
+    if kind == "annotation":
+        path = weighted(SOURCES)
+        result = change_annotation(path)
+        return diff(path, *result) if result else None
+    if kind == "imports":
+        path = weighted(SOURCES)
+        result = swap_imports(path)
+        return diff(path, *result) if result else None
     if kind in ("classconst", "moduleconst"):
         path = weighted(SOURCES)
         result = mutate_constant(path, "class" if kind == "classconst" else "module")

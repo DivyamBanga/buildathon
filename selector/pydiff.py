@@ -41,99 +41,129 @@ def _canon(value):
     return (type(value).__name__, repr(value))
 
 
-def _instructions(code: CODE):
-    """(opcode, argument) with EXTENDED_ARG folded in and inline caches skipped."""
-    raw = code.co_code
-    extended = 0
-    for offset in range(0, len(raw), 2):
-        opcode = raw[offset]
-        if opcode == _CACHE:
-            continue
-        argument = raw[offset + 1] | extended
-        if opcode == _EXTENDED_ARG:
-            extended = argument << 8
-            continue
-        extended = 0
-        yield opcode, argument
+CO_VARARGS = 0x0004
+CO_VARKEYWORDS = 0x0008
+_HASCONST = frozenset(dis.hasconst)
+_HASNAME = frozenset(dis.hasname)
+_HASJUMP = frozenset(getattr(dis, "hasjump", ())) | frozenset(dis.hasjrel) | frozenset(dis.hasjabs)
 
 
-def _inert_consts(code: CODE) -> set[int]:
-    """Constants of `code` that no test of this project can observe.
-
-    - `__firstlineno__`: Python 3.13 stores each class's first line in its body,
-      so moving a class down a line changes a constant and nothing else.
-    - `__static_attributes__`: Python 3.13 lists the `self.x` names a class's
-      methods assign; an edit inside a method can change it.
-    - Docstrings: nothing in sqlglot or its tests reads `__doc__`.
-    - Function annotations in a module under `from __future__ import annotations`:
-      they are stored as strings, never evaluated, and nothing reads them.
-    """
-    inert: set[int] = set()
-    consts = code.co_consts
-    if code.co_flags & CO_NEWLOCALS:
-        # A def keeps its docstring as its first constant, None when it has none.
-        # (A generator expression has no such slot, so only real defs qualify.)
-        if consts and isinstance(consts[0], str) and not code.co_name.startswith("<"):
-            inert.add(0)
-    else:
-        names = code.co_names
-        targets = {names.index(name) for name in _INERT_NAMES if name in names}
-        if targets:
-            previous = (-1, 0)
-            for opcode, argument in _instructions(code):
-                if opcode == _STORE_NAME and argument in targets and previous[0] == _LOAD_CONST:
-                    inert.add(previous[1])
-                previous = (opcode, argument)
-    if code.co_flags & CO_FUTURE_ANNOTATIONS and _SET_FUNCTION_ATTRIBUTE >= 0:
-        # LOAD_CONST <annotations>; LOAD_CONST <code>; MAKE_FUNCTION; SET_FUNCTION_ATTRIBUTE 4
-        window = [(-1, 0), (-1, 0), (-1, 0)]
-        for opcode, argument in _instructions(code):
-            if (
-                opcode == _SET_FUNCTION_ATTRIBUTE
-                and argument == _ANNOTATIONS_ATTRIBUTE
-                and window[2][0] == _MAKE_FUNCTION
-                and window[1][0] == _LOAD_CONST
-                and window[0][0] == _LOAD_CONST
-                and isinstance(consts[window[1][1]], CODE)
-                and isinstance(consts[window[0][1]], tuple)
-                and all(isinstance(item, str) for item in consts[window[0][1]])
-            ):
-                inert.add(window[0][1])
-            window = [window[1], window[2], (opcode, argument)]
-    return inert
-
-
-def _key(code: CODE, inert=()):
+def _shape(code: CODE):
+    """What must match exactly, whatever the instructions are."""
+    flags = code.co_flags
+    varnames = code.co_varnames
+    if flags & CO_NEWLOCALS:
+        # Parameters keep their names (callers may pass them by keyword); the other
+        # locals are slots in the bytecode and their names are never looked at.
+        parameters = (
+            code.co_argcount + code.co_kwonlyargcount + bool(flags & CO_VARARGS) + bool(flags & CO_VARKEYWORDS)
+        )
+        varnames = (varnames[:parameters], len(varnames))
     return (
-        code.co_code,
-        tuple(
-            "<inert>" if index in inert else _canon(const)
-            for index, const in enumerate(code.co_consts)
-        ),
-        code.co_names,
-        code.co_varnames,
+        varnames,
         code.co_freevars,
         code.co_cellvars,
-        code.co_flags,
+        flags,
         code.co_argcount,
         code.co_posonlyargcount,
         code.co_kwonlyargcount,
-        code.co_exceptiontable,
         code.co_name,
         code.co_qualname,
     )
 
 
-def own_key(code: CODE):
-    """Everything that decides what this code object does, apart from its children."""
-    return _key(code, _inert_consts(code))
+def _raw_key(code: CODE):
+    return (
+        code.co_code,
+        tuple(_canon(const) for const in code.co_consts),
+        code.co_names,
+        code.co_varnames,
+        code.co_exceptiontable,
+    ) + _shape(code)
+
+
+def _normal_form(code: CODE):
+    """The code object as its instructions, with every table index resolved and
+    the constants no test can observe masked.
+
+    Two compilations of the same statements can number their constants and
+    names differently (the tables are deduplicated, so one edited constant
+    renumbers the rest) and can differ in instruction offsets. Here constants
+    appear by value, names by name, jumps and exception ranges by instruction
+    position. Masked, because nothing in sqlglot or its tests reads them:
+
+    - what a module or class body stores as `__doc__`, `__firstlineno__` (the
+      line a class starts on, new in Python 3.13) or `__static_attributes__`
+      (the `self.x` names its methods assign, also new in 3.13);
+    - the annotations handed to a function being defined, in a module under
+      `from __future__ import annotations` (strings that are never evaluated);
+    - the docstring of a function, which no instruction loads.
+    """
+    consts = code.co_consts
+    rows = []
+    position = {}
+    waiting = []
+    for instruction in dis.get_instructions(code):
+        if instruction.opname == "EXTENDED_ARG":
+            waiting.append(instruction.offset)
+            continue
+        for offset in waiting:
+            position[offset] = len(rows)
+        waiting = []
+        position[instruction.offset] = len(rows)
+        rows.append(instruction)
+    inert = set()
+    module_like = not code.co_flags & CO_NEWLOCALS
+    future = bool(code.co_flags & CO_FUTURE_ANNOTATIONS)
+    for index, instruction in enumerate(rows):
+        if instruction.opcode != _LOAD_CONST:
+            continue
+        following = rows[index + 1] if index + 1 < len(rows) else None
+        if module_like and following is not None and following.opcode == _STORE_NAME and following.argval in _INERT_NAMES:
+            inert.add(index)
+        elif (
+            future
+            and index + 3 < len(rows)
+            and following.opcode == _LOAD_CONST
+            and isinstance(consts[following.arg], CODE)
+            and rows[index + 2].opcode == _MAKE_FUNCTION
+            and rows[index + 3].opcode == _SET_FUNCTION_ATTRIBUTE
+            and rows[index + 3].arg == _ANNOTATIONS_ATTRIBUTE
+            and isinstance(consts[instruction.arg], tuple)
+            and all(isinstance(item, str) for item in consts[instruction.arg])
+        ):
+            inert.add(index)
+    resolved = []
+    for index, instruction in enumerate(rows):
+        opcode = instruction.opcode
+        if opcode in _HASCONST:
+            value = "<inert>" if index in inert else _canon(consts[instruction.arg])
+        elif opcode in _HASJUMP:
+            value = ("to", position.get(instruction.argval, -1))
+        elif opcode in _HASNAME:
+            value = (instruction.argval, instruction.argrepr)
+        else:
+            value = instruction.arg
+        resolved.append((instruction.opname, value))
+    handlers = tuple(
+        (position.get(entry.start, -1), position.get(entry.end, len(rows)), position.get(entry.target, -1),
+         entry.depth, entry.lasti)
+        for entry in dis._parse_exception_table(code)
+    )
+    return tuple(resolved), handlers
 
 
 def same_behaviour(old: CODE, new: CODE) -> bool:
-    """True when the two code objects differ at most in line numbers, children and inert constants."""
-    if _key(old) == _key(new):
+    """True when the two code objects differ at most in line numbers, in their
+    children and in what no test can observe."""
+    if _raw_key(old) == _raw_key(new):
         return True
-    return own_key(old) == own_key(new)
+    if _shape(old) != _shape(new):
+        return False
+    try:
+        return _normal_form(old) == _normal_form(new)
+    except Exception:
+        return False
 
 
 def is_function_like(code: CODE) -> bool:
@@ -343,3 +373,93 @@ def changed_lines_in_function(
     # Fragment line `first_line` is line old_span[0] of the file.
     shift = old_span[0] - first_line
     return {line + shift for line in lines}
+
+
+# Module-level names pytest or unittest treat as fixtures for every test of the file.
+_MODULE_HOOKS = ("setup", "teardown", "pytest_", "pytestmark")
+
+
+def _bound_names(body: list) -> set[str]:
+    names: set[str] = set()
+    for statement in body:
+        for node in ast.walk(statement) if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else [statement]:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                names.add(node.id)
+            elif isinstance(node, ast.alias):
+                names.add((node.asname or node.name).split(".")[0])
+    return names
+
+
+def _plain_function(node) -> bool:
+    """A def that cannot fail or act when it is merely defined."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.decorator_list:
+        return False
+    arguments = node.args
+    defaults = list(arguments.defaults) + [d for d in arguments.kw_defaults if d is not None]
+    if any(not isinstance(default, ast.Constant) for default in defaults):
+        return False
+    annotated = [a.annotation for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs]
+    return node.returns is None and not any(annotated)
+
+
+def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str) -> bool:
+    import unittest
+
+    old_names = _bound_names(old_body)
+    position = 0
+    for statement in new_body:
+        old = old_body[position] if position < len(old_body) else None
+        if old is not None and ast.dump(old) == ast.dump(statement):
+            position += 1
+            continue
+        if (
+            isinstance(statement, ast.ClassDef)
+            and isinstance(old, ast.ClassDef)
+            and old.name == statement.name
+            and [ast.dump(n) for n in old.bases + old.keywords + old.decorator_list]
+            == [ast.dump(n) for n in statement.bases + statement.keywords + statement.decorator_list]
+        ):
+            if not _only_new_definitions(old.body, statement.body, known, prefix + statement.name + "::"):
+                return False
+            position += 1
+            continue
+        name = getattr(statement, "name", "")
+        if not name or name in old_names or name.startswith("__") or prefix + name in known:
+            return False
+        if prefix:
+            # A method: only a new test, never something existing tests could call.
+            if not name.startswith("test") or hasattr(unittest.TestCase, name) or not _plain_function(statement):
+                return False
+        elif isinstance(statement, ast.ClassDef):
+            if statement.decorator_list or statement.keywords:
+                return False
+            for member in statement.body:
+                simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member)
+                if isinstance(member, ast.Assign) and isinstance(member.value, ast.Constant):
+                    simple = all(isinstance(target, ast.Name) for target in member.targets)
+                if not simple or getattr(member, "name", "x").startswith("__"):
+                    return False
+        else:
+            if not _plain_function(statement) or name.lower().startswith(_MODULE_HOOKS):
+                return False
+    return position == len(old_body)
+
+
+def only_new_definitions(old_text: str, new_text: str, known: set) -> bool:
+    """True when a test file only gained whole new tests, test classes or helper functions.
+
+    Everything that was there is unchanged, and every addition has a name that
+    was not bound before and that nothing existing can reach: a new `test...`
+    method (not one that would replace an inherited test, `known` holds those),
+    a new class of plain methods, or a new module-level function that is not a
+    pytest or unittest hook. Defining them cannot fail and no existing test
+    behaves differently, so no test needs to run.
+    """
+    try:
+        old_tree = ast.parse(old_text)
+        new_tree = ast.parse(new_text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    return _only_new_definitions(old_tree.body, new_tree.body, known, "")

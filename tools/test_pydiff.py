@@ -140,9 +140,22 @@ new = BASE.replace('"""Doc."""', '"""Other doc."""')
 expect("docstring", names(analyse(new)), [])
 new = BASE.replace('"""Module doc."""', '"""Another module doc."""')
 expect("module docstring", names(analyse(new)), [])
-# ... but adding one where there was none is left to the general rule
+# ... and so does adding one where there was none
 new = BASE.replace("    def other(self):\n", '    def other(self):\n        """New."""\n')
-expect("docstring added", names(analyse(new)), ["other"])
+expect("docstring added", names(analyse(new)), [])
+
+# 8b. constants are compared by value, however the compiler numbers them
+AT = BASE.count("\n") + 3  # the line the class below starts on
+NUMBERED = BASE + f"\n\nclass Numbered:\n    A = {AT}\n    B = {AT + 2}\n\n    def f(self, x):\n        return {AT}\n"
+OLD_BASE, BASE = BASE, NUMBERED
+expect("class line", [n.lineno for n in ast.walk(ast.parse(BASE)) if getattr(n, "name", "") == "Numbered"], [AT])
+# Moved two lines down, the class's first line equals one of its own constants,
+# so the compiler merges them and renumbers the table.
+shifted = BASE.replace("LIMIT = 10\n", "LIMIT = 10\n# moved\n# down\n")
+expect("class moved onto its own constant", names(analyse(shifted)), [])
+new = BASE.replace(f"    B = {AT + 2}\n", f"    B = {AT + 3}\n")
+expect("constant in numbered class", names(analyse(new)), ["Numbered"])
+BASE = OLD_BASE
 
 # 9. a default value is evaluated where the function is defined
 new = BASE.replace("def top(a, b=1):", "def top(a, b=2):")
@@ -199,6 +212,50 @@ OLD_BASE, BASE = BASE, WITH_GEN
 new = BASE.replace('"abc" for _', '"abd" for _')
 expect("genexpr string", names(analyse(new)), ["<genexpr>"])
 BASE = OLD_BASE
+
+# 18. renaming a local variable changes nothing; renaming a parameter does
+new = BASE.replace("total = inner(n)", "result = inner(n)").replace("total = 0", "result = 0").replace(
+    "return total", "return result"
+)
+expect("local rename", names(analyse(new)), [])
+new = BASE.replace("def inner(k):", "def inner(j):").replace("return k + 1", "return j + 1")
+expect("parameter rename", names(analyse(new)), ["inner"])
+
+# 19. a test file that only gains new tests or helpers
+TESTS = textwrap.dedent('''\
+    import unittest
+    from helpers import check
+
+
+    def helper(x):
+        return x
+
+
+    class TestA(unittest.TestCase):
+        LIMIT = 3
+
+        def test_one(self):
+            self.assertEqual(helper(1), 1)
+''')
+KNOWN = {"TestA::test_one", "TestA::test_inherited"}
+
+
+def added(new_text):
+    return pydiff.only_new_definitions(TESTS, new_text, KNOWN)
+
+
+expect("new test method", added(TESTS + "\n    def test_two(self):\n        self.assertTrue(True)\n"), True)
+expect("new helper", added(TESTS + "\n\ndef other(y):\n    return y\n"), True)
+expect("new class", added(TESTS + "\n\nclass TestB(unittest.TestCase):\n    def test_x(self):\n        pass\n"), True)
+expect("replaces inherited test", added(TESTS + "\n    def test_inherited(self):\n        pass\n"), False)
+expect("overrides setUp", added(TESTS + "\n    def setUp(self):\n        pass\n"), False)
+expect("non-test method", added(TESTS + "\n    def validate(self):\n        pass\n"), False)
+expect("module hook", added(TESTS + "\n\ndef setUpModule():\n    pass\n"), False)
+expect("decorated", added(TESTS + "\n    @unittest.skip('x')\n    def test_two(self):\n        pass\n"), False)
+expect("shadows a name", added(TESTS + "\n\ndef check(y):\n    return y\n"), False)
+expect("edits a test", added(TESTS.replace("helper(1), 1", "helper(1), 2")), False)
+expect("removes a test", added(TESTS.replace("    def test_one(self):\n        self.assertEqual(helper(1), 1)\n", "")), False)
+expect("class with side effects", added(TESTS + "\n\nclass X:\n    helper(1)\n"), False)
 
 # patchlib line mapping
 patch_text = "\n".join([

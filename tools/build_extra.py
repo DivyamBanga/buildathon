@@ -154,13 +154,14 @@ for path in sorted(cov_index):
         sources[path] = ast.parse(open(ROOT + path, encoding="utf-8").read())
         if path.startswith("sqlglot/"):
             index_classes(path, sources[path].body, "")
-            assigns = []
-            for statement in sources[path].body:
-                name = named_assign(statement)
-                if name:
-                    assigns.append([statement.lineno, statement.end_lineno, name])
-                    constant_names.add(name)
-            module_statements[path] = assigns
+        # Module-level constants of the test helpers count too (the TPC schemas).
+        assigns = []
+        for statement in sources[path].body:
+            name = named_assign(statement)
+            if name:
+                assigns.append([statement.lineno, statement.end_lineno, name])
+                constant_names.add(name)
+        module_statements[path] = assigns
 
 readers = {}  # constant name -> tests that execute a line, inside a function, that reads it
 read_at_import = set()  # constant names read by a class or module body
