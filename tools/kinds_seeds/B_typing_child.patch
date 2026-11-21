@@ -1,0 +1,11 @@
+diff --git a/sqlglot/typing/zzchild.py b/sqlglot/typing/zzchild.py
+new file mode 100644
+index 0000000..b64bcc0
+--- /dev/null
++++ b/sqlglot/typing/zzchild.py
+@@ -0,0 +1,5 @@
++from __future__ import annotations
++
++from sqlglot.typing.hive import EXPRESSION_METADATA as _PARENT
++
++EXPRESSION_METADATA = {k: dict(v) for k, v in _PARENT.items()}

@@ -41,6 +41,53 @@ the patched code**, and selects the ones that fail.
 
    No candidates means the commit selects nothing.
 
+   **A path in more than one section of a patch** (a file edited twice, deleted
+   and created again, renamed and edited) selects every test. The sections are
+   analysed one by one against the pinned file here, which is not what applying
+   them in order gives.
+
+   **Changed lines that speak to pytest**, in a file under `tests/` (the word
+   itself, marks, fixtures, `xfail`, `__test__`, and the hooks only pytest calls
+   on a unittest module or class: `setup_module`, `teardown_module`,
+   `setup_class`, `setup_method`, `setup_function` and their `teardown_`
+   twins), select every test of that file unchecked, and every test that
+   imports it when it is a helper module. Added and removed lines count. The
+   runner uses unittest, which ignores all of these, so running the test says
+   nothing. (A new or changed `conftest.py` and the pytest configuration files
+   select everything, as before.)
+
+   **New tests and helpers in a test file.** A file that only gained whole new
+   tests, test classes or helper functions selects nothing, but only if what
+   was added can neither act nor be found by existing code. pytest runs the new
+   test in the same process as every other, so a new or changed statement that
+   may act outside its own locals, in a new or an edited test file, selects
+   every test: an attribute or subscript store or `del` on anything but `self`
+   (and on `self` anywhere but in a method that never rebinds it nor passes it
+   on as another parameter), `global`, `nonlocal`, a read of `__dict__`,
+   `__class__` and the like, and a call named like something that changes
+   shared state or runs text (`setattr`, `update`, `clear`, `pop`, `append`,
+   `exec`, `eval`, `reload`, `patch`, `start`, `register`, `setenv`, ...). The
+   list of call names is a list, not a proof: a call into sqlglot that changes
+   a shared table under another name is not found. A new
+   module-level name must not be a builtin or a name the old module loads
+   anywhere (existing code would find the new one); a new method must not be a
+   name `unittest.TestCase` has, one the old module reads as an attribute or
+   defines elsewhere, or the name of any test in the suite. Otherwise the file
+   counts as changed, and its own tests run as for any edited test file.
+
+   **A file that appears or vanishes** changes what its directory lists. The
+   tests that listed that directory in their own run (`dirs.json`, from the
+   `D` rows of the per-test traces: `os.listdir`, `os.scandir`, `glob`) are
+   candidates; so is everything that could notice a new module, because which
+   names the tests ask the import system for is not recorded: a new or removed
+   `.py` file or directory counts for every test, a data file only for the
+   tests that listed its directory. The import system's own listings are among
+   the rows, so for `sqlglot/` and `tests/` that is nearly every test. A new
+   test file under `tests/` keeps its own rule above. The candidates run in a
+   clean child that holds the new file, except where the listing code reaches
+   the checkout past the overlay (`sqlglotc/setup.py`) or the file is outside
+   `sqlglot/` and `tests/`; those are selected unchecked.
+
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
    another state: other module globals, class attributes, defaults or closures.
@@ -244,6 +291,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
+| `dirs.json` | `trace_all.py`, `build_dirs.py` | directory → tests that listed it (the `D` rows of the traces) |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
 There is no table from a patch, or from a kind of edit, to failing tests: the
@@ -276,6 +324,12 @@ observed failing on the patched code or could not be ruled out.
 - `tools/test_runner_paths.py` holds the unit checks for how a child finds
   patched files: redirected `open` and `io.open_code`, resolved paths that
   stay in the overlay, and modules imported on demand from patched text.
+- `tools/test_kinds.py` holds the unit checks for the rules about kinds of
+  change that one test run cannot settle (a path in several sections, changed
+  lines that speak to pytest, new tests and helpers that store outside their
+  locals or shadow a name, a file that appears or vanishes) and replays the
+  patches in `tools/kinds_seeds/`: each was a commit for which pytest failed a
+  test and the selector selected nothing of the kind.
 - `tools/trace_suite.py` traces the whole suite in one process, in collection
   order, and `tools/build_suite.py` compares it test by test with the runs
   alone. Of 2.59 million (test, line) pairs, 121 are executed in the suite but

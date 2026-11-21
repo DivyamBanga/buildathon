@@ -1,0 +1,7 @@
+diff --git a/sqlglot/typing/zz.py b/sqlglot/typing/zz.py
+new file mode 100644
+index 0000000..2699a24
+--- /dev/null
++++ b/sqlglot/typing/zz.py
+@@ -0,0 +1 @@
++def (:
