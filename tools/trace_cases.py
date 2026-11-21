@@ -24,6 +24,19 @@ PREFIX = "tests/fixtures/"
 
 
 def run(bit, fixture, kind, index):
+    result = run_once(bit, fixture, kind, index, {})
+    if result.get("failed") and index not in ("none", "all") and not result.get("retried"):
+        # The tracer's own memory can trip a test that measures memory growth.
+        name = fixture.replace("/", "__")
+        os.remove(os.path.join(out, f"{bit}@{name}@{index}.json"))
+        result = run_once(bit, fixture, kind, index, {"BR_STUB_TRACEMALLOC": "1"})
+        result["retried"] = "tracemalloc"
+        with open(os.path.join(out, f"{bit}@{name}@{index}.json"), "w") as handle:
+            json.dump(result, handle)
+    return result
+
+
+def run_once(bit, fixture, kind, index, extra_env):
     name = fixture.replace("/", "__")
     final = os.path.join(out, f"{bit}@{name}@{index}")
     if os.path.exists(final + ".json"):
@@ -35,6 +48,7 @@ def run(bit, fixture, kind, index):
     env["BR_TRACE_DIR"] = work
     env["PYTHONPATH"] = "/sqlglot:" + os.path.join(HERE, "trace")
     env.pop("BR_TRACE_CLASSES", None)
+    env.update(extra_env)
     proc = subprocess.run(
         [sys.executable, os.path.join(HERE, "trace_case_run.py"), ids[bit], final + ".tmp", kind, fixture, str(index)],
         cwd="/sqlglot", env=env, capture_output=True, text=True,

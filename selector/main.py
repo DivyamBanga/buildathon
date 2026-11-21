@@ -38,7 +38,11 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 # The whole batch has 180 s of wall clock. Past this, whatever is still being
 # checked is selected unchecked.
 HARD_DEADLINE = float(os.environ.get("BR_DEADLINE", "135"))
-MAX_PARALLEL = 2
+MAX_PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+# One child at a time costs the least CPU: two busy processes slow each other
+# down, and CPU time is what is scored. A second child runs alongside only once
+# the batch is this many seconds in, so that a slow batch still finishes in time.
+SEQUENTIAL_UNTIL = float(os.environ.get("BR_SEQUENTIAL", "75"))
 # First guess at the CPU seconds the scoring machine needs per recorded second
 # of a plain test (the recorded seconds came from a machine of the same kind).
 MACHINE = float(os.environ.get("BR_MACHINE", "1.0"))
@@ -807,7 +811,8 @@ class Coordinator:
                     self.finish_job(job, job.pending)
                 self.queue = []
                 return
-            while self.queue and len(self.running) < MAX_PARALLEL:
+            limit = 1 if now - self.start < SEQUENTIAL_UNTIL else MAX_PARALLEL
+            while self.queue and len(self.running) < limit:
                 job = self.queue.pop(0)
                 if job.decided or self.decide(job):
                     self.spawn(job)

@@ -55,6 +55,13 @@ the patched code**, and selects the ones that fail.
    first failure. A test that hangs, burns far more CPU than it normally costs
    or keeps allocating memory is stopped and counted as failing.
 
+   CPU time is what the score counts, and there is wall-clock time to spare, so
+   nothing runs side by side unless the batch is running late: children run one
+   at a time, and the process pools some tests start are replaced by a stand-in
+   that does the work in the test's own process, each call when its result is
+   asked for (arguments and results are still pickled, as a pool would). A
+   test that fails on its third query then never pays for the other ninety.
+
 5. **Do not repeat work the patch cannot have changed.**
 
    - Fixture-driven tests (the optimizer `check_file` tests, the TPC executor

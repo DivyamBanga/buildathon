@@ -31,6 +31,16 @@ if len(sys.argv) > 3:
 
     runner.CASE_HOOK = hook
 
+if os.environ.get("BR_STUB_TRACEMALLOC"):
+    # A test that measures memory growth also measures what the tracer keeps
+    # (one tuple per line seen for the first time). The lines the case runs do
+    # not depend on that measurement, so it is taken out for the retry.
+    import tracemalloc
+
+    tracemalloc.start = lambda *args, **kwargs: None
+    tracemalloc.stop = lambda: None
+    tracemalloc.get_traced_memory = lambda: (0, 0)
+
 os.environ["SKIP_INTEGRATION"] = "0"
 runner.warm_up("/sqlglot", [test_id.split("::")[0]])
 messages = []

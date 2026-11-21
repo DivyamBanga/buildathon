@@ -27,6 +27,9 @@ import sys
 import unittest
 
 POOL_WORKERS = 2
+# Process pools the tests start are replaced by work done in the test's own
+# process (see _InlinePool) unless this is switched off.
+INLINE_POOLS = os.environ.get("BR_POOL", "inline") == "inline"
 
 # (loader kind, fixture file as the test names it) -> the pinned file's case
 # numbers worth running. A fixture-driven test loops over independent cases;
@@ -477,12 +480,113 @@ class _Members:
         return len(self._original)
 
 
+class _InlineFuture:
+    """The result of work handed to an _InlinePool; the work runs when it is first asked for."""
+
+    def __init__(self, function, args, kwargs) -> None:
+        self._call = (function, args, kwargs)
+        self._outcome = None
+        self._callbacks: list = []
+
+    def _run(self):
+        if self._outcome is None:
+            import pickle
+
+            try:
+                # A pool pickles the call on its way to a worker and the result
+                # on its way back; both can fail, and the copy is what the test sees.
+                function, args, kwargs = pickle.loads(pickle.dumps(self._call, pickle.HIGHEST_PROTOCOL))
+                value = function(*args, **kwargs)
+                self._outcome = (True, pickle.loads(pickle.dumps(value, pickle.HIGHEST_PROTOCOL)))
+            except BaseException as error:  # noqa: BLE001 - a pool reports any of them through the future
+                self._outcome = (False, error)
+            self._call = None
+            callbacks, self._callbacks = self._callbacks, []
+            for callback in callbacks:
+                callback(self)
+        return self._outcome
+
+    def result(self, timeout=None):
+        done, value = self._run()
+        if done:
+            return value
+        raise value
+
+    def exception(self, timeout=None):
+        done, value = self._run()
+        return None if done else value
+
+    def add_done_callback(self, callback) -> None:
+        if self._outcome is None:
+            self._callbacks.append(callback)
+        else:
+            callback(self)
+
+    def done(self) -> bool:
+        self._run()
+        return True
+
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def running(self) -> bool:
+        return False
+
+
+class _InlinePool:
+    """Stands in for a ProcessPoolExecutor: the work is done in this process.
+
+    The tests use pools only to spread independent calls over cores. Here CPU
+    time is what counts, so the calls run one after the other, each when its
+    result is asked for; a test that stops at its first failure then never
+    pays for the calls it did not get to. Arguments and results are pickled
+    and unpickled as a pool would do.
+    """
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs) -> None:
+        if initializer is not None:
+            initializer(*initargs)
+
+    def submit(self, function, /, *args, **kwargs):
+        return _InlineFuture(function, args, kwargs)
+
+    def map(self, function, *iterables, timeout=None, chunksize=1):
+        futures = [self.submit(function, *args) for args in zip(*iterables)]
+        return (future.result() for future in futures)
+
+    def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+def _inline_wait(futures, timeout=None, return_when=None):
+    import concurrent.futures
+
+    futures = set(futures)
+    for future in futures:
+        future.done()
+    return concurrent.futures._base.DoneAndNotDoneFutures(futures, set())
+
+
+def _inline_as_completed(futures, timeout=None):
+    # Any order is a possible order of completion.
+    return iter(list(futures))
+
+
 def _patch_test_modules() -> None:
     """Adapt the test modules' helpers to this process.
 
     Process pools: the tests ask for spawned workers, which would import the
-    unpatched tree in hot mode and cost a fresh interpreter each either way, so
-    they get workers forked from this (patched) process instead.
+    unpatched tree in hot mode and cost a fresh interpreter each either way.
+    Their work is done in this (patched) process instead, see _InlinePool.
 
     Fixture loaders: wrapped so that CASE_FILTER can leave out cases.
     """
@@ -523,7 +627,12 @@ def _patch_test_modules() -> None:
         if getattr(module, "get_context", None) is not None:
             module.get_context = get_context
         if getattr(module, "ProcessPoolExecutor", None) is not None:
-            module.ProcessPoolExecutor = Pool
+            module.ProcessPoolExecutor = _InlinePool if INLINE_POOLS else Pool
+            if INLINE_POOLS:
+                if getattr(module, "wait", None) is concurrent.futures.wait:
+                    module.wait = _inline_wait
+                if getattr(module, "as_completed", None) is concurrent.futures.as_completed:
+                    module.as_completed = _inline_as_completed
         if helpers is not None:
             for kind, attribute in loaders:
                 original = getattr(helpers, "_br_" + attribute, None)
