@@ -55,6 +55,10 @@ CHEAP = 0.5
 PROBE_ABOVE = 3.0
 PROBE_SHARE = 0.15
 SETUP_ALLOWANCE = 40.0
+# CPU seconds a child may burn between tests (imports, class setup) before it
+# counts as stuck, and how far any of its processes may grow past this one.
+SETUP_CPU = 8.0
+MEMORY_ALLOWANCE = 1.2 * 1024**3
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
@@ -68,23 +72,35 @@ def log(*parts) -> None:
 _TICKS = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
 
 
-def tree_cpu(pid: int) -> float:
-    """CPU seconds used so far by a process, its live descendants and the ones they reaped."""
+_PAGE = float(os.sysconf("SC_PAGE_SIZE")) if hasattr(os, "sysconf") else 4096.0
+
+
+def tree_usage(pid: int) -> tuple[float, float]:
+    """(CPU seconds used so far, largest resident size in bytes) over a process and its descendants.
+
+    The CPU figure includes descendants that were already reaped.
+    """
     total = 0.0
+    largest = 0.0
     pending = [pid]
     while pending:
         current = pending.pop()
         try:
             with open(f"/proc/{current}/stat", "rb") as handle:
                 data = handle.read()
-            # Fields after the command name: state, ppid, ..., utime, stime, cutime, cstime.
+            # Fields after the command name: state, ppid, ..., utime, stime, cutime, cstime, ..., rss.
             fields = data[data.rindex(b")") + 2:].split()
             total += (int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])) / _TICKS
+            largest = max(largest, int(fields[21]) * _PAGE)
             with open(f"/proc/{current}/task/{current}/children", "rb") as handle:
                 pending.extend(int(child) for child in handle.read().split())
         except (OSError, ValueError, IndexError):
             pass
-    return total
+    return total, largest
+
+
+def tree_cpu(pid: int) -> float:
+    return tree_usage(pid)[0]
 
 
 class Job:
@@ -196,6 +212,7 @@ class Coordinator:
         self.ran_seconds = 0.0
         self._opens: dict[int, list[str]] = {}
         self.setup_map: dict | None = None
+        self.resident = 0.0  # this process's own resident size, the baseline for its forks
 
     # ---- deciding -------------------------------------------------------
 
@@ -638,6 +655,11 @@ class Coordinator:
         except OSError:
             pass
         self.running[read_fd] = Run(pid, job, tests, time.monotonic())
+        try:
+            with open("/proc/self/statm", "rb") as handle:
+                self.resident = int(handle.read().split()[1]) * _PAGE
+        except (OSError, ValueError, IndexError):
+            pass
         self.running[read_fd].overlay = spec["overlay"]
 
     def kill(self, run: Run) -> None:
@@ -684,6 +706,8 @@ class Coordinator:
                     run.done.add(bit)
                     self.ran_seconds += self.bit_seconds[bit]
                 run.current = None
+                run.current_cpu = tree_cpu(run.pid)
+                run.cpu_checked = now
                 if status == b"1":
                     run.job.failed.add(bit)
                     if not run.job.replanned and self.replan(run):
@@ -804,17 +828,32 @@ class Coordinator:
                     log(f"{run.job.plan.commit}: over its time budget, the rest is selected unchecked")
                     run.job.timeouts = 99
                     self.close(fd)
-                elif run.current is not None:
+                    continue
+                used = None
+                if now - run.cpu_checked > 0.25:
+                    run.cpu_checked = now
+                    cpu, resident = tree_usage(run.pid)
+                    used = cpu - run.current_cpu
+                    if resident > self.resident + MEMORY_ALLOWANCE:
+                        # The run has 4 GB in all; a test that keeps allocating is stopped.
+                        log(f"{run.job.plan.commit}: child over its memory allowance")
+                        if run.current is None:
+                            run.job.strikes += 1
+                        else:
+                            run.job.timeouts += 1
+                        self.close(fd)
+                        continue
+                if run.current is not None:
                     over = now - run.current_started > self.allowance(run.current)
-                    if not over and now - run.cpu_checked > 0.25:
-                        run.cpu_checked = now
-                        used = tree_cpu(run.pid) - run.current_cpu
-                        over = used > self.cpu_allowance(run.job, run.current)
+                    if used is not None and used > self.cpu_allowance(run.job, run.current):
+                        over = True
                     if over:
                         log(f"{run.job.plan.commit}: {self.covmap.ids[run.current]} timed out")
                         run.job.timeouts += 1
                         self.close(fd)
-                elif now - run.last_event > SETUP_ALLOWANCE:
+                elif now - run.last_event > SETUP_ALLOWANCE or (
+                    used is not None and used > SETUP_CPU * max(self.machine, 1.0)
+                ):
                     log(f"{run.job.plan.commit}: child stalled outside a test")
                     run.job.strikes += 1
                     self.close(fd)

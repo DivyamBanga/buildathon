@@ -239,7 +239,12 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
         plan.note(f"unparsable patch: {error!r}")
         return plan
     if not plan.files:
-        plan.note("empty patch")
+        if text.strip():
+            # Not a diff this parser knows: nothing can be said about it.
+            plan.select_all = True
+            plan.note("unrecognised patch")
+        else:
+            plan.note("empty patch")
         return plan
     for patch in plan.files:
         path = patch.path
