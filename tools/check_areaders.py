@@ -26,7 +26,7 @@ from selector.analyze import analyze  # noqa: E402
 from selector.covmap import CovMap  # noqa: E402
 
 ROOT = "/sqlglot"
-patches, labels, output = sys.argv[1:4]
+patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in sys.argv[1:4])
 first, last = (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (0, 1 << 30)
 maps = os.path.join(HERE, "maps")
 os.environ["SKIP_INTEGRATION"] = "0"

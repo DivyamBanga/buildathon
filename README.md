@@ -55,6 +55,15 @@ the patched code**, and selects the ones that fail.
      reads, a `not` on a value nothing uses), and it adds no candidate.
    - A function that kept its code but got another default or closure value is
      noticed only by calling it: the tests that run that function.
+   - A data attribute of a class with a new value, when `areaders.bin` covers
+     it: exactly the tests that read that attribute while they run, from
+     tracing the pinned tests (`tools/trace_attrs.py`: every test alone, with
+     each such attribute replaced by a descriptor that notes the read). A read
+     through an instance or a subclass counts for the class that defines the
+     attribute. This replaces the reach and the name of the next two rules for
+     the pairs it covers; added and removed attributes, functions, enum
+     members, anything with a `__get__` and any class the tracer could not
+     name by module and qualified name stay with the rules below.
    - A constant with a new value is noticed only by reading it: the tests that
      can reach the module or class and execute a line reading that name.
    - Anything else on a class: the tests that can reach the class, as above.
@@ -193,6 +202,8 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
+| `areaders.bin` | `trace_attrs.py`, `build_areaders.py` | `module:Class\|attribute` → tests that read that class attribute while the test itself runs |
+| `execattrs.json` | same | the class attributes read while the executor prepares tables, plans and runs a query (not while it optimizes) |
 | `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | optimized TPC query → executor result; the lines that produce it |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
