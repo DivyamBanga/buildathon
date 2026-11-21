@@ -979,7 +979,79 @@ def edit_leaves_state(old_text: str, new_text: str) -> bool:
     return _stores_state_in(old_tree, removed, new_tree, False) or _stores_state_in(new_tree, added, old_tree, True)
 
 
-def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple) -> bool:
+_TEST_PACKAGES = ("unittest", "tests")
+
+
+def _plain_base(base, kinds: dict) -> bool:
+    """A base that exists when the class statement runs and does nothing when it is subclassed:
+    `object`, `unittest.TestCase`, a plain class the module defined further up, or a name
+    imported from unittest or the tests that reads as a class (`TestCase`, `Validator`; not
+    `mock`, not `load`). `kinds` says what each name is bound to at that point of the module."""
+    if isinstance(base, ast.Name):
+        kind = kinds.get(base.id)
+        if kind is None:
+            return base.id == "object"
+        return kind == "class" or (kind == "imported" and base.id[:1].isupper() and not base.id.isupper())
+    return (
+        isinstance(base, ast.Attribute)
+        and base.attr == "TestCase"
+        and isinstance(base.value, ast.Name)
+        and base.value.id == "unittest"
+        and kinds.get("unittest") == "unittest"
+    )
+
+
+def _importable_bases(module_body: list, statement) -> bool:
+    """Can this new class statement run where it stands in the module?
+
+    A name nothing binds is a NameError and a module or a function as a base a TypeError,
+    for the whole file, when the module is imported; two bases may have no consistent
+    method resolution order. So: at most one base, and one that `_plain_base` accepts with
+    what the statements above it bind (a base defined further down does not exist yet).
+    """
+    if len(statement.bases) > 1:
+        return False
+    if not statement.bases:
+        return True
+    kinds: dict = {}
+    for node in module_body:
+        if node is statement:
+            return _plain_base(statement.bases[0], kinds)
+        if isinstance(node, ast.ClassDef):
+            plain = (
+                not node.keywords
+                and not node.decorator_list
+                and len(node.bases) <= 1
+                and all(_plain_base(base, kinds) for base in node.bases)
+                and not any(getattr(member, "name", "") == "__init_subclass__" for member in node.body)
+            )
+            kinds[node.name] = "class" if plain else "other"
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kinds[node.name] = "other"
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                return False  # it may rebind any name
+            first_party = not node.level and (node.module or "").split(".", 1)[0] in _TEST_PACKAGES
+            for alias in node.names:
+                kinds[alias.asname or alias.name] = "imported" if first_party else "other"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                plain = alias.asname is None and bound == "unittest"
+                kinds[bound] = "unittest" if plain else "other"
+        else:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and isinstance(inner.ctx, (ast.Store, ast.Del)):
+                    kinds[inner.id] = "other"
+                elif isinstance(inner, ast.alias):
+                    kinds[(inner.asname or inner.name).split(".", 1)[0]] = "other"
+                elif isinstance(inner, _DEFS):
+                    kinds[inner.name] = "other"
+    return False  # not a statement of the module itself
+
+
+def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple, module=None) -> bool:
+    """`module`: the whole body of the new module when `new_body` leaves part of it out."""
     import unittest
 
     old_names = _bound_names(old_body)
@@ -1018,6 +1090,8 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
         elif isinstance(statement, ast.ClassDef):
             if statement.decorator_list or statement.keywords or name in module_taken:
                 return False
+            if not _importable_bases(new_body if module is None else module, statement):
+                return False
             for member in statement.body:
                 simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member, True)
                 if isinstance(member, ast.Assign) and isinstance(member.value, ast.Constant):
@@ -1035,7 +1109,7 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
 _KNOWN_PACKAGES = ("sqlglot", "tests", "pytest", "unittest", "duckdb", "pandas", "numpy")
 
 
-def harmless_new_test_module(text: str) -> bool:
+def harmless_new_test_module(text: str, import_ok=None) -> bool:
     """True when a brand-new test file can only add tests of its own.
 
     pytest imports every test file it finds, so a new one runs at collection.
@@ -1044,12 +1118,14 @@ def harmless_new_test_module(text: str) -> bool:
     and functions. Importing those modules does nothing a test file of the
     pinned commit does not already do, and defining classes and functions does
     nothing at all. Anything else at module level could change what the
-    existing tests see.
+    existing tests see. `import_ok(module, names)` (names None for `import
+    module`) is asked about every import and says False for one that is certain
+    to fail: a file that cannot be imported is not one that only adds tests.
     """
     import sys
 
     try:
-        tree = ast.parse(text)
+        tree = _parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     body = []
@@ -1061,15 +1137,19 @@ def harmless_new_test_module(text: str) -> bool:
                 if statement.level or not statement.module:
                     return False
                 modules = [statement.module]
+                names = [alias.name for alias in statement.names]
             else:
                 modules = [alias.name for alias in statement.names]
+                names = None
             for module in modules:
                 top = module.split(".", 1)[0]
                 if top not in _KNOWN_PACKAGES and top not in sys.stdlib_module_names:
                     return False
+                if import_ok is not None and not import_ok(module, names):
+                    return False
             continue
         body.append(statement)
-    return _only_new_definitions([], body, set(), "", (frozenset(), frozenset()))
+    return _only_new_definitions([], body, set(), "", (frozenset(), frozenset()), tree.body)
 
 
 def coding_cookie(text: str) -> str:

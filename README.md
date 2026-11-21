@@ -85,8 +85,21 @@ the patched code**, and selects the ones that fail.
    module-level name must not be a builtin or a name the old module loads
    anywhere (existing code would find the new one); a new method must not be a
    name `unittest.TestCase` has, one the old module reads as an attribute or
-   defines elsewhere, or the name of any test in the suite. Otherwise the file
+   defines elsewhere, or the name of any test in the suite. A new class has at
+   most one base, and one that exists when the class statement runs and does
+   nothing when it is subclassed: `object`, `unittest.TestCase`, a plain class
+   the module defines further up, or a name imported from unittest or the
+   tests that reads as a class (`Validator`). A name nothing binds, or a base
+   defined further down, fails the whole file when it is imported; a class of
+   sqlglot may register the subclass; two bases may have no consistent method
+   resolution order. Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
+   A new test file must in addition hold no import that is certain to fail,
+   or it selects every test: a module of sqlglot or of the tests for which the
+   pinned tree has no file, or a name that the module's source does not bind
+   and nothing else can supply (no submodule of that name, no star import, no
+   module-level `__getattr__`, no code that writes into a namespace). What the
+   patch itself touches is not judged, nor is any other package.
 
    **An edited test that leaves state behind.** The rule above compares the
    statements of the new text with those of the old one, so it sees neither a

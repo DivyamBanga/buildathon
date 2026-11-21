@@ -8,6 +8,7 @@ this module never decides that a test fails or passes.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import marshal
 import os
@@ -142,7 +143,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             plan.note(f"new {path}")
         elif path.startswith("tests/") and (name.startswith("test_") or name.endswith("_test.py")):
             # pytest collects it, so it is imported next to the existing tests.
-            if not pydiff.harmless_new_test_module(patch.new_text or ""):
+            if not pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan)):
                 plan.select_all = True
                 plan.note(f"new test file {path} does more than define tests")
         return
@@ -424,7 +425,7 @@ def _config_may_break(patch: patchlib.FilePatch, path: str, old_path: str) -> bo
 _PYTEST_FILES = _PYTEST_CONFIG + ("__init__.py", "sitecustomize.py", "usercustomize.py")
 
 
-def _pytest_file_moves(patch: patchlib.FilePatch, path: str, old_path: str) -> str | None:
+def _pytest_file_moves(plan: Plan, patch: patchlib.FilePatch, path: str, old_path: str, root: str) -> str | None:
     """A file pytest reads for itself that appears, vanishes or moves, by whatever route.
 
     The rules for new files and for edits in place do not see a rename onto one of
@@ -442,7 +443,7 @@ def _pytest_file_moves(patch: patchlib.FilePatch, path: str, old_path: str) -> s
             old_path != path
             and path.startswith("tests/")
             and (name.startswith("test_") or name.endswith("_test.py"))
-            and not pydiff.harmless_new_test_module(patch.new_text or "")
+            and not pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan))
         ):
             return f"{path}: a file moved into the tests is collected and does more than define tests"
     if leaves:
@@ -495,6 +496,64 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.redirects[os.path.join(root, path)] = patch.new_text
 
 
+# Text that can put a name into a module which no statement of it binds.
+_DYNAMIC_NAMES = ("import *", "__getattr__", "globals()", "locals()", "vars(", "setattr(", "__dict__", "exec(", "sys.modules")
+
+
+def _import_checker(root: str, plan: Plan):
+    """`import_ok(module, names)` for a new test file: False when the import is certain to fail.
+
+    pytest imports a new test file when it collects, and a file that cannot be imported is
+    an error before any test runs. Only what is certain is turned down, read off the
+    pinned tree: a module of sqlglot or of the tests for which there is no file, directory
+    or compiled module, and a name that the module's own source does not bind, when
+    nothing else could supply it (a submodule of that name, a star import, a module-level
+    `__getattr__` as in sqlglot.dialects and sqlglot.optimizer, code that writes into a
+    namespace). Whatever the patch itself touches is not judged, and neither is any other
+    package: nothing is imported here to find out.
+    """
+    touched = {name for patch in plan.files for name in (patch.old_path, patch.new_path) if name}
+
+    def supplied(base: str) -> bool:
+        """Something in the tree, or in the patch, can be the module at this path (no suffix)."""
+        absolute = os.path.join(root, base)
+        if os.path.isfile(absolute + ".py") or os.path.isdir(absolute):
+            return True
+        try:
+            entries = os.listdir(os.path.dirname(absolute))
+        except OSError:
+            entries = []
+        name = os.path.basename(base)
+        return any(entry.startswith(name + ".") for entry in entries) or any(
+            other.startswith((base + ".", base + "/")) for other in touched
+        )
+
+    def check(module: str, names) -> bool:
+        parts = module.split(".")
+        if parts[0] not in ("sqlglot", "tests"):
+            return True
+        if not all(supplied("/".join(parts[:depth])) for depth in range(1, len(parts) + 1)):
+            return False
+        if names is None:
+            return True
+        base = "/".join(parts)
+        source = base + "/__init__.py"
+        if not os.path.isfile(os.path.join(root, source)):
+            source = base + ".py"
+        if any(other.startswith((base + ".", base + "/")) for other in touched):
+            return True
+        text = _read(os.path.join(root, source))
+        if text is None or any(marker in text for marker in _DYNAMIC_NAMES):
+            return True
+        try:
+            bound = pydiff._bound_names(ast.parse(text).body)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return True
+        return all(name == "*" or name in bound or supplied(base + "/" + name) for name in names)
+
+    return check
+
+
 def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """A file that appears or vanishes changes what its directory lists.
 
@@ -511,7 +570,7 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
         and old_path == path
         and path.startswith("tests/")
         and (name.startswith("test_") or name.endswith("_test.py"))
-        and pydiff.harmless_new_test_module(patch.new_text or "")
+        and pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan))
     ):
         # pytest lists the directory but keeps only what its arguments name, and
         # nothing asks the import system for the new module: only this rule's
@@ -632,7 +691,7 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note(f"{path}: unchanged")
             continue
         try:
-            moved = _pytest_file_moves(patch, path, old_path)
+            moved = _pytest_file_moves(plan, patch, path, old_path, root)
             if moved:
                 plan.select_all = True
                 plan.note(moved)

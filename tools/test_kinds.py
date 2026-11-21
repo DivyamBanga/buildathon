@@ -309,6 +309,59 @@ expect("L: a form feed in a line does not shift the line numbers", pydiff.edit_l
     L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n"),
     L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n").replace("Parser.FUNCTIONS = ORIGINAL", "pass")), True)
 
+# ---- M: a new definition that fails when the module is imported ---------------
+
+M_BASE = "import unittest\nfrom unittest import mock\nfrom sqlglot.dialects.dialect import Dialect\nfrom tests.helpers import Validator, load\n\n\nclass Base(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+
+
+def m_added(text, base=M_BASE):
+    return pydiff.only_new_definitions(base, base + text, {"Base::test_a"})
+
+
+CLASS = "\n\nclass T({}):\n    def test_b(self):\n        pass\n"
+for label, bases, want in (
+    ("no base", "", True),
+    ("object", "object", True),
+    ("a class of the module", "Base", True),
+    ("unittest.TestCase", "unittest.TestCase", True),
+    ("a class imported from the tests", "Validator", True),
+    ("a name nothing binds", "NoSuchBase", False),
+    ("an imported module", "mock", False),
+    ("an imported function", "load", False),
+    ("a class of sqlglot, whose metaclass acts", "Dialect", False),
+    ("an attribute of another module", "mock.Mock", False),
+    ("two bases may have no consistent order", "unittest.TestCase, Base", False),
+    ("a repeated base", "Base, Base", False),
+    ("a call", "type('B', (), {})", False),
+):
+    expect("M: new class, " + label, m_added(CLASS.format(bases).replace("T()", "T")), want)
+expect("M: a base defined further down does not exist yet", pydiff.only_new_definitions(
+    M_BASE, M_BASE.replace("\n\nclass Base", "\n\nclass T(Base):\n    def test_b(self):\n        pass\n\n\nclass Base"), {"Base::test_a"}), False)
+expect("M: a base of the module that is itself plain", m_added(CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base):\n    pass\n"), True)
+expect("M: a base of the module with two bases", m_added(CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base, object):\n    pass\n"), False)
+expect("M: a base of the module with a subclass hook", m_added(
+    CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base):\n    def __init_subclass__(cls):\n        raise TypeError\n"), False)
+expect("M: a base rebound after its class statement", m_added(CLASS.format("Base"), M_BASE + "\nBase = None\n"), False)
+expect("M: unittest bound to something else", m_added(CLASS.format("unittest.TestCase"), M_BASE + "\nunittest = None\n"), False)
+expect("M: after a star import any name may be another thing", m_added(CLASS.format("Base"), M_BASE + "\nfrom os import *\n"), False)
+expect("M: a decorator on a new def", m_added("\n\n@mock.patch('x')\ndef helper(a):\n    return a\n"), False)
+expect("M: a default that runs", m_added("\n\ndef helper(a=load('x')):\n    return a\n"), False)
+expect("M: a keyword on a class", m_added("\n\nclass T(Base, metaclass=type):\n    pass\n"), False)
+NEW_FILE = "import unittest\nfrom sqlglot import {}\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+RESOLVES = {("unittest", None), ("sqlglot", ("exp",))}
+
+
+def resolves(module, names):
+    return (module, tuple(names) if names else None) in RESOLVES
+
+
+expect("M: new file, imports that can succeed", pydiff.harmless_new_test_module(NEW_FILE.format("exp"), resolves), True)
+expect("M: new file, an import that cannot", pydiff.harmless_new_test_module(NEW_FILE.format("nothing"), resolves), False)
+expect("M: new file, nobody asked", pydiff.harmless_new_test_module(NEW_FILE.format("nothing")), True)
+expect("M: new file, a base nothing binds", pydiff.harmless_new_test_module(NEW_FILE.format("exp").replace("unittest.TestCase", "Missing")), False)
+expect("M: new file, a base imported from the tests", pydiff.harmless_new_test_module(
+    "from tests.dialects.test_dialect import Validator\n\n\nclass T(Validator):\n    def test_a(self):\n        self.validate_identity('SELECT 1')\n"), True)
+
 # ---- F: a new name must not change what existing code finds ---------------
 
 expect("F: new global is a builtin", added("\n\ndef set(*args):\n    return {'x'}\n"), False)
@@ -439,6 +492,10 @@ for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith(("K_", "L_")):
         expect("seed " + name[:-6], seed(name[:-6]).select_all, True)
+plan = seed("M_undefined_base")
+expect("seed M: not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
+expect("seed M: the tests of the file run", plan.candidates & covmap.tests_of_file("tests/test_helper.py"), covmap.tests_of_file("tests/test_helper.py"))
+expect("seed M: and nothing is selected unchecked", (plan.select_all, plan.unverified), (False, 0))
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
@@ -460,6 +517,47 @@ def deleted_file_patch(path):
     return (f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n--- a/{path}\n+++ /dev/null\n"
             f"@@ -1,{len(lines)} +0,0 @@\n" + body)
 
+
+NEW_TEST_FILE = "import unittest\n{}\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n"
+for line in (
+    "from sqlglot import nothing",
+    "import sqlglot.nothing",
+    "from sqlglot.nothing import exp",
+    "from tests.helpers import nothing",
+    "from tests.dialects.test_dialect import Validator, Nothing",
+):
+    plan = plan_for(new_file_patch("tests/test_new_import.py", NEW_TEST_FILE.format(line)))
+    expect("M: a new test file with an import that cannot succeed, " + line, plan.select_all, True)
+for line in (
+    "from sqlglot import exp, parse_one\nfrom tests.helpers import assert_logger_contains",
+    "from sqlglot.dialects import BigQuery, Hive",  # handed out by the module's __getattr__
+    "from sqlglot.optimizer import optimize\nfrom sqlglot.optimizer.qualify import qualify",
+    "from sqlglot.expressions import Column, convert",  # bound by star imports
+    "import sqlglot.expressions.core as core\nimport sqlglot.dialects",
+    "from tests.dialects.test_dialect import Validator",
+    "from sqlglot import optimizer",  # a submodule
+    "from decimal import Decimal\nfrom unittest import mock\nimport pandas as pd",
+):
+    plan = plan_for(new_file_patch("tests/test_new_import.py", NEW_TEST_FILE.format(line)))
+    expect("M: a new test file whose imports can succeed, " + line.split("\n")[0], (plan.select_all, plan.candidates), (False, 0))
+
+
+def appended(path, addition):
+    """A patch that adds text at the end of a file of the pinned tree."""
+    import difflib
+
+    with open(os.path.join(ROOT, path), encoding="utf-8", newline="") as handle:
+        old = handle.read().splitlines(keepends=True)
+    body = "".join(difflib.unified_diff(old, old + addition.splitlines(keepends=True), "a/" + path, "b/" + path, n=3))
+    return f"diff --git a/{path} b/{path}\n" + body
+
+
+both = appended("sqlglot/time.py", "\n\ndef zz_new_helper():\n    return 1\n") + new_file_patch(
+    "tests/test_new_import.py", NEW_TEST_FILE.format("from sqlglot.time import zz_new_helper"))
+expect("M: a name the same patch adds is not judged", plan_for(both).select_all, False)
+both = new_file_patch("sqlglot/zz_new_module.py", "VALUE = 1\n") + new_file_patch(
+    "tests/test_new_import.py", NEW_TEST_FILE.format("from sqlglot.zz_new_module import VALUE"))
+expect("M: a module the same patch adds is not judged", any("does more than define tests" in note for note in plan_for(both).notes), False)
 
 everything = covmap.all
 plan = plan_for(new_file_patch("tests/test_new_ok.py", "import unittest\n\n\nclass TestNew(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n"))
