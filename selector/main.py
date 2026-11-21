@@ -82,6 +82,8 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 # simulated time is what the failing tests alone come to.
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
+# Measurement build (branch exp-e2 only): see full_cost.
+EXPERIMENT_SKIP_CONCERNED = os.environ.get("BR_SKIP_CONCERNED", "1") != "0"
 FIXTURES = "tests/fixtures/"
 EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
@@ -805,6 +807,12 @@ class Coordinator:
 
     def full_cost(self, job: Job, bit: int) -> float:
         """What the whole test costs to run for this commit, in recorded seconds of a plain test."""
+        if EXPERIMENT_SKIP_CONCERNED and job.mode == "clean" and bit in self.memo_cost and self.bit_seconds[bit] > 10.0:
+            # Measurement build: after a clean import the largest executor test is
+            # run only when recorded results spare most of its queries; when the
+            # patch concerns (nearly) all of them it is selected instead.
+            if not self.executor_memo_ok(job) or self.memo_share(job, bit) >= 0.9:
+                return float("inf")
         if bit in self.memo_cost and self.executor_memo_ok(job):
             share = self.memo_share(job, bit)
             if not share:
