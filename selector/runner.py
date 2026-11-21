@@ -12,6 +12,7 @@ ways and then runs tests with unittest, stopping each test at its first failure:
 Messages to the coordinator, one per line on the pipe:
   S <index>            test started
   R <index> <0|1>      test finished, 1 = failed
+  C <index>            the class of this test raised after its tests had run
   X <text>             the child could not do its job
   D                    all done
 """
@@ -591,6 +592,7 @@ def build_executor_tables() -> None:
     finally:
         duckdb.connect = real_connect
     EXECUTOR_TABLES = (test_class.tpch_tables, test_class.tpcds_tables)
+    _snapshot_pinned()
     for name in ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"):
         if name in test_class.__dict__:
             delattr(test_class, name)
@@ -634,6 +636,15 @@ EXECUTOR_MEMO = None
 # applies only inside the two tests it was recorded from.
 MEMO_SCOPE = None
 MEMO_TESTS = {"test_execute_tpch": "tpch", "test_execute_tpcds": "tpcds"}
+# memo key -> (bit mask of the phase lines, bit mask of the attributes) that one
+# query runs and reads when it is planned and executed (maps/execqueries.bin).
+EXECUTOR_QUERIES = None
+# (phase lines, attributes) the patch changes, or None when it changes none:
+# a recorded result is used only for a query whose own record touches neither.
+MEMO_BLOCK = None
+# True in a child that imports the patched tree afresh and may reuse recorded
+# results: the memo is put in place when one of those two tests starts.
+MEMO_AFTER_IMPORT = False
 # For the offline tools: a directory to record results into, and a callable
 # told when the planning-and-execution phase starts ("X") and ends ("L").
 MEMO_RECORD = None
@@ -652,36 +663,244 @@ def load_executor_memo(path: str) -> None:
         EXECUTOR_MEMO = None
 
 
-class _Planned:
-    """Stands in for the plan of a query whose result is already known."""
+def read_executor_queries(path: str) -> dict:
+    """maps/execqueries.bin as {memo key: (lines, attributes)}, the two as ints; {} when it is not there."""
+    import marshal
+    import zlib
 
-    def __init__(self, key: str) -> None:
-        self.key = key
+    try:
+        with open(path, "rb") as handle:
+            raw = marshal.loads(zlib.decompress(handle.read()))
+        return {
+            key: (int.from_bytes(lines, "little"), int.from_bytes(attributes, "little"))
+            for key, (lines, attributes) in raw.items()
+        }
+    except Exception:
+        return {}
+
+
+def _query_untouched(key: str) -> bool:
+    """True when nothing the patch changes is run or read by this query's planning and execution."""
+    block = MEMO_BLOCK
+    if block is None:
+        return True
+    own = (EXECUTOR_QUERIES or {}).get(key)
+    return own is not None and not own[0] & block[0] and not own[1] & block[1]
+
+
+class _Planned:
+    """Stands in for the plan of a query until its executor decides whether the result is known."""
+
+    def __init__(self, expression, digest: str) -> None:
+        self.expression = expression
+        self.digest = digest
+
+
+def tree_digest(root) -> str:
+    """A digest of an expression tree, read off the nodes themselves.
+
+    It covers everything a node holds: its class, every argument in order
+    (absent, None and an empty list are three different things), its type,
+    comments and meta, and the type of every leaf value. It also covers how the
+    nodes of the tree are wired: a node that sits in two places is written as
+    a reference to its first occurrence, and a child whose parent, argument
+    name or index is not the place it was found in is marked. Two trees with
+    the same digest are the same data structure to any code that walks them.
+    No sqlglot code is called (a patch cannot change what the digest says),
+    only attributes are read.
+
+    The type annotation of a node is written by value: sqlglot hands the same
+    type object to many nodes, and which nodes share one depends on what the
+    process did before, not on the query.
+
+    Raises ValueError for a tree that hangs under another node (what is above
+    it is not part of the digest) and for a type nested absurdly deep.
+    """
+    import enum
+    import hashlib
+
+    if getattr(root, "parent", None) is not None:
+        raise ValueError("not the root of its tree")
+    digest = hashlib.sha1()
+    write = digest.update
+    seen: dict = {}
+    # (value, parent, argument name, index or depth, mode); mode 0: a plain
+    # value, 1: a child found at that place, 2: inside a type annotation (by
+    # value, `index` counts the depth), 3: punctuation.
+    todo = [(root, None, None, None, 0)]
+    while todo:
+        value, parent, key, index, mode = todo.pop()
+        kind = type(value)
+        if mode == 3:
+            write(value)
+        elif value is None:
+            write(b"N;")
+        elif kind is bool:
+            write(b"T;" if value else b"F;")
+        elif kind is int:
+            write(b"i%d;" % value)
+        elif kind is str:
+            data = value.encode("utf-8", "surrogatepass")
+            write(b"s%d:" % len(data))
+            write(data)
+        elif kind is float:
+            write(("f" + repr(value) + ";").encode())
+        elif type(getattr(value, "args", None)) is dict and hasattr(value, "parent"):
+            inner = 1
+            depth = 0
+            if mode == 2:
+                inner = 2
+                depth = index + 1
+                if depth > 100:
+                    raise ValueError("type nested too deep")
+            else:
+                ordinal = seen.get(id(value))
+                if ordinal is not None:
+                    write(b"@%d;" % ordinal)
+                    continue
+                seen[id(value)] = len(seen)
+            write(("E" + kind.__module__ + "." + kind.__qualname__).encode())
+            if mode == 1:
+                if value.parent is not parent:
+                    write(b"!p%d" % seen.get(id(value.parent), -1))
+                if value.arg_key != key:
+                    write(("!k" + repr(value.arg_key)).encode())
+                if value.index != index:
+                    write(("!i" + repr(value.index)).encode())
+            tasks: list = [(b"(", None, None, None, 3)]
+            for name, argument in value.args.items():
+                tasks.append((name, None, None, None, 0))
+                if type(argument) is list:
+                    tasks.append((b"[", None, None, None, 3))
+                    for position, item in enumerate(argument):
+                        tasks.append((item, value, name, depth if inner == 2 else position, inner))
+                    tasks.append((b"]", None, None, None, 3))
+                else:
+                    tasks.append((argument, value, name, depth if inner == 2 else None, inner))
+            tasks.append((b"|", None, None, None, 3))
+            annotation = getattr(value, "_type", None)
+            if annotation is value:
+                tasks.append((b"self;", None, None, None, 3))
+            else:
+                tasks.append((annotation, None, None, depth, 2))
+            tasks.append((getattr(value, "comments", None), None, None, None, 0))
+            tasks.append((getattr(value, "_meta", None), None, None, None, 0))
+            tasks.append((b")", None, None, None, 3))
+            todo.extend(reversed(tasks))
+        elif isinstance(value, enum.Enum):
+            write(("e" + kind.__module__ + "." + kind.__qualname__ + "." + value.name + ";").encode())
+        elif kind is list or kind is tuple:
+            tasks = [(b"[" if kind is list else b"<", None, None, None, 3)]
+            tasks.extend((item, None, None, index, 2 if mode == 2 else 0) for item in value)
+            tasks.append((b"]", None, None, None, 3))
+            todo.extend(reversed(tasks))
+        elif kind is dict:
+            tasks = [(b"{", None, None, None, 3)]
+            for name, item in value.items():
+                tasks.append((name, None, None, None, 0))
+                tasks.append((item, None, None, index, 2 if mode == 2 else 0))
+            tasks.append((b"}", None, None, None, 3))
+            todo.extend(reversed(tasks))
+        else:
+            text = "o" + kind.__module__ + "." + kind.__qualname__ + ":" + repr(value) + ";"
+            write(text.encode("utf-8", "backslashreplace"))
+    return digest.hexdigest()
+
+
+# What every pinned table held when it was built: id -> (the table, its rows, its columns).
+# The rows are kept as a tuple of the row tuples themselves, so that a later
+# change of the table in place (a row dropped, replaced or reordered) shows.
+_PINNED_ROWS: dict = {}
+# Tables found to hold exactly a pinned table's data: id -> (the table, its rows, its columns), kept the same way.
+_VERIFIED_TABLES: dict = {}
+
+
+def _snapshot_pinned() -> None:
+    _PINNED_ROWS.clear()
+    for tables in EXECUTOR_TABLES or ():
+        for table in tables.values():
+            _PINNED_ROWS[id(table)] = (table, tuple(table.rows), tuple(table.columns))
+
+
+def _same_table(table, pinned) -> bool:
+    """True when `table` holds exactly the data of the pinned table right now: same columns, same rows, same value types.
+
+    Checked on every use: being the pinned object, or having been equal to
+    it once, says nothing about what was done to its rows since.
+    """
+    import operator
+
+    try:
+        known = _PINNED_ROWS.get(id(pinned))
+        if known is None or known[0] is not pinned:
+            return False
+        _, pinned_rows, pinned_columns = known
+        rows = table.rows
+        if type(table).__name__ != "Table" or type(rows) is not list or table.column_range is not None:
+            return False
+        if tuple(table.columns) != pinned_columns or len(rows) != len(pinned_rows):
+            return False
+        reader = table.reader
+        if type(reader).__name__ != "RowReader" or reader.columns != {name: index for index, name in enumerate(pinned_columns)}:
+            return False
+        if table is pinned:
+            return all(map(operator.is_, rows, pinned_rows))
+        seen = _VERIFIED_TABLES.get(id(table))
+        if seen is not None and seen[0] is table:
+            # Compared in full before: the very same row tuples must still be there.
+            return len(rows) == len(seen[1]) and all(map(operator.is_, rows, seen[1]))
+        if rows != list(pinned_rows):
+            return False
+        if any(type(row) is not tuple or list(map(type, row)) != list(map(type, other)) for row, other in zip(rows, pinned_rows)):
+            return False
+    except Exception:
+        return False
+    _VERIFIED_TABLES[id(table)] = (table, tuple(rows), pinned_columns)
+    return True
+
+
+def memo_key(scope: str, digest: str, executor_args: tuple, executor_kwargs: dict) -> str | None:
+    """The memo key of one `execute` call, or None when its tables are not the pinned ones.
+
+    The executor is built as `PythonExecutor(tables=...)` with what
+    `ensure_tables` made of the tables the test passed. The recorded result
+    stands for a query only when those are the same tables, by name and by
+    content, as at the pinned commit; their names are part of the key.
+    """
+    if EXECUTOR_TABLES is None or executor_args or list(executor_kwargs) != ["tables"]:
+        return None
+    pinned = EXECUTOR_TABLES[0 if scope == "tpch" else 1]
+    tables = executor_kwargs["tables"]
+    mapping = getattr(tables, "mapping", None)
+    if type(tables).__name__ != "Tables" or type(mapping) is not dict:
+        return None
+    for name, table in mapping.items():
+        if type(name) is not str or name not in pinned or not _same_table(table, pinned[name]):
+            return None
+    return scope + ":" + ",".join(sorted(mapping)) + ":" + digest
 
 
 def install_executor_memo() -> None:
     """Skip planning and executing a TPC query that is unchanged since the pinned commit.
 
     `sqlglot.executor.execute` prepares the tables, optimizes the query, plans
-    it and runs the plan. The result depends only on the optimized query and
-    on everything else `execute` runs: the code that prepares the tables, the
-    planner and the executor. This is installed only for a patch that touches
-    none of that code (maps/execphase.json), so a query whose optimized form is
-    exactly the pinned one must give the pinned result, which is returned
-    without running it. Any other query is planned and executed as usual.
+    it and runs the plan. The result depends only on the optimized query, on
+    the tables, and on everything else `execute` runs: the code that prepares
+    the tables, the planner and the executor. This is installed only for a
+    patch that changes none of that code and nothing that code reads
+    (maps/execphase.json, maps/execnames.json), so a query whose optimized form
+    is exactly the pinned one, run on exactly the pinned tables, must give the
+    pinned result, which is returned without running it. Any other query is
+    planned and executed as usual.
     """
-    import hashlib
-    import json
     import pickle
 
     import sqlglot.executor as executor
-    from sqlglot import serde
 
     real_plan = executor.Plan
     real_executor = executor.PythonExecutor
     if getattr(real_plan, "_br_memo", False):
         return
-    pending: dict = {}
 
     def plan(expression):
         scope = MEMO_SCOPE
@@ -690,15 +909,9 @@ def install_executor_memo() -> None:
         if MEMO_PHASE is not None:
             MEMO_PHASE("X")
         try:
-            text = json.dumps(serde.dump(expression), sort_keys=True, default=str)
-            key = scope + ":" + hashlib.sha1(text.encode()).hexdigest()
+            return _Planned(expression, tree_digest(expression))
         except Exception:
             return real_plan(expression)
-        if MEMO_RECORD is None and EXECUTOR_MEMO is not None and key in EXECUTOR_MEMO:
-            return _Planned(key)
-        planned = real_plan(expression)
-        pending["plan"], pending["key"] = planned, key
-        return planned
 
     plan._br_memo = True
 
@@ -709,16 +922,25 @@ def install_executor_memo() -> None:
 
         def execute(self, planned):
             try:
-                if isinstance(planned, _Planned):
-                    return pickle.loads(EXECUTOR_MEMO[planned.key])
-                result = real_executor(*self._args, **self._kwargs).execute(planned)
-                if MEMO_RECORD is not None and pending.get("plan") is planned:
-                    name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{pending['key'].replace(':', '-')}")
+                if not isinstance(planned, _Planned):
+                    return real_executor(*self._args, **self._kwargs).execute(planned)
+                scope = MEMO_SCOPE
+                key = None if scope is None else memo_key(scope, planned.digest, self._args, self._kwargs)
+                if (
+                    key is not None
+                    and MEMO_RECORD is None
+                    and EXECUTOR_MEMO is not None
+                    and key in EXECUTOR_MEMO
+                    and _query_untouched(key)
+                ):
+                    return pickle.loads(EXECUTOR_MEMO[key])
+                result = real_executor(*self._args, **self._kwargs).execute(real_plan(planned.expression))
+                if MEMO_RECORD is not None and key is not None:
+                    name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{len(os.listdir(MEMO_RECORD))}")
                     with open(name, "wb") as handle:
-                        pickle.dump((pending["key"], pickle.dumps(result, protocol=4)), handle)
+                        pickle.dump((key, pickle.dumps(result, protocol=4)), handle)
                 return result
             finally:
-                pending.clear()
                 if MEMO_PHASE is not None and MEMO_SCOPE is not None:
                     MEMO_PHASE("L")
 
@@ -973,6 +1195,12 @@ class _Result(unittest.TestResult):
         self.started.append(test._br_index)
         # Pool workers are forked inside the test and inherit this.
         MEMO_SCOPE = MEMO_TESTS.get(getattr(test, "_testMethodName", ""))
+        if MEMO_SCOPE is not None and MEMO_AFTER_IMPORT:
+            # After a clean import the executor exists only once the test module is imported.
+            try:
+                install_executor_memo()
+            except Exception:
+                pass
         self._emit(f"S {test._br_index}\n")
 
     def stopTest(self, test) -> None:
@@ -1047,13 +1275,14 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
             # setUpClass failed, so pytest reports an error for each of them.
             emit(f"R {index} 1\n")
         if result.holders and not never:
-            # A class teardown error is reported against the last test that ran.
-            emit(f"R {cases[-1]._br_index} 1\n")
+            # A class teardown error: pytest reports it against the last test of
+            # the class. Which one that is, the coordinator knows.
+            emit(f"C {cases[-1]._br_index}\n")
 
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
-    global _pinned_fixtures, _changed_fixtures
+    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK
     code = 0
     try:
         os.setpgid(0, 0)
@@ -1084,12 +1313,14 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
         _changed_fixtures = set(changes)
         CASE_FILTER.clear()
         CASE_FILTER.update(job.get("cases") or {})
+        MEMO_BLOCK = job.get("memo_block")
         if job["mode"] == "clean":
             _purge(root)
             sys.path.insert(0, overlay)
             os.chdir(overlay)
             if changes:
                 _keep_resolved_paths_in(overlay, root)
+            MEMO_AFTER_IMPORT = bool(job.get("executor_memo") and EXECUTOR_MEMO and EXECUTOR_TABLES is not None)
         else:
             lazy = list(job.get("lazy") or ())
             swaps = []

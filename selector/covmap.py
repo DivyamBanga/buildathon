@@ -31,6 +31,7 @@ class CovMap:
         self._tblob: bytes | None = None
         self._tfiles: dict[str, dict[int, dict[int, int]]] = {}
         self._warm: dict | None = None
+        self._import_run: dict | None = None
         self._blob: bytes | None = None
         self._files: dict[str, dict[int, dict[int, int]]] = {}
         self._packs: dict[str, dict | None] = {}
@@ -184,6 +185,15 @@ class CovMap:
     def warm_files(self) -> list[str]:
         """Source files imported by the time every test module is imported."""
         return list(self._load_warm())
+
+    def runs_at_import(self, path: str, first: int) -> bool:
+        """True when the code object runs while the whole package is imported
+        (tools/build_importrun.py), or when that is not known."""
+        if self._import_run is None:
+            self._import_run = self._optional_json("importrun.json") or {}
+        if not self._import_run:
+            return True
+        return first in self._import_run.get(path, ())
 
     @staticmethod
     def bits(bitmap: int) -> list[int]:

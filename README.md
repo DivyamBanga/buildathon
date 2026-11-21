@@ -68,6 +68,19 @@ the patched code**, and selects the ones that fail.
      can reach the module or class and execute a line reading that name.
    - Anything else on a class: the tests that can reach the class, as above.
 
+   The same is done for a changed function that sqlglot itself runs while it
+   is imported (a helper of a metaclass, the error formatter the parser calls
+   while templates are parsed). Run alone, nearly every test "executes" such a
+   function, because sqlglot is imported in its process. What the function did
+   then is in the state of the package, so the candidates are the tests that
+   run it themselves, plus whatever the comparison finds.
+
+   Both imports also go through sqlglot's on-demand loading, on dialects that
+   are not imported yet (`Dialect.get`, `Dialect[...]`, `Dialect.get_or_raise`,
+   attribute access on the lazy packages), and what comes back is compared
+   too: importing every module directly would not notice a patch that breaks
+   that machinery.
+
    "Run" and "read" here mean while the test itself runs. A second line map
    (`tcov.bin`) records each test with sqlglot imported in full beforehand, so
    that what sqlglot executes while importing itself, whichever test runs, is
@@ -157,10 +170,45 @@ the patched code**, and selects the ones that fail.
      really sends. The optimizer tests' small DuckDB database is held back the
      same way until a case executes a query.
    - `sqlglot.executor.execute` prepares the tables it was given, optimizes
-     the query, plans it and runs the plan. For a patch that changes none of
-     the lines `execute` runs outside the optimizer, a TPC query whose
-     optimized form is exactly the pinned one is not planned and executed
-     again: its recorded result is returned.
+     the query, plans it and runs the plan. The result of the last two steps
+     depends on three things: the optimized query, the tables, and the code
+     that plans and executes (with whatever that code reads). When all three
+     are what they were at the pinned commit, the recorded result is returned
+     and the query is not planned and executed again. Each is checked, not
+     assumed:
+     - *The query*: a digest taken from the tree itself, with no sqlglot code
+       involved (`runner.tree_digest`): every node's class, arguments in
+       order, type, comments and meta, the type of every leaf value, and the
+       wiring (a node held in two places, a child that names another parent
+       or position).
+     - *The tables*: what `ensure_tables` returned for this call must hold
+       exactly the pinned tables, by name and by content, at that moment (a
+       table changed in place is not the pinned table any more).
+     - *The code and what it reads*: the patch changes none of the lines
+       `execute` runs outside the optimizer (`execphase.json`). After a hot
+       swap nothing else can differ. After a clean import the comparison of
+       import state (step 3) lists every module or class attribute that
+       differs, and each must be out of that code's sight: a function with
+       other code, defaults or closure must not be one it runs; a plain data
+       attribute of a class must not be one it read (`execattrs.json`:
+       recorded with a descriptor in the attribute's place that notes every
+       read through the class, a subclass or an instance); any other constant
+       must not be named in any function it runs (`execnames.json`);
+       anything else (an attribute added or removed, other bases, a
+       difference on the classes the recorded results are made of) turns the
+       reuse off, as does an inconclusive comparison or a patch outside
+       `sqlglot/`. A patched module that is imported on demand is imported
+       from its new source when a test first asks for it; that leaves the
+       state the pinned module would leave only when function bodies alone
+       changed and none of them runs while sqlglot is imported
+       (`importrun.json`). Then it counts as a hot swap; otherwise the reuse
+       is off.
+     - *Query by query*: when the patch does change lines of that phase, or
+       attributes it reads, the record of each single query says whether that
+       query is concerned (`execqueries.bin`: the lines it runs and the
+       attributes it reads when planned and executed alone in a fresh
+       process). A query that touches nothing changed keeps its recorded
+       result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
      shared by the children.
@@ -203,8 +251,9 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `areaders.bin` | `trace_attrs.py`, `build_areaders.py` | `module:Class\|attribute` → tests that read that class attribute while the test itself runs |
-| `execattrs.json` | same | the class attributes read while the executor prepares tables, plans and runs a query (not while it optimizes) |
-| `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | optimized TPC query → executor result; the lines that produce it |
+| `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
+| `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
+| `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
 There is no table from a patch, or from a kind of edit, to failing tests: the

@@ -35,9 +35,13 @@ MAPS = os.environ.get(
 )
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
-# The whole batch has 180 s of wall clock. Past this, whatever is still being
-# checked is selected unchecked.
+# A practice batch (40 commits) has 180 s of wall clock, the final (about 60
+# commits) 270 s. Past the deadline, whatever is still being checked is
+# selected unchecked. The deadline is 135 s for up to 40 commits and grows
+# with the batch from there, up to 200 s.
 HARD_DEADLINE = float(os.environ.get("BR_DEADLINE", "135"))
+PRACTICE_COMMITS = 40
+LONGEST_DEADLINE = 200.0
 MAX_PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 # One child at a time costs the least CPU: two busy processes slow each other
 # down, and CPU time is what is scored. A second child runs alongside only once
@@ -144,8 +148,11 @@ class Job:
         self.import_files: list[str] = []
         self.setup_untouched: bool | None = None
         self.memo_ok: bool | None = None
+        self.memo_block = (0, 0)  # phase lines and attributes the patch changes, as bit masks
+        self.memo_share: dict = {}
         self.deadline = float("inf")  # wall-clock limit for checking this commit
         self.probed = False  # the state left by its import-time changes has been compared
+        self.state: dict | None = None  # what that comparison found, once it has narrowed the candidates
 
 
 class Run:
@@ -192,6 +199,11 @@ class Coordinator:
         # ... and when, on top of that, recorded executor results can be reused.
         self.memo_cost: dict[int, float] = {}
         self.exec_phase: dict | None = None
+        self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
+        self.exec_names: dict | None = None
+        self.exec_attrs: dict | None = None  # attribute the phase reads -> its number
+        self.exec_queries: dict = {}  # memo key -> (phase lines, attributes) of that one query, as bit masks
+        self.record_failed = False
         # ... and when they run their own setup but DuckDB's recorded answers are
         # reused (a clean import, or a patch that touches what the setup runs).
         self.answer_cost: dict[int, float] = {}
@@ -240,6 +252,8 @@ class Coordinator:
         self._opens: dict[int, list[str]] = {}
         self.setup_map: dict | None = None
         self.resident = 0.0  # this process's own resident size, the baseline for its forks
+        self.deadline = HARD_DEADLINE
+        self.sequential_until = SEQUENTIAL_UNTIL
 
     # ---- deciding -------------------------------------------------------
 
@@ -450,7 +464,7 @@ class Coordinator:
         costly = 0.0
         for bit in check:
             # What the check may come to if the change turns out to be real.
-            potential = job.estimates[bit] * self.worst_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
+            potential = job.estimates[bit] * self.changed_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
             if potential * self.machine > PROBE_ABOVE:
                 costly += potential
         if costly and blind:
@@ -488,7 +502,7 @@ class Coordinator:
             # executed in full: expect half way between the best and the worst.
             for bit in remaining:
                 if bit in self.memo_cost:
-                    ratio = self.worst_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
+                    ratio = self.changed_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
                     job.estimates[bit] *= (1.0 + ratio) / 2.0
         check, blind = self.weigh(remaining, job.estimates, list(job.blind | job.failed), PASS_LIVE)
         if not blind:
@@ -600,22 +614,204 @@ class Coordinator:
         changed = {path[len(ROOT) + 1:] for path in job.plan.redirects}
         return not any(path in changed and not path.endswith(".sql") for path in setup["opens"])
 
+    def executor_phase(self) -> dict:
+        """What `execute` runs outside the optimizer at the pinned commit: path -> [[code firstlineno, line]]."""
+        if self.exec_phase is None:
+            try:
+                self.exec_phase = json.load(open(os.path.join(MAPS, "execphase.json")))
+            except (OSError, ValueError):
+                self.exec_phase = {}
+            try:
+                # name -> [[path, first line, last line]]: the code of the phase that mentions it
+                self.exec_names = json.load(open(os.path.join(MAPS, "execnames.json")))["where"]
+            except (OSError, ValueError, KeyError, TypeError):
+                self.exec_names = None
+            try:
+                read = json.load(open(os.path.join(MAPS, "execattrs.json")))["read"]
+                self.exec_attrs = {name: index for index, name in enumerate(read)}
+            except (OSError, ValueError, KeyError, TypeError):
+                self.exec_attrs = None
+            # Every line of the phase has a number (its place in the file), and so
+            # has every attribute it reads: the record of a single query is a
+            # pair of bit masks over the two (maps/execqueries.bin).
+            self.exec_rows = {}
+            number = 0
+            for path, rows in self.exec_phase.items():
+                for first, line in rows:
+                    self.exec_rows.setdefault((path, first), []).append((line, number))
+                    number += 1
+            self.exec_queries = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
+        return self.exec_phase
+
+    def lines_naming(self, name: str) -> int:
+        """Bit mask of the phase lines inside the code that mentions `name`."""
+        mask = 0
+        for path, start, end in self.exec_names.get(name, ()):
+            for (row_path, _first), rows in self.exec_rows.items():
+                if row_path == path:
+                    for line, number in rows:
+                        if start <= line <= end:
+                            mask |= 1 << number
+        return mask
+
+    def phase_lines(self, units: dict) -> int:
+        """Bit mask of the phase lines that belong to the changed code in `units`
+        (path -> [(code firstlineno, lines or None)])."""
+        mask = 0
+        for path, entries in units.items():
+            for first, lines in entries:
+                for line, number in self.exec_rows.get((path, first), ()):
+                    if lines is None or line in lines:
+                        mask |= 1 << number
+        return mask
+
     def executor_memo_ok(self, job: Job) -> bool:
-        """True when recorded executor results may stand in for unchanged TPC queries:
-        the patch changes nothing that runs between the optimized form of a query and its result."""
+        """True when recorded executor results may stand in for unchanged TPC queries.
+
+        For all of them when the patch changes nothing that runs between the
+        optimized form of a query and its result, and nothing that code reads.
+        Otherwise `job.memo_block` names what it does change there (phase
+        lines, attributes the phase reads), and a query keeps its recorded
+        result when its own record touches none of that.
+        """
         if job.memo_ok is None:
             job.memo_ok = False
-            # Not for a patched module that is imported on demand: its class and
-            # module bodies are not lines the recorded phase could have executed,
-            # yet what they define can be read there.
-            if self.memo_cost and not job.plan.lazy and self.executor_setup_untouched(job):
-                if self.exec_phase is None:
-                    try:
-                        self.exec_phase = json.load(open(os.path.join(MAPS, "execphase.json")))
-                    except (OSError, ValueError):
-                        self.exec_phase = {}
-                job.memo_ok = bool(self.exec_phase) and not self.touches(job.plan, self.exec_phase)
+            job.memo_block = (0, 0)
+            job.memo_share = {}
+            # A patched module that is imported on demand is imported from its
+            # new source when a test first asks for it. That leaves the state
+            # the pinned module would leave only when nothing the patch
+            # changed runs during an import: function bodies alone, none of
+            # them called while sqlglot is imported.
+            lazy_ok = not job.plan.lazy or (job.plan.sliceable and job.plan.import_units == 0)
+            if self.memo_cost and lazy_ok and self.executor_phase():
+                if job.mode == "hot":
+                    # Only function bodies changed: the state sqlglot builds at import is the pinned one.
+                    block = (self.phase_lines(job.plan.units), 0) if self.executor_setup_untouched(job) else None
+                else:
+                    block = self.import_seen_by_executor(job)
+                if block is not None and (block == (0, 0) or self.exec_queries):
+                    job.memo_ok = True
+                    job.memo_block = block
         return job.memo_ok
+
+    def memo_share(self, job: Job, bit: int) -> float:
+        """The share of a test's recorded queries that the patch touches (they are executed in full)."""
+        rows, reads = job.memo_block
+        if not rows and not reads:
+            return 0.0
+        scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
+        if scope not in job.memo_share:
+            mine = [entry for key, entry in self.exec_queries.items() if key.startswith(f"{scope}:")]
+            touched = sum(1 for own_rows, own_reads in mine if own_rows & rows or own_reads & reads)
+            job.memo_share[scope] = touched / len(mine) if mine else 1.0
+            if mine:
+                job.plan.note(f"the patch concerns the execution of {touched} of {len(mine)} recorded {scope} queries")
+        return job.memo_share[scope]
+
+    def clean_memo_possible(self, job: Job) -> bool:
+        """Whether a patch that needs a clean import could still reuse recorded executor results,
+        as far as can be told before its import state is compared."""
+        plan = job.plan
+        if job.mode != "clean" or not self.memo_cost or not plan.sliceable or not plan.probe_ok:
+            return False
+        if not self.executor_phase() or self.exec_names is None:
+            return False
+        for patch in plan.files:
+            # Every patched file exists before and after, under the same name.
+            # Code that runs at import is sqlglot's own (probe_ok): only that is
+            # what the comparison of import state covers. What the tests and
+            # their data hand to `execute` needs no assumption, it is checked
+            # where the recorded result would be used (the query's tree, the
+            # tables' content).
+            if patch.unapplied or patch.old_text is None or patch.new_text is None:
+                return False
+            if patch.old_path not in (None, patch.path):
+                return False
+        return bool(self.exec_queries) or not self.phase_lines(plan.units)
+
+    def import_seen_by_executor(self, job: Job) -> tuple[int, int] | None:
+        """After a clean import: what of the patch the executor phase can see, as
+        (bit mask of phase lines, bit mask of attributes the phase reads); (0, 0)
+        when it can see nothing; None when that cannot be told.
+
+        The comparison of import state (selector/state.py) lists every module
+        or class attribute that differs. Reusing a recorded result is right
+        when the code that produced it would run the same way here, so each
+        difference must be out of that code's sight, or be pinned down to the
+        lines and attributes through which it can be seen:
+
+        - a function with other code, defaults or closure is seen by running
+          it: through its lines among those the recorded phase executed;
+        - a plain data attribute of a class with another value is seen by
+          reading it, through the class, a subclass or an instance: through
+          that attribute, if the recorded phase read it (maps/execattrs.json,
+          taken with a descriptor in the attribute's place);
+        - any other constant (a name in capitals) with another value is seen
+          by reading the name: through the lines of the code that mentions it
+          (maps/execnames.json, by the same rule as the reader map);
+        - anything else (attributes added or removed, other bases, anything on
+          the classes the recorded results are made of) cannot be pinned down.
+        """
+        result = job.state
+        if result is None or not self.clean_memo_possible(job):
+            return None
+        if result.get("inconclusive") or result.get("widen") or result.get("failed"):
+            return None
+        known = self.covmap._pack("treaders.bin") or {}
+        rows = self.phase_lines(job.plan.units)
+        reads = 0
+        for kind, module, qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
+            where = f"{module}:{qualname}.{attribute}" if qualname else f"{module}.{attribute}"
+            if module == "sqlglot.executor.table" and reason not in ("function-meta", "function-code"):
+                # What the recorded results are made of.
+                job.plan.note(f"no recorded results: {where} differs")
+                return None
+            if reason in ("function-meta", "function-code") and path:
+                if self.covmap.is_loader(path, first):
+                    job.plan.note(f"no recorded results: {where} imports on demand")
+                    return None
+                rows |= self.phase_lines({path: [(first, None)]})
+                continue
+            if (
+                kind == "class"
+                and reason in ("value", "removed")
+                and self.exec_attrs is not None
+                and state.PINNED is not None
+                and state.watchable_pair(state.PINNED[2], module, qualname, attribute)
+            ):
+                # Another value, or gone: either way only a read of it can tell.
+                number = self.exec_attrs.get(f"{module}:{qualname}|{attribute}")
+                if number is not None:
+                    reads |= 1 << number
+                continue
+            if reason != "value":
+                job.plan.note(f"no recorded results: {where} {reason}")
+                return None
+            if attribute in known and attribute.isupper():
+                # Read by name: seen by the queries that run code mentioning it.
+                rows |= self.lines_naming(attribute)
+                continue
+            job.plan.note(f"no recorded results: {where} may be read by the executor")
+            return None
+        return rows, reads
+
+    def executor_record(self) -> bool:
+        """Build the pinned executor tables and load the recorded results, once. False when that fails."""
+        if runner.EXECUTOR_TABLES is None:
+            if self.record_failed:
+                return False
+            try:
+                runner.build_executor_tables()
+                runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
+                runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
+                runner.EXECUTOR_QUERIES = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
+                gc.freeze()
+            except Exception as error:
+                log(f"could not prebuild the executor tables: {error!r}")
+                self.record_failed = True
+                return False
+        return True
 
     def worst_cost(self, job: Job, bit: int) -> float:
         """The same when no recorded executor result can be reused (every query changed)."""
@@ -623,10 +819,22 @@ class Coordinator:
             return self.fast_cost[bit]
         return self.bit_cost[bit]
 
+    def changed_cost(self, job: Job, bit: int) -> float:
+        """What the test is expected to cost when the change is real and every query has to be executed."""
+        if bit in self.fast_cost and self.executor_setup_untouched(job):
+            return self.fast_cost[bit]
+        if bit in self.answer_cost and self.duckdb_answers_expected(job):
+            return self.answer_cost[bit]
+        return self.bit_cost[bit]
+
     def full_cost(self, job: Job, bit: int) -> float:
         """What the whole test costs to run for this commit, in recorded seconds of a plain test."""
         if bit in self.memo_cost and self.executor_memo_ok(job):
-            return self.memo_cost[bit]
+            share = self.memo_share(job, bit)
+            if not share:
+                return self.memo_cost[bit]
+            # The queries the patch touches are executed in full.
+            return self.memo_cost[bit] + share * max(0.0, self.changed_cost(job, bit) - self.memo_cost[bit])
         if bit in self.fast_cost and self.executor_setup_untouched(job):
             return self.fast_cost[bit]
         if bit in self.answer_cost and self.duckdb_answers_expected(job):
@@ -668,16 +876,9 @@ class Coordinator:
             return False
         if not self.executor_setup_untouched(job):
             return False
-        if runner.EXECUTOR_TABLES is None:
-            try:
-                runner.build_executor_tables()
-                runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
-                runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
-                gc.freeze()
-            except Exception as error:
-                log(f"could not prebuild the executor tables: {error!r}")
-                self.setup_map[EXECUTOR_CLASS] = None
-                return False
+        if not self.executor_record():
+            self.setup_map[EXECUTOR_CLASS] = None
+            return False
         return True
 
     def wants_probe(self, job: Job) -> bool:
@@ -694,6 +895,12 @@ class Coordinator:
             # Tests were left out as unable to see the change to a class or
             # module body. That is only true if the module still imports, and
             # importing it is what the comparison does first.
+            return True
+        if self.clean_memo_possible(job) and any(
+            bit in self.memo_cost and self.bit_cost[bit] - self.memo_cost[bit] > 4.0 * PROBE_COST
+            for bit in job.candidates
+        ):
+            # The comparison also tells whether recorded executor results may be reused.
             return True
         bits = job.candidates
         checking = self.machine * (self.overhead(job, bits) + sum(job.estimates[bit] for bit in bits))
@@ -775,6 +982,7 @@ class Coordinator:
         for path, first, lines in plan.warm_units:
             narrowed |= self.covmap.test_time(path, first, lines)
         before = plan.candidates.bit_count()
+        job.state = result
         plan.candidates = plan.rest_candidates | narrowed
         plan.import_check = 0
         plan.note(
@@ -799,6 +1007,7 @@ class Coordinator:
         job.followers = {}
         job.estimates = {}
         job.slices = {}
+        job.memo_ok = None  # what the comparison found decides it
         job.candidates = self.followers(plan, bits, job)
         self.estimate(plan, job.candidates, job)
         job.estimate = sum(job.estimates.values())
@@ -830,8 +1039,9 @@ class Coordinator:
             "cases": self.case_filter(job, tests),
             "imports": job.import_files if job.mode == "clean" else [],
             "executor_tables": self.executor_tables(job, tests),
-            "executor_memo": self.executor_memo_ok(job),
+            "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
+        spec["memo_block"] = job.memo_block if spec["executor_memo"] and job.memo_block != (0, 0) else None
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
         spec["lazy"] = plan.lazy if job.mode == "hot" else []
@@ -879,9 +1089,17 @@ class Coordinator:
 
         Well above what the whole test normally costs (with no recorded result
         reused): a patch that makes a test crawl would otherwise be paid for in
-        CPU time until the wall-clock limit.
+        CPU time until the wall-clock limit. And not far above what giving up
+        costs: a test that is stopped is selected, which adds at most its
+        recorded seconds (plus a worker when nothing else is selected), so
+        burning much more CPU than that on it cannot pay. The test always
+        gets what it needs at full price, with room to spare.
         """
-        return max(4.0, 2.2 * self.worst_cost(job, bit) * max(self.machine, 1.0) + 2.0)
+        scale = max(self.machine, 1.0)
+        generous = max(4.0, 2.2 * self.worst_cost(job, bit) * scale + 2.0)
+        giving_up = self.bit_seconds[bit] + (0.0 if job.blind or job.failed else 2.0)
+        needed = 1.6 * self.bit_cost[bit] * scale + 0.5
+        return min(generous, max(1.5, giving_up, needed))
 
     def feed(self, run: Run, data: bytes, now: float) -> None:
         run.buffer += data
@@ -919,6 +1137,16 @@ class Coordinator:
                     run.job.failed.add(bit)
                     if not run.job.replanned and self.replan(run):
                         return
+            elif kind == b"C":
+                # The class teardown raised. pytest holds that against the test
+                # of the class it ran last, which is the last one it collected,
+                # whether or not that test was run here.
+                name = self.bit_class[int(line[2:])]
+                members = [
+                    bit for bit, other in enumerate(self.bit_class) if other == name and self.bit_number[bit] >= 0
+                ]
+                if members:
+                    run.job.failed.add(max(members, key=self.bit_number.__getitem__))
             elif kind == b"E":
                 try:
                     run.state = json.loads(line[2:])
@@ -981,6 +1209,7 @@ class Coordinator:
             log(f"{job.plan.commit}: child failed in {job.mode} mode: {run.fatal}")
             if job.mode == "hot":
                 job.mode = "clean"
+                job.memo_ok = job.setup_untouched = None
                 job.pending = left
                 self.queue.insert(0, job)
             else:
@@ -993,6 +1222,15 @@ class Coordinator:
         if run.current is not None and run.current in left:
             job.failed.add(run.current)
             left.remove(run.current)
+            if not job.replanned and left:
+                # A test that had to be stopped counts as a failure: the change is
+                # real, and what is left is weighed again as after any first failure.
+                job.replanned = True
+                _, blind = self.weigh(left, job.estimates, list(job.blind | job.failed), PASS_LIVE)
+                if blind:
+                    job.blind.update(blind)
+                    dropped = set(blind)
+                    left = [bit for bit in left if bit not in dropped]
         elif not run.done:
             job.strikes += 1
         if not left:
@@ -1007,7 +1245,7 @@ class Coordinator:
     def loop(self) -> None:
         while self.queue or self.running:
             now = time.monotonic()
-            if now - self.start > HARD_DEADLINE:
+            if now - self.start > self.deadline:
                 log("deadline reached: selecting everything still unchecked")
                 for fd in list(self.running):
                     run = self.running.pop(fd)
@@ -1022,7 +1260,7 @@ class Coordinator:
                     self.finish_job(job, job.pending)
                 self.queue = []
                 return
-            limit = 1 if now - self.start < SEQUENTIAL_UNTIL else MAX_PARALLEL
+            limit = 1 if now - self.start < self.sequential_until else MAX_PARALLEL
             while self.queue and len(self.running) < limit:
                 job = self.queue.pop(0)
                 if not job.decided and self.wants_probe(job):
@@ -1081,6 +1319,11 @@ class Coordinator:
     def run(self) -> dict[str, list[int]]:
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         commits = [os.path.basename(path)[: -len(".patch")] for path in patches]
+        if "BR_DEADLINE" not in os.environ and len(commits) > PRACTICE_COMMITS:
+            # A larger batch is given more time in proportion (270 s for 60 commits).
+            scale = min(len(commits) / PRACTICE_COMMITS, LONGEST_DEADLINE / HARD_DEADLINE)
+            self.deadline = HARD_DEADLINE * scale
+            self.sequential_until = SEQUENTIAL_UNTIL * scale
         loaded = {os.path.join(ROOT, path) for path in self.covmap.warm_files()}
         plans = []
         for commit, path in zip(commits, patches):
