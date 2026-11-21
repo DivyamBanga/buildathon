@@ -7,14 +7,14 @@ test_execute_tpch and test_execute_tpcds send every TPC query through
 `sqlglot.executor.execute`: optimize, plan, run the plan. Two things are
 recorded at the pinned commit:
 
-  execmemo.bin    optimized query (hash of its serialized tree) -> the result table
+  execmemo.bin    (names of the tables, digest of the optimized query's tree) -> the result table
   execphase.json  every line `execute` runs outside the optimizer: preparing
-                  the tables it was given, planning, running the plan, and
-                  computing the key
+                  the tables it was given, planning and running the plan
 
 The selector reuses a recorded result only for a patch that changes none of
 the lines in execphase.json, and only for a query whose optimized form is
-exactly the recorded one. Then nothing that decides the result has changed.
+exactly the recorded one, run on tables that hold exactly the pinned data.
+Then nothing that decides the result has changed.
 """
 import json
 import os
@@ -38,6 +38,9 @@ tracer = sys.modules.get("sitecustomize")
 runner.MEMO_RECORD = record_dir
 if trace_dir and hasattr(tracer, "_phase"):
     runner.MEMO_PHASE = tracer._phase
+# The key of a result names the tables it was computed on: only tables holding
+# exactly what these hold are recognised.
+runner.build_executor_tables()
 runner.install_executor_memo()
 
 ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in runner.MEMO_TESTS]
