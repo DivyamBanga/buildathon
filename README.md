@@ -198,13 +198,16 @@ the patched code**, and selects the ones that fail.
      as well, since a class body reads its own namespace and then the module's.
    - *Reads with no name in the source*, kept visible by shape or by name:
      dunders (`__reduce__`, `__deepcopy__`, `__len__`: Python looks them up);
-     names ending in `_sql` (the generators and the simplifier build their
-     dispatch with `dir()` over the class, `getattr(self, key + "_sql")`);
+     names ending in `_sql` whose stem can be an expression key (the generators
+     and the simplifier build their dispatch with `dir()` over the class,
+     `getattr(self, key + "_sql")`; a key is the lower-cased name of a class
+     defined anywhere in the tree, so the stem is checked against `classes` and
+     the lower-cased `named`; a stem that is none of those is no key);
      classes that register themselves or are found by walking a namespace (any
      class defined in the module with a base from the package or a metaclass:
      `subclasses()` over `sqlglot.expressions`, `Dialect._try_load` over a
-     dialect module, serde's class lookup, the dialect registry, a new `Dialects`
-     member); a module no other namespace binds (importing it has effects);
+     dialect module (also any class bound there, whoever defined it), serde's
+     class lookup, the dialect registry, a new `Dialects` member); a module no other namespace binds (importing it has effects);
      every attribute of a class with a base from outside the package (an
      enum, an exception, a `dict` subclass: their own machinery reads names);
      and the enum classes, classes made inside functions and any class the map
@@ -216,6 +219,18 @@ the patched code**, and selects the ones that fail.
      executor reads attributes of a `datetime`).
    - A function that a changed function calls is reached through the changed
      function's own candidates; an unused one is not reached at all.
+
+   Two maps decide, each for what it knows. `maps/names.json` answers for names
+   at module level, for names nobody defines yet on the class (a new method, a
+   new constant) and for the places that build names (above). When a class
+   attribute is removed, or added under a name an ancestor defines, the name is
+   read, and `maps/areaders.bin` answers (`CovMap.moved_readers`): for a removal
+   the tests that read that (class, attribute) pair, for an addition the tests
+   that read the same name on any ancestor that holds it, narrowed to the tests
+   that can reach the class; a pair the map does not cover (a function, a
+   property, a dunder) is not answered and keeps the rule that applied before.
+   An all-capitals name that is added or removed is seen by the tests that run a
+   line reading that name (`treaders.bin`), as a changed value of it would be.
 
    Anything the map cannot show is unread stays as before (every test that
    imports the module, or every test that can reach the class). Docstring
