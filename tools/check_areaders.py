@@ -37,7 +37,14 @@ index = {test_id: bit for bit, test_id in enumerate(ids)}
 
 
 def as_bits(failing):
-    return {index[item] if isinstance(item, str) else item for item in failing}
+    bits = set()
+    for item in failing:
+        if isinstance(item, str) and item.startswith("COLLECT::"):
+            # a test file that does not import: every test in it fails
+            bits.update(bit for test_id, bit in index.items() if test_id.startswith(item[9:] + "::"))
+        else:
+            bits.add(index[item] if isinstance(item, str) else item)
+    return bits
 
 
 truth = {}
@@ -105,7 +112,7 @@ bad = []
 names = sorted(name[:-6] for name in os.listdir(patches) if name.endswith(".patch"))[first:last]
 with open(output, "w") as log:
     for sequence, commit in enumerate(names):
-        text = open(os.path.join(patches, commit + ".patch"), encoding="utf-8", newline="").read()
+        text = open(os.path.join(patches, commit + ".patch"), encoding="utf-8", errors="surrogateescape", newline="").read()
         try:
             plan = analyze(commit, text, new_map, ROOT, warm)
         except Exception as error:  # noqa: BLE001
