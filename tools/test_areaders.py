@@ -107,4 +107,34 @@ with tempfile.TemporaryDirectory() as directory:
     build(directory, with_areaders=False)
     expect("no map", CovMap(directory).state_candidates(result(row("class", "sqlglot.a", "C", "FLAG", "value"))), ALL)
 
+def supplementary_run():
+    import marshal
+    import build_areaders
+
+    with tempfile.TemporaryDirectory() as directory:
+        maps = os.path.join(directory, "maps")
+        os.makedirs(maps)
+        json.dump(["t.py::A::a", "t.py::A::b", "t.py::A::c"], open(os.path.join(maps, "tests.json"), "w"))
+
+        def run(name, rows):
+            path = os.path.join(directory, name)
+            os.makedirs(path)
+            json.dump({"pairs": ["m:C|X"]}, open(os.path.join(path, "pairs.json"), "w"))
+            with open(os.path.join(path, "results.jsonl"), "w") as handle:
+                for number, ok, pairs in rows:
+                    handle.write(json.dumps({"n": number, "ok": ok, "pairs": pairs}) + "\n")
+            return path
+
+        full = run("full", [(0, True, []), (1, True, []), (2, True, [])])
+        more = run("more", [(1, True, ["m:C|X"])])
+        build_areaders.main([maps, full, "+" + more])
+        table = marshal.loads(zlib.decompress(open(os.path.join(maps, "areaders.bin"), "rb").read()))
+        expect("a supplementary run adds its reads; tests it lacks keep theirs", table["m:C|X"], bytes([2]))
+        bad = run("bad", [(0, False, [])])
+        build_areaders.main([maps, full, "+" + bad])
+        table = marshal.loads(zlib.decompress(open(os.path.join(maps, "areaders.bin"), "rb").read()))
+        expect("a test that failed in it reads everything", table["m:C|X"], bytes([1]))
+
+
+supplementary_run()
 print(f"{checks} checks passed")

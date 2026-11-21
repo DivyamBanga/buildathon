@@ -1,6 +1,6 @@
 """Pack the class-attribute read traces into maps/areaders.bin.
 
-    python build_areaders.py <maps dir> <run dir> [<run dir> ...]
+    python build_areaders.py <maps dir> <run dir> [<run dir> ...] [+<supplementary run dir> ...]
 
 Each run dir is the output of tools/trace_attrs.py (the full suite, one per
 hash seed; the readers of a pair are the union over the runs).
@@ -39,7 +39,8 @@ def load(run_dir):
 
 def main(argv):
     maps_dir = argv[0]
-    runs = argv[1:]
+    runs = [arg for arg in argv[1:] if not arg.startswith("+")]
+    extras = [arg[1:] for arg in argv[1:] if arg.startswith("+")]
     ids = json.load(open(os.path.join(maps_dir, "tests.json"), encoding="utf-8"))
     width = (len(ids) + 7) // 8
     bits = {}
@@ -58,6 +59,18 @@ def main(argv):
                 continue
             for pair in row["pairs"]:
                 bits[pair] |= 1 << number
+    for run_dir in extras:
+        # A supplementary run of some tests only: its reads are added, a test it
+        # does not hold keeps what the full runs say, a test that failed in it
+        # reads everything.
+        rows, pairs = load(run_dir)
+        for number, row in rows.items():
+            if not row["ok"]:
+                everyone |= 1 << number
+                continue
+            for pair in row["pairs"]:
+                if pair in bits:
+                    bits[pair] |= 1 << number
     table = {pair: (bitmap | everyone).to_bytes(width, "little") if bitmap | everyone else b"" for pair, bitmap in bits.items()}
     blob = zlib.compress(marshal.dumps(table), 9)
     with open(os.path.join(maps_dir, "areaders.bin"), "wb") as handle:

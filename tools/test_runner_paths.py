@@ -143,6 +143,35 @@ def on_demand_broken():
         check(True, "")
 
 
-for part in (redirects, resolved_paths, on_demand, on_demand_broken):
+def subtest_messages():
+    # pytest formats a subtest message with str(); a message that cannot be
+    # formatted fails the test there, so it must fail here.
+    import unittest
+
+    class Bad:
+        def __str__(self):
+            raise TypeError("not formattable")
+
+    class Cases(unittest.TestCase):
+        def test_bad(self):
+            with self.subTest(Bad(), x=Bad()):
+                pass
+
+        def test_good(self):
+            with self.subTest("fine", x=Bad()):
+                pass
+
+    lines = []
+    cases = []
+    for number, name in enumerate(("test_bad", "test_good")):
+        case = Cases(name)
+        case._br_index = number
+        cases.append(case)
+    unittest.TestSuite(cases).run(runner._Result(lines.append))
+    check("R 0 1\n" in lines, "a subtest message that str() cannot format fails the test")
+    check("R 1 0\n" in lines, "a parameter that repr() cannot format does not")
+
+
+for part in (redirects, resolved_paths, on_demand, on_demand_broken, subtest_messages):
     in_child(part)
 print(f"{checks} checks passed")

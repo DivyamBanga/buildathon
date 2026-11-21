@@ -304,6 +304,7 @@ def main() -> None:
     parser.add_argument("--last", type=int, default=1 << 30)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--no-wrap", action="store_true", help="baseline: same runs, nothing replaced")
+    parser.add_argument("--only", default="", help="numbers of the only tests to run (a supplementary run, see build_areaders +DIR)")
     parser.add_argument("--warm", default="", help="numbers of tests to run first in the same process")
     arguments = parser.parse_args()
     arguments.out = os.path.abspath(arguments.out)
@@ -331,6 +332,8 @@ def main() -> None:
     if os.path.exists(results_path):
         done = {json.loads(line)["n"] for line in open(results_path)}
     numbers = range(arguments.first, min(arguments.last, len(ids)))
+    if arguments.only:
+        numbers = [int(part) for part in arguments.only.split(",") if part]
     warm = [int(part) for part in arguments.warm.split(",") if part]
     with open(results_path, "a") as log:
         for number in numbers:

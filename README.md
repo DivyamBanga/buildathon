@@ -111,6 +111,10 @@ the patched code**, and selects the ones that fail.
      the pairs it covers; added and removed attributes, functions, enum
      members, anything with a `__get__` and any class the tracer could not
      name by module and qualified name stay with the rules below.
+     The runner formats a subtest's message with `str()` and its parameters
+     with `repr()` after each subtest, as pytest does when it reports one, so
+     that the reads on that path are traced and a message that fails to format
+     fails the test in a child too.
    - A constant with a new value is noticed only by reading it: the tests that
      can reach the module or class and execute a line reading that name.
    - Anything else on a class: the tests that can reach the class, as above.
