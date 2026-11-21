@@ -50,6 +50,10 @@ PASS_QUIET = float(os.environ.get("BR_PASS_QUIET", "0.9"))
 PASS_LIVE = float(os.environ.get("BR_PASS_LIVE", "0.5"))
 # Tests cheaper than this to check are weighed together, not one by one.
 CHEAP = 0.5
+# A check dearer than PROBE_ABOVE seconds is preceded by cheap probes worth up
+# to PROBE_SHARE of its cost.
+PROBE_ABOVE = 3.0
+PROBE_SHARE = 0.15
 SETUP_ALLOWANCE = 40.0
 VERBOSE = os.environ.get("BR_VERBOSE", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
@@ -59,6 +63,28 @@ EXECUTOR_CLASS = "tests/test_executor.py::TestExecutor"
 
 def log(*parts) -> None:
     print(*parts, file=sys.stderr, flush=True)
+
+
+_TICKS = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+
+
+def tree_cpu(pid: int) -> float:
+    """CPU seconds used so far by a process, its live descendants and the ones they reaped."""
+    total = 0.0
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        try:
+            with open(f"/proc/{current}/stat", "rb") as handle:
+                data = handle.read()
+            # Fields after the command name: state, ppid, ..., utime, stime, cutime, cstime.
+            fields = data[data.rindex(b")") + 2:].split()
+            total += (int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])) / _TICKS
+            with open(f"/proc/{current}/task/{current}/children", "rb") as handle:
+                pending.extend(int(child) for child in handle.read().split())
+        except (OSError, ValueError, IndexError):
+            pass
+    return total
 
 
 class Job:
@@ -101,6 +127,8 @@ class Run:
         self.started = now
         self.stopped = False  # the coordinator chose to end it
         self.overlay = ""
+        self.current_cpu = 0.0  # CPU the child's process tree had used when the current test began
+        self.cpu_checked = now
 
 
 class Coordinator:
@@ -120,6 +148,9 @@ class Coordinator:
         # seconds stand in for a test that was never measured.
         self.bit_cost = list(self.bit_seconds)
         self.class_setup: dict[str, float] = {}
+        # The executor tests' costs when their class setup is reused (see runner).
+        self.fast_cost: dict[int, float] = {}
+        self.fast_setup: dict[str, float] = {}
         try:
             runcost = json.load(open(os.path.join(MAPS, "runcost.json")))
             measured = runcost["tests"][: len(self.bit_cost)]
@@ -135,6 +166,9 @@ class Coordinator:
                 if value is not None:
                     self.bit_cost[bit] = value * scale
             self.class_setup = {name: value * scale for name, value in runcost.get("setup", {}).items()}
+            fast = runcost.get("fast", {})
+            self.fast_cost = {int(bit): value * scale for bit, value in fast.get("tests", {}).items()}
+            self.fast_setup = {name: value * scale for name, value in fast.get("setup", {}).items()}
         except (OSError, ValueError, KeyError, ZeroDivisionError):
             pass
         # CPU seconds this machine needs per recorded second of a plain test. It
@@ -197,11 +231,26 @@ class Coordinator:
                 dropped.update(job.followers[lead])
         return [bit for bit in bits if bit not in dropped]
 
+    def units_of(self, plan: Plan, bit: int) -> dict:
+        """The changed code this one test executes (by the whole-test map)."""
+        mask = 1 << bit
+        mine: dict = {}
+        for path, entries in plan.units.items():
+            for first, lines in entries:
+                if lines is None:
+                    ran = self.covmap.code_any(path, first)
+                else:
+                    ran = self.covmap.code_lines(path, first, lines)
+                if ran & mask:
+                    mine.setdefault(path, []).append((first, lines))
+        return mine
+
     def estimate(self, plan: Plan, bits: list[int], job: Job) -> None:
         """What checking each candidate should cost, and which fixture cases it needs."""
         changed = self.changed_fixtures(plan)
         for bit in bits:
             share = 1.0
+            mine = self.units_of(plan, bit) if plan.units else {}
             if plan.sliceable:
                 shares = []
                 # Only .sql fixtures hold cases; the other files a test opens are plain data.
@@ -212,8 +261,9 @@ class Coordinator:
                         if not self.covmap.case_independent(bit, fixture):
                             shares.append(1.0)
                         continue
-                    # With no code change, only the cases the patch edits can differ.
-                    keep = self.covmap.case_slice(bit, fixture, plan.units) if plan.units else set()
+                    # When the test runs none of the changed code, only the cases
+                    # the patch edits can differ.
+                    keep = self.covmap.case_slice(bit, fixture, mine) if mine else set()
                     if keep is None:
                         shares.append(1.0)
                         continue
@@ -225,8 +275,11 @@ class Coordinator:
                     shares.append(min(1.0, part))
                 if shares:
                     share = max(0.03, max(shares))
-            # In seconds of the machine runcost.json was measured on.
-            job.estimates[bit] = self.bit_cost[bit] * share
+            cost = self.bit_cost[bit]
+            if bit in self.fast_cost and self.executor_setup_untouched(job):
+                cost = self.fast_cost[bit]
+            # In recorded seconds of a plain test; `self.machine` turns it into CPU here.
+            job.estimates[bit] = cost * share
 
     def weigh(self, bits: list[int], estimates: dict, chosen: list[int], passing: float):
         """Split `bits` into (worth checking, selected unchecked), given `chosen` is selected anyway.
@@ -274,7 +327,9 @@ class Coordinator:
         totals: dict[str, float] = {}
         for bit in bits:
             totals[self.bit_class[bit]] = totals.get(self.bit_class[bit], 0.0) + estimates[bit]
-        return sorted(bits, key=lambda bit: (totals[self.bit_class[bit]], self.bit_class[bit], bit))
+        return sorted(
+            bits, key=lambda bit: (totals[self.bit_class[bit]], self.bit_class[bit], estimates[bit], bit)
+        )
 
     def plan_commit(self, plan: Plan) -> None:
         if plan.select_all:
@@ -306,7 +361,7 @@ class Coordinator:
         setup = 0.0
         for name in classes:
             if name == EXECUTOR_CLASS and self.executor_setup_untouched(job):
-                setup += 0.15  # its tables come ready-made
+                setup += self.fast_setup.get(name, 0.15)  # its tables come ready-made
             else:
                 setup += self.class_setup.get(name, 0.0)
         return setup + (0.45 if job.mode == "clean" else 0.05)
@@ -328,6 +383,23 @@ class Coordinator:
                 return True
             self.finish(plan, job.everything)
             return False
+        # Before paying for an expensive check, find out cheaply whether the change
+        # is real: run a few of the cheapest tests that were going to be selected
+        # anyway. If one fails, the expensive tests are weighed again as likely to fail.
+        costly = sum(job.estimates[bit] for bit in check if job.estimates[bit] * self.machine > PROBE_ABOVE)
+        if costly and blind:
+            budget = max(0.5 / self.machine, PROBE_SHARE * costly)
+            probes = []
+            for bit in sorted(blind, key=lambda bit: (job.estimates[bit], bit)):
+                if job.estimates[bit] > budget:
+                    break
+                budget -= job.estimates[bit]
+                probes.append(bit)
+            if probes:
+                moved = set(probes)
+                blind = [bit for bit in blind if bit not in moved]
+                check = check + probes
+                plan.note(f"{len(probes)} cheap tests run first as probes")
         plan.note(f"checking {len(check)} (~{total:.1f}s), {len(blind)} selected unchecked")
         job.pending = self.order(check, job.estimates)
         job.blind = set(blind)
@@ -457,6 +529,7 @@ class Coordinator:
         if runner.EXECUTOR_TABLES is None:
             try:
                 runner.build_executor_tables()
+                runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
                 gc.freeze()
             except Exception as error:
                 log(f"could not prebuild the executor tables: {error!r}")
@@ -518,7 +591,19 @@ class Coordinator:
                 pass
 
     def allowance(self, bit: int) -> float:
+        """Wall-clock seconds a test may take before it counts as hung."""
         return max(4.0, 8.0 * self.bit_seconds[bit] + 3.0)
+
+    def cpu_allowance(self, job: Job, bit: int) -> float:
+        """CPU seconds a test may burn before it counts as failing.
+
+        Twice what the whole test normally costs: a patch that makes a test
+        crawl would otherwise be paid for in CPU time until the wall-clock limit.
+        """
+        cost = self.bit_cost[bit]
+        if bit in self.fast_cost and self.executor_setup_untouched(job):
+            cost = self.fast_cost[bit]
+        return max(3.0, 2.0 * cost * max(self.machine, 1.0) + 1.0)
 
     def feed(self, run: Run, data: bytes, now: float) -> None:
         run.buffer += data
@@ -528,6 +613,8 @@ class Coordinator:
             if kind == b"S":
                 run.current = int(line[2:])
                 run.current_started = now
+                run.current_cpu = tree_cpu(run.pid)
+                run.cpu_checked = now
                 run.job.import_files = []
             elif kind == b"B":
                 # A test file that can no longer be imported: all its tests fail.
@@ -663,7 +750,12 @@ class Coordinator:
                     run.job.timeouts = 99
                     self.close(fd)
                 elif run.current is not None:
-                    if now - run.current_started > self.allowance(run.current):
+                    over = now - run.current_started > self.allowance(run.current)
+                    if not over and now - run.cpu_checked > 0.25:
+                        run.cpu_checked = now
+                        used = tree_cpu(run.pid) - run.current_cpu
+                        over = used > self.cpu_allowance(run.job, run.current)
+                    if over:
                         log(f"{run.job.plan.commit}: {self.covmap.ids[run.current]} timed out")
                         run.job.timeouts += 1
                         self.close(fd)

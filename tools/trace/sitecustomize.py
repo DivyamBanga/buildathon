@@ -35,9 +35,14 @@ if _DIR:
             _seen.append((filename, code.co_firstlineno, line))
         return _DISABLE
 
+    _CLASSES = bool(os.environ.get("BR_TRACE_CLASSES"))
+
     def _on_start(code, offset):
+        # Function starts are always monitored, even when nothing is recorded
+        # here: with line events alone, CPython 3.13 does not report the first
+        # line of a function, so a one-line lambda would never be seen running.
         # Only constructors stay monitored; `self` tells which class was built.
-        if code.co_name != "__init__" or not code.co_argcount:
+        if not _CLASSES or code.co_name != "__init__" or not code.co_argcount:
             return _DISABLE
         try:
             _classes.add(type(_getframe(1).f_locals[code.co_varnames[0]]))
@@ -110,13 +115,13 @@ if _DIR:
             for entry in rows:
                 handle.write(entry + "\n")
 
-    _events = _mon.events.LINE
+    _events = _mon.events.LINE | _mon.events.PY_START
     _mon.use_tool_id(_TOOL, "blast-radius-trace")
     _mon.register_callback(_TOOL, _mon.events.LINE, _on_line)
-    if os.environ.get("BR_TRACE_CLASSES"):
-        _mon.register_callback(_TOOL, _mon.events.PY_START, _on_start)
+    _mon.register_callback(_TOOL, _mon.events.PY_START, _on_start)
+    if _CLASSES:
         _mon.register_callback(_TOOL, _mon.events.CALL, _on_call)
-        _events |= _mon.events.PY_START | _mon.events.CALL
+        _events |= _mon.events.CALL
     _mon.set_events(_TOOL, _events)
     sys.addaudithook(_audit)
     atexit.register(_dump)

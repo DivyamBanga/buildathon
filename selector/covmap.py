@@ -323,9 +323,10 @@ class CovMap:
     def case_slice(self, bit: int, fixture: str, units: dict) -> set[int] | None:
         """The fixture cases through which the test can reach the changed code.
 
-        `units` maps a source path to [(code firstlineno, lines or None)].
-        None means every case: the test reaches the code even with no case, or
-        the per-case traces cannot account for how it reaches it.
+        `units` maps a source path to [(code firstlineno, lines or None)] and must
+        hold only code this test executes. None means every case: the test
+        reaches the code even with no case, or the per-case traces cannot
+        account for how it reaches some of it.
         """
         key = f"{bit}@{fixture}"
         if self.case_info(bit, fixture) is None:
@@ -340,11 +341,16 @@ class CovMap:
                 fixed = zero.get(first)
                 if fixed and (lines is None or not fixed.isdisjoint(lines)):
                     return None
+                seen = 0
                 table = cases.get(first)
                 if table:
                     for line, bitmap in table.items():
                         if lines is None or line in lines:
-                            wanted |= bitmap
+                            seen |= bitmap
+                if not seen:
+                    # The test runs this code, yet no single case accounts for it.
+                    return None
+                wanted |= seen
         if not wanted:
             return None
         return set(self.bits(wanted))

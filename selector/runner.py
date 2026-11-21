@@ -215,6 +215,65 @@ def _wrap_loader(kind: str, original, helpers):
 # The TPC-H and TPC-DS tables TestExecutor.setUpClass parses from CSV, built
 # once by the coordinator at the pinned commit (see build_executor_tables).
 EXECUTOR_TABLES = None
+# {"tpch_conn": {sql text: pickled DataFrame}, "tpcds_conn": {...}}: what DuckDB
+# answers for the queries the executor tests send it (maps/duckdb.bin).
+DUCKDB_ANSWERS = None
+
+
+def load_duckdb_answers(path: str) -> None:
+    global DUCKDB_ANSWERS
+    import pickle
+    import zlib
+
+    try:
+        with open(path, "rb") as handle:
+            DUCKDB_ANSWERS = pickle.loads(zlib.decompress(handle.read()))
+    except Exception:
+        DUCKDB_ANSWERS = None
+
+
+class _Answer:
+    """Stands in for a DuckDB result whose rows are already known."""
+
+    def __init__(self, connection, query: str, data: bytes) -> None:
+        self._connection = connection
+        self._query = query
+        self._data = data
+
+    def fetchdf(self):
+        import pickle
+
+        return pickle.loads(self._data)  # a fresh frame each time: callers rename columns in place
+
+    df = fetchdf
+
+    def __getattr__(self, name):
+        # Anything else is asked of DuckDB itself.
+        return getattr(self._connection.execute(self._query), name)
+
+
+class _AnsweringConnection:
+    """A DuckDB connection that does not recompute a query it has the answer to.
+
+    The executor tests check sqlglot's own executor against DuckDB running the
+    same query over the TPC tables. DuckDB's answer depends only on the exact
+    SQL text it is given, so it is looked up by that text; any other text (for
+    instance because the patch changed how the query is transpiled) is executed.
+    """
+
+    def __init__(self, connection, answers: dict) -> None:
+        self._connection = connection
+        self._answers = answers
+
+    def execute(self, query, *args, **kwargs):
+        if not args and not kwargs and type(query) is str:
+            data = self._answers.get(query)
+            if data is not None:
+                return _Answer(self._connection, query, data)
+        return self._connection.execute(query, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 class _NoConnection:
@@ -271,6 +330,10 @@ def _use_executor_tables() -> None:
             module.csv, module.Table, module.open_file = saved
         cls.tpch_tables = dict(tpch_tables)
         cls.tpcds_tables = dict(tpcds_tables)
+        if DUCKDB_ANSWERS:
+            for name, answers in DUCKDB_ANSWERS.items():
+                if name in cls.__dict__ and answers:
+                    setattr(cls, name, _AnsweringConnection(getattr(cls, name), answers))
 
     test_class.setUpClass = classmethod(setUpClass)
 

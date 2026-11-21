@@ -4,13 +4,14 @@
 
 Each test class runs in a child forked from a warm parent, exactly as the
 selector runs it, and the CPU time of the child and everything it starts is
-read around every test. The result weighs "run this test to find out" against
-"select it unchecked"; it never decides whether a test fails.
+read around every test. The executor tests are measured a second time the way
+they run when their class setup can be reused (prebuilt tables, recorded
+DuckDB answers). The result weighs "run this test to find out" against "select
+it unchecked"; it never decides whether a test fails.
 """
 import json
 import os
 import sys
-import time
 
 sys.path.insert(0, "/repo")
 import psutil  # noqa: E402
@@ -18,9 +19,11 @@ import psutil  # noqa: E402
 from selector import runner  # noqa: E402
 
 tests = json.load(open(sys.argv[1]))["tests"]
-ids = json.load(open(os.path.join(sys.argv[2], "tests.json")))
+maps = sys.argv[2]
+ids = json.load(open(os.path.join(maps, "tests.json")))
 os.environ["SKIP_INTEGRATION"] = "0"
 runner.warm_up("/sqlglot", list(dict.fromkeys(test["file"] for test in tests)))
+EXECUTOR = "tests/test_executor.py::TestExecutor"
 
 
 def tree_cpu():
@@ -36,17 +39,14 @@ def tree_cpu():
     return total
 
 
-groups = {}
-for bit, test_id in enumerate(ids):
-    groups.setdefault(test_id.rsplit("::", 1)[0], []).append(bit)
-
-costs = [None] * len(ids)
-setup = {}
-for name, bits in groups.items():
+def measure(name, bits, prepare=None):
+    """Run one class's tests in a forked child. Returns ({bit: cpu}, setup cpu)."""
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(read_fd)
+        if prepare is not None:
+            prepare()
         marks = {}
         began = tree_cpu()
         first = [None]
@@ -67,8 +67,10 @@ for name, bits in groups.items():
         runner._Result.startTest = start
         runner._Result.stopTest = stop
         failed = []
-        runner.run_tests([(bit, ids[bit]) for bit in bits],
-                         lambda text: failed.append(text) if text.startswith("R") and text.endswith(" 1\n") else None)
+        runner.run_tests(
+            [(bit, ids[bit]) for bit in bits],
+            lambda text: failed.append(text) if text.startswith("R") and text.endswith(" 1\n") else None,
+        )
         total = tree_cpu() - began
         os.write(write_fd, json.dumps({"marks": marks, "setup": first[0], "total": total, "failed": failed}).encode())
         os._exit(0)
@@ -82,12 +84,32 @@ for name, bits in groups.items():
     os.close(read_fd)
     os.waitpid(pid, 0)
     data = json.loads(b"".join(chunks))
-    for bit, value in data["marks"].items():
-        costs[int(bit)] = round(value, 4)
-    setup[name] = round(data["setup"] or 0.0, 4)
-    extra = data["total"] - sum(data["marks"].values()) - (data["setup"] or 0)
-    print(f"{name}: {len(bits)} tests, setup {setup[name]:.2f}s, tests {sum(data['marks'].values()):.2f}s, "
+    costs = {int(bit): round(value, 4) for bit, value in data["marks"].items()}
+    setup = round(data["setup"] or 0.0, 4)
+    extra = data["total"] - sum(costs.values()) - setup
+    print(f"{name}: {len(bits)} tests, setup {setup:.2f}s, tests {sum(costs.values()):.2f}s, "
           f"other {extra:.2f}s, failed {len(data['failed'])}", flush=True)
-json.dump({"tests": costs, "setup": setup}, open(sys.argv[3], "w"), separators=(",", ":"))
+    return costs, setup
+
+
+groups = {}
+for bit, test_id in enumerate(ids):
+    groups.setdefault(test_id.rsplit("::", 1)[0], []).append(bit)
+
+costs = [None] * len(ids)
+setup = {}
+for name, bits in groups.items():
+    measured, setup[name] = measure(name, bits)
+    for bit, value in measured.items():
+        costs[bit] = value
+
+fast = {"tests": {}, "setup": {}}
+if EXECUTOR in groups:
+    runner.build_executor_tables()
+    runner.load_duckdb_answers(os.path.join(maps, "duckdb.bin"))
+    measured, fast["setup"][EXECUTOR] = measure(EXECUTOR + " (setup reused)", groups[EXECUTOR], runner._use_executor_tables)
+    fast["tests"] = {str(bit): value for bit, value in measured.items()}
+
+json.dump({"tests": costs, "setup": setup, "fast": fast}, open(sys.argv[3], "w"), separators=(",", ":"))
 recorded = sum(test["seconds"] for test in tests)
 print(f"total measured {sum(c for c in costs if c):.1f}s vs recorded {recorded:.1f}s")
