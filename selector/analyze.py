@@ -73,6 +73,11 @@ class Plan:
         # (absolute path, new text) of patched modules the coordinator never
         # imports: a hot child imports the new source when a test asks for it.
         self.lazy: list[tuple[str, str]] = []
+        # Changed code that runs while sqlglot is imported, in whatever way the
+        # module comes to be imported: module and class bodies, and functions
+        # they call (maps/importrun.json). With none, the patch only changes
+        # what happens when its functions are called.
+        self.import_units = 0
         self.notes: list[str] = []
 
     def note(self, text: str) -> None:
@@ -290,6 +295,8 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                     if plan.import_floor is not None:
                         plan.import_floor |= themselves
         plan.candidates |= found
+        if at_import or covmap.runs_at_import(path, first):
+            plan.import_units += 1
         if at_import:
             plan.import_candidates |= found
             if not path.startswith("sqlglot/"):

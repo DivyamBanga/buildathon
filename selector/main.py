@@ -35,9 +35,13 @@ MAPS = os.environ.get(
 )
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 
-# The whole batch has 180 s of wall clock. Past this, whatever is still being
-# checked is selected unchecked.
+# A practice batch (40 commits) has 180 s of wall clock, the final (about 60
+# commits) 270 s. Past the deadline, whatever is still being checked is
+# selected unchecked. The deadline is 135 s for up to 40 commits and grows
+# with the batch from there, up to 200 s.
 HARD_DEADLINE = float(os.environ.get("BR_DEADLINE", "135"))
+PRACTICE_COMMITS = 40
+LONGEST_DEADLINE = 200.0
 MAX_PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 # One child at a time costs the least CPU: two busy processes slow each other
 # down, and CPU time is what is scored. A second child runs alongside only once
@@ -244,6 +248,8 @@ class Coordinator:
         self._opens: dict[int, list[str]] = {}
         self.setup_map: dict | None = None
         self.resident = 0.0  # this process's own resident size, the baseline for its forks
+        self.deadline = HARD_DEADLINE
+        self.sequential_until = SEQUENTIAL_UNTIL
 
     # ---- deciding -------------------------------------------------------
 
@@ -623,10 +629,13 @@ class Coordinator:
         nothing that runs between the optimized form of a query and its result, and nothing that code reads."""
         if job.memo_ok is None:
             job.memo_ok = False
-            # Not for a patched module that is imported on demand: its class and
-            # module bodies are not lines the recorded phase could have executed,
-            # yet what they define can be read there.
-            if self.memo_cost and not job.plan.lazy and self.executor_phase():
+            # A patched module that is imported on demand is imported from its
+            # new source when a test first asks for it. That leaves the state
+            # the pinned module would leave only when nothing the patch
+            # changed runs during an import: function bodies alone, none of
+            # them called while sqlglot is imported.
+            lazy_ok = not job.plan.lazy or (job.plan.sliceable and job.plan.import_units == 0)
+            if self.memo_cost and lazy_ok and self.executor_phase():
                 if job.mode == "hot":
                     # Only function bodies changed: the state sqlglot builds at import is the pinned one.
                     unseen = self.executor_setup_untouched(job)
@@ -976,9 +985,17 @@ class Coordinator:
 
         Well above what the whole test normally costs (with no recorded result
         reused): a patch that makes a test crawl would otherwise be paid for in
-        CPU time until the wall-clock limit.
+        CPU time until the wall-clock limit. And not far above what giving up
+        costs: a test that is stopped is selected, which adds at most its
+        recorded seconds (plus a worker when nothing else is selected), so
+        burning much more CPU than that on it cannot pay. The test always
+        gets what it needs at full price, with room to spare.
         """
-        return max(4.0, 2.2 * self.worst_cost(job, bit) * max(self.machine, 1.0) + 2.0)
+        scale = max(self.machine, 1.0)
+        generous = max(4.0, 2.2 * self.worst_cost(job, bit) * scale + 2.0)
+        giving_up = self.bit_seconds[bit] + (0.0 if job.blind or job.failed else 2.0)
+        needed = 1.6 * self.bit_cost[bit] * scale + 0.5
+        return min(generous, max(1.5, giving_up, needed))
 
     def feed(self, run: Run, data: bytes, now: float) -> None:
         run.buffer += data
@@ -1105,7 +1122,7 @@ class Coordinator:
     def loop(self) -> None:
         while self.queue or self.running:
             now = time.monotonic()
-            if now - self.start > HARD_DEADLINE:
+            if now - self.start > self.deadline:
                 log("deadline reached: selecting everything still unchecked")
                 for fd in list(self.running):
                     run = self.running.pop(fd)
@@ -1120,7 +1137,7 @@ class Coordinator:
                     self.finish_job(job, job.pending)
                 self.queue = []
                 return
-            limit = 1 if now - self.start < SEQUENTIAL_UNTIL else MAX_PARALLEL
+            limit = 1 if now - self.start < self.sequential_until else MAX_PARALLEL
             while self.queue and len(self.running) < limit:
                 job = self.queue.pop(0)
                 if not job.decided and self.wants_probe(job):
@@ -1179,6 +1196,11 @@ class Coordinator:
     def run(self) -> dict[str, list[int]]:
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         commits = [os.path.basename(path)[: -len(".patch")] for path in patches]
+        if "BR_DEADLINE" not in os.environ and len(commits) > PRACTICE_COMMITS:
+            # A larger batch is given more time in proportion (270 s for 60 commits).
+            scale = min(len(commits) / PRACTICE_COMMITS, LONGEST_DEADLINE / HARD_DEADLINE)
+            self.deadline = HARD_DEADLINE * scale
+            self.sequential_until = SEQUENTIAL_UNTIL * scale
         loaded = {os.path.join(ROOT, path) for path in self.covmap.warm_files()}
         plans = []
         for commit, path in zip(commits, patches):

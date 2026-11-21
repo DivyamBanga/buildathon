@@ -183,8 +183,13 @@ the patched code**, and selects the ones that fail.
        must not be named in any function it runs (`execnames.json`);
        anything else (an attribute added or removed, other bases, a
        difference on the classes the recorded results are made of) turns the
-       reuse off, as does an inconclusive comparison, a patch outside
-       `sqlglot/`, or a patched module that is imported on demand.
+       reuse off, as does an inconclusive comparison or a patch outside
+       `sqlglot/`. A patched module that is imported on demand is imported
+       from its new source when a test first asks for it; that leaves the
+       state the pinned module would leave only when function bodies alone
+       changed and none of them runs while sqlglot is imported
+       (`importrun.json`). Then it counts as a hot swap; otherwise the reuse
+       is off.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
      shared by the children.
@@ -228,6 +233,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
+| `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
 There is no table from a patch, or from a kind of edit, to failing tests: the

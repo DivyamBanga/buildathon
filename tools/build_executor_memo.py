@@ -43,18 +43,42 @@ if trace_dir and hasattr(tracer, "_phase"):
 runner.build_executor_tables()
 runner.install_executor_memo()
 
-ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in runner.MEMO_TESTS]
-messages = []
-runner.run_tests(list(enumerate(ids)), messages.append)
-failed = [message for message in messages if message.startswith("R") and message.endswith(" 1\n")]
-if failed:
-    raise SystemExit(f"tests failed while recording: {failed}")
+# Much of sqlglot's state is built on first use. Whatever is first used inside
+# the phase is recorded as part of it, so the tests are run in every order a
+# child can meet them in, each in a process of its own that has done nothing
+# yet: both tests, either one alone, and the two the other way round.
+names = list(runner.MEMO_TESTS)
+for order in (names, names[::-1], names[:1], names[1:]):
+    pid = os.fork()
+    if pid == 0:
+        code = 0
+        try:
+            ids = [f"tests/test_executor.py::TestExecutor::{name}" for name in order]
+            messages = []
+            runner.run_tests(list(enumerate(ids)), messages.append)
+            failed = [message for message in messages if message.startswith("R") and message.endswith(" 1\n")]
+            if failed:
+                print(f"tests failed while recording: {failed}", flush=True)
+                code = 1
+            if hasattr(tracer, "_dump"):
+                tracer._dump()
+        except BaseException as error:  # noqa: BLE001
+            print(f"recording raised {error!r}", flush=True)
+            code = 1
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+        raise SystemExit(f"recording {order} failed")
 
 memo = {}
 for name in os.listdir(record_dir):
     with open(os.path.join(record_dir, name), "rb") as handle:
         key, data = pickle.load(handle)
-    memo[key] = data
+    known = memo.setdefault(key, data)
+    if known != data:
+        one, two = pickle.loads(known), pickle.loads(data)
+        if one.columns != two.columns or one.rows != two.rows:
+            raise SystemExit(f"two results for {key}")
 with open(memo_path, "wb") as handle:
     handle.write(zlib.compress(pickle.dumps(memo, protocol=4), 9))
 print(f"{len(memo)} results, {os.path.getsize(memo_path)} bytes")
