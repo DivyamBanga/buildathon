@@ -82,6 +82,27 @@ with tempfile.TemporaryDirectory() as directory:
     expect("floor", covmap.attribute_readers("sqlglot.a", "C", "FLAG"), 0b110)
     expect("missing pair", covmap.attribute_readers("sqlglot.a", "C", "NOPE"), None)
 
+    # With the pinned world known, the map answers only for what state.watchable accepts.
+    import types
+
+    from selector import state
+
+    module = types.ModuleType("sqlglot.a")
+    module.C = type("C", (), {"FLAG": 1, "UNREAD": 2, "CALLED": lambda self: 1, "Inner": type("Inner", (), {"NAMES": ()})})
+    module.C.Inner.__qualname__ = "C.Inner"
+    state.PINNED = ("x", [], {"sqlglot.a": module}, {}, {}, 0)
+    try:
+        expect("watchable pair", covmap.attribute_readers("sqlglot.a", "C", "FLAG"), 0b110)
+        expect("nested watchable", covmap.attribute_readers("sqlglot.a", "C.Inner", "NAMES"), 0x80)
+        table = covmap._pack("areaders.bin")
+        table["sqlglot.a:C|CALLED"] = bytes([1])
+        table["sqlglot.a:C|GONE"] = bytes([1])
+        expect("not watchable: a function", covmap.attribute_readers("sqlglot.a", "C", "CALLED"), None)
+        expect("not in the pinned class", covmap.attribute_readers("sqlglot.a", "C", "GONE"), None)
+        expect("class unknown", covmap.attribute_readers("sqlglot.b", "C", "FLAG"), None)
+    finally:
+        state.PINNED = None
+
 with tempfile.TemporaryDirectory() as directory:
     build(directory, with_areaders=False)
     expect("no map", CovMap(directory).state_candidates(result(row("class", "sqlglot.a", "C", "FLAG", "value"))), ALL)

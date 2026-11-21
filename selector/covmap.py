@@ -12,6 +12,8 @@ import os
 import re
 import zlib
 
+from . import state
+
 _FAMILY = re.compile(r"^sqlglot/(dialects|parsers|generators)/(\w+)\.py$")
 _CONSTANT_LIKE = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 _NOT_A_DIALECT = ("dialect", "base", "__init__")
@@ -229,7 +231,12 @@ class CovMap:
         if not table:
             return None
         raw = table.get(f"{module}:{qualname}|{attribute}")
-        return None if raw is None else int.from_bytes(raw, "little")
+        if raw is None:
+            return None
+        if state.PINNED is not None and not state.watchable_pair(state.PINNED[2], module, qualname, attribute):
+            # The map covers exactly what state.watchable accepts; anything else is not its to answer.
+            return None
+        return int.from_bytes(raw, "little")
 
     def _changed_constants(self, path: str, qualname: str, changed, inserted, derived_ok=False) -> set | None:
         """Names of the class-level constants the changed lines assign, or None

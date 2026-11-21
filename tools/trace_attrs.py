@@ -1,7 +1,7 @@
 """Record which tests read which class attributes of sqlglot (input of maps/areaders.bin).
 
     python trace_attrs.py OUT [--seed N] [--first A] [--last B] [--timeout S] [--no-wrap]
-                              [--phase [--warm I,J,...]]
+                              [--warm I,J,...]
 
 Run inside the lab image (pinned sqlglot at /sqlglot, selector/ next to this
 tool's parent directory). sqlglot is imported in full, as the split tracer
@@ -16,9 +16,10 @@ class setup included, process pools are replaced by the in-process stand-in).
 Which attributes are wrapped: those in the own __dict__ of a class that its
 module can be reached from by name (state.py reports differences against such
 a class: the pair is "module:Qualname|attribute"), except names with two
-leading and trailing underscores, state Python keeps for itself, anything
-whose type defines __get__, __set__ or __delete__ (functions, properties,
-class and static methods), classes, modules and everything in an Enum.
+leading and trailing underscores, state Python keeps for itself, and anything
+else state.watchable refuses (callables, anything whose type defines __get__:
+functions, properties, class and static methods; everything in an Enum), and
+anything whose type defines __set__ or __delete__.
 
 A descriptor that is read out of a class dict (vars(cls), cls.__dict__) and
 used from there is a "bypass": the object stands in for its value (see
@@ -28,7 +29,7 @@ sqlglot or tests frame in the output.
 Output, in OUT:
   pairs.json     every pair wrapped
   results.jsonl  one line per test: number, id, ok, pairs read, bypass events,
-                 and with --phase the pairs read inside the executor window
+                 (--warm: numbers of tests run first in the same process)
 A test that does not pass under tracing, dies or runs out of time is "not ok":
 tools/build_areaders.py makes it a candidate for every pair.
 """
@@ -44,7 +45,6 @@ import select
 import signal
 import sys
 import time
-import types
 import unittest  # noqa: F401 - sqlglot checks, when imported, whether tests are loaded
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,29 +52,15 @@ ROOT = "/sqlglot"
 PACKAGE = "sqlglot"
 
 READS: set = set()
-WINDOW: set = set()
 BYPASS: set = set()
-IN_WINDOW = False
 
 # Names Python and the abc module keep for themselves (state._CLASS_NOISE).
 _NOISE = frozenset(("_abc_impl",))
-_SKIP_TYPES = (
-    types.FunctionType,
-    types.BuiltinFunctionType,
-    types.MethodType,
-    classmethod,
-    staticmethod,
-    property,
-    type,
-    types.ModuleType,
-)
 
 
 def _bypass(logged, kind: str) -> None:
     pair = logged._br_pair
     READS.add(pair)
-    if IN_WINDOW:
-        WINDOW.add(pair)
     frame = sys._getframe(2)
     while frame is not None and not frame.f_code.co_filename.startswith(ROOT + "/"):
         frame = frame.f_back
@@ -99,8 +85,6 @@ class _Logged:
 
     def __get__(self, obj, objtype=None):
         READS.add(self._br_pair)
-        if IN_WINDOW:
-            WINDOW.add(self._br_pair)
         return self._br_value
 
     @property
@@ -203,6 +187,8 @@ def package_classes() -> list:
 
 def wrap_attributes() -> dict:
     """Install the descriptors. Returns {"pairs": [...], counts of what was left alone}."""
+    from selector import state  # the one definition of what can be watched
+
     pairs: list = []
     left = {"classes": 0, "enum": 0, "unreachable": 0, "kept": 0, "unreachable_names": []}
     for cls in package_classes():
@@ -216,10 +202,8 @@ def wrap_attributes() -> dict:
             continue
         left["classes"] += 1
         for name, value in list(vars(cls).items()):
-            if name.startswith("__") and name.endswith("__") or name in _NOISE:
-                continue
             kind = type(value)
-            if isinstance(value, _SKIP_TYPES) or any(hasattr(kind, hook) for hook in ("__get__", "__set__", "__delete__")):
+            if name in _NOISE or not state.watchable(cls, name, value) or any(hasattr(kind, hook) for hook in ("__set__", "__delete__")):
                 left["kept"] += 1
                 continue
             pair = f"{module_name}:{qualname}|{name}"
@@ -236,9 +220,8 @@ def wrap_attributes() -> dict:
 # ---- the child ---------------------------------------------------------------
 
 
-def run_in_child(write_fd: int, jobs: list, phase: bool) -> None:
+def run_in_child(write_fd: int, jobs: list) -> None:
     """Never returns. `jobs`: [(number, id)]; the last one is the test traced, the others run first."""
-    global IN_WINDOW
     try:
         os.setpgid(0, 0)
         null = os.open(os.devnull, os.O_RDWR)
@@ -246,13 +229,6 @@ def run_in_child(write_fd: int, jobs: list, phase: bool) -> None:
             os.dup2(null, fd)
         from selector import runner
 
-        if phase:
-            def mark(kind):
-                global IN_WINDOW
-                IN_WINDOW = kind == "X"
-
-            runner.MEMO_PHASE = mark
-            runner.install_executor_memo()
         READS.clear()
         verdicts = []
         for number, test_id in jobs:
@@ -263,7 +239,6 @@ def run_in_child(write_fd: int, jobs: list, phase: bool) -> None:
         payload = {
             "ok": verdicts[-1],
             "pairs": sorted(READS),
-            "window": sorted(WINDOW),
             "bypass": sorted(BYPASS),
             "cpu": round(sum(os.times()[:2]), 2),
         }
@@ -280,13 +255,13 @@ def run_in_child(write_fd: int, jobs: list, phase: bool) -> None:
         os._exit(0)
 
 
-def run_test(jobs: list, phase: bool, timeout: float) -> dict:
+def run_test(jobs: list, timeout: float) -> dict:
     read_fd, write_fd = os.pipe()
     started = time.monotonic()
     pid = os.fork()
     if pid == 0:
         os.close(read_fd)
-        run_in_child(write_fd, jobs, phase)
+        run_in_child(write_fd, jobs)
         os._exit(1)
     os.close(write_fd)
     chunks: list = []
@@ -329,8 +304,7 @@ def main() -> None:
     parser.add_argument("--last", type=int, default=1 << 30)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--no-wrap", action="store_true", help="baseline: same runs, nothing replaced")
-    parser.add_argument("--phase", action="store_true", help="only test_execute_tpch and test_execute_tpcds, window marks on")
-    parser.add_argument("--warm", default="", help="with --phase: numbers of tests to run first in the same process")
+    parser.add_argument("--warm", default="", help="numbers of tests to run first in the same process")
     arguments = parser.parse_args()
     arguments.out = os.path.abspath(arguments.out)
     if os.environ.get("PYTHONHASHSEED") != str(arguments.seed):
@@ -358,14 +332,12 @@ def main() -> None:
         done = {json.loads(line)["n"] for line in open(results_path)}
     numbers = range(arguments.first, min(arguments.last, len(ids)))
     warm = [int(part) for part in arguments.warm.split(",") if part]
-    if arguments.phase:
-        numbers = [number for number, test_id in enumerate(ids) if test_id.endswith(("::test_execute_tpch", "::test_execute_tpcds"))]
     with open(results_path, "a") as log:
         for number in numbers:
             if number in done:
                 continue
             jobs = [(other, ids[other]) for other in warm] + [(number, ids[number])]
-            result = run_test(jobs, arguments.phase, arguments.timeout)
+            result = run_test(jobs, arguments.timeout)
             result.update({"n": number, "id": ids[number], "warm": warm})
             log.write(json.dumps(result, separators=(",", ":")) + "\n")
             log.flush()
