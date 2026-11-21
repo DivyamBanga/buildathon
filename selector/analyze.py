@@ -191,7 +191,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
     if path.startswith("tests/") and not diff.isomorphic:
         prefix = path + "::"
         known = {test_id[len(prefix):] for test_id in covmap.ids if test_id.startswith(prefix)}
-        if pydiff.only_new_definitions(patch.old_text, patch.new_text, known):
+        if pydiff.only_new_definitions(patch.old_text, patch.new_text, known, covmap.test_names()):
             plan.note(f"{path}: only new tests or helpers were added")
             return
     old_lines = patch.old_text.splitlines(keepends=True)
@@ -368,6 +368,12 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
     path = patch.path
     old_path = patch.old_path or path
     if not (path.startswith("tests/") or old_path.startswith("tests/")):
+        return
+    if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
+        # A new or changed statement that stores into a class, a module or a
+        # registry: in the whole suite it reaches tests of other files.
+        plan.select_all = True
+        plan.note(f"{path}: new code stores outside its own locals")
         return
     if patch.old_text is None:
         return

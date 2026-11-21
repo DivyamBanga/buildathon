@@ -53,6 +53,21 @@ the patched code**, and selects the ones that fail.
    (A new or changed `conftest.py` and the pytest configuration files select
    everything, as before.)
 
+   **New tests and helpers in a test file.** A file that only gained whole new
+   tests, test classes or helper functions selects nothing, but only if what
+   was added can neither act nor be found by existing code. pytest runs the new
+   test in the same process as every other, so a new or changed statement that
+   stores to anything but its own locals and `self` (an attribute or subscript
+   store or `del` on something else, `setattr`, `delattr`, `global`,
+   `nonlocal`), in a new or an edited test file, selects every test. A new
+   module-level name must not be a builtin or a name the old module loads
+   anywhere (existing code would find the new one); a new method must not be a
+   name `unittest.TestCase` has, one the old module reads as an attribute or
+   defines elsewhere, or the name of any test in the suite. Otherwise the file
+   counts as changed, and its own tests run as for any edited test file. A
+   store done by a method that is called (`registry.update(...)`) is not looked
+   for.
+
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
    another state: other module globals, class attributes, defaults or closures.

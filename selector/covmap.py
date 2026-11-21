@@ -95,6 +95,10 @@ class CovMap:
                 result |= 1 << bit
         return result
 
+    def test_names(self) -> frozenset:
+        """The last part of every test id: names a new test must not take."""
+        return frozenset(test_id.split("::")[-1].split("[")[0] for test_id in self.ids)
+
     def code_any(self, path: str, first: int) -> int:
         result = 0
         for bitmap in self.file(path).get(first, {}).values():

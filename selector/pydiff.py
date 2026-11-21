@@ -14,9 +14,11 @@ needed for a test to notice the change.
 from __future__ import annotations
 
 import ast
+import builtins
 import re
 import dis
 import types
+from collections import Counter
 
 CODE = types.CodeType
 CO_NEWLOCALS = 0x0002
@@ -404,13 +406,60 @@ def _plain_function(node) -> bool:
     if any(not isinstance(default, ast.Constant) for default in defaults):
         return False
     annotated = [a.annotation for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs]
-    return node.returns is None and not any(annotated)
+    return node.returns is None and not any(annotated) and not any(_global_effects(node))
 
 
-def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str) -> bool:
+def _global_effects(tree, scope: str = ""):
+    """Signatures of the statements under `tree` that can store outside the local scope.
+
+    A function that only stores to its own locals and to attributes of `self`
+    leaves every other test as it was; these are the ones that do not: an
+    attribute or subscript store (or `del`) on anything but `self`, `setattr` and
+    `delattr`, and `global` or `nonlocal`.
+    """
+    found = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.extend(_global_effects(node, scope + "." + node.name))
+            continue
+        flagged = False
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            flagged = True
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            flagged = not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self")
+        elif isinstance(node, ast.Call):
+            callee = node.func
+            name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
+            flagged = name in ("setattr", "delattr", "__setattr__", "__delattr__")
+        if flagged:
+            found.append((scope, ast.dump(node)))
+        found.extend(_global_effects(node, scope))
+    return found
+
+
+def new_global_effects(old_text: str, new_text: str) -> bool:
+    """True when the new text has a statement that stores outside the local scope
+    (see `_global_effects`) which the old text did not have in that place.
+
+    It matters in any test file, new or edited: pytest runs a new test, and
+    imports every test module, in the same process as every other test, so a
+    store into a class, a module or a registry reaches tests of other files.
+    """
+    try:
+        new_tree = ast.parse(new_text)
+        old_tree = ast.parse(old_text) if old_text else None
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    old_found = Counter(_global_effects(old_tree)) if old_tree is not None else Counter()
+    new_found = Counter(_global_effects(new_tree))
+    return any(count > old_found[signature] for signature, count in new_found.items())
+
+
+def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple) -> bool:
     import unittest
 
     old_names = _bound_names(old_body)
+    module_taken, method_taken = taken
     position = 0
     for statement in new_body:
         old = old_body[position] if position < len(old_body) else None
@@ -424,7 +473,7 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
             and [ast.dump(n) for n in old.bases + old.keywords + old.decorator_list]
             == [ast.dump(n) for n in statement.bases + statement.keywords + statement.decorator_list]
         ):
-            if not _only_new_definitions(old.body, statement.body, known, prefix + statement.name + "::"):
+            if not _only_new_definitions(old.body, statement.body, known, prefix + statement.name + "::", taken):
                 return False
             position += 1
             continue
@@ -432,11 +481,18 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
         if not name or name in old_names or name.startswith("__") or prefix + name in known:
             return False
         if prefix:
-            # A method: only a new test, never something existing tests could call.
-            if not name.startswith("test") or hasattr(unittest.TestCase, name) or not _plain_function(statement):
+            # A method: only a new test, never something existing tests could call
+            # or read through self: not a name unittest.TestCase has, not one the
+            # old code of the module reads as an attribute or defines elsewhere.
+            if (
+                not name.startswith("test")
+                or hasattr(unittest.TestCase, name)
+                or name in method_taken
+                or not _plain_function(statement)
+            ):
                 return False
         elif isinstance(statement, ast.ClassDef):
-            if statement.decorator_list or statement.keywords:
+            if statement.decorator_list or statement.keywords or name in module_taken:
                 return False
             for member in statement.body:
                 simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member)
@@ -445,7 +501,9 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
                 if not simple or getattr(member, "name", "x").startswith("__"):
                     return False
         else:
-            if not _plain_function(statement) or name.lower().startswith(_MODULE_HOOKS):
+            # A new global must not be a builtin, nor a name the old module loads
+            # as a global anywhere: existing code would find the new one instead.
+            if not _plain_function(statement) or name.lower().startswith(_MODULE_HOOKS) or name in module_taken:
                 return False
     return position == len(old_body)
 
@@ -487,7 +545,7 @@ def harmless_new_test_module(text: str) -> bool:
                     return False
             continue
         body.append(statement)
-    return _only_new_definitions([], body, set(), "")
+    return _only_new_definitions([], body, set(), "", (frozenset(), frozenset()))
 
 
 def coding_cookie(text: str) -> str:
@@ -502,7 +560,15 @@ def coding_cookie(text: str) -> str:
     return ""
 
 
-def only_new_definitions(old_text: str, new_text: str, known: set) -> bool:
+def _taken_names(tree, reserved) -> tuple:
+    """(names a new module-level definition must not have, names a new method must not have)."""
+    loaded = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    defined = {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return frozenset(loaded | set(dir(builtins))), frozenset(attributes | defined | set(reserved))
+
+
+def only_new_definitions(old_text: str, new_text: str, known: set, reserved=()) -> bool:
     """True when a test file only gained whole new tests, test classes or helper functions.
 
     Everything that was there is unchanged, and every addition has a name that
@@ -517,4 +583,4 @@ def only_new_definitions(old_text: str, new_text: str, known: set) -> bool:
         new_tree = ast.parse(new_text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
-    return _only_new_definitions(old_tree.body, new_tree.body, known, "")
+    return _only_new_definitions(old_tree.body, new_tree.body, known, "", _taken_names(old_tree, reserved))

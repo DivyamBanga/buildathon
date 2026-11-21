@@ -27,6 +27,104 @@ def expect(label, got, want):
         raise SystemExit(f"FAIL {label}: got {got!r}, want {want!r}")
 
 
+# ---- E: a new test or helper may store to locals and self only -------------
+
+TESTS = textwrap.dedent('''\
+    import unittest
+    from helpers import check
+
+
+    def helper(x):
+        return x
+
+
+    class TestA(unittest.TestCase):
+        def test_one(self):
+            self.assertEqual(helper(1), 1)
+            self.assertTrue(self.fixture_value)
+''')
+KNOWN = {"TestA::test_one"}
+
+
+def added(addition, reserved=()):
+    return pydiff.only_new_definitions(TESTS, TESTS + addition, KNOWN, reserved)
+
+
+def effects(new_text, old_text=TESTS):
+    return pydiff.new_global_effects(old_text, new_text)
+
+
+METHOD = "\n    def test_two(self):\n{}\n"
+expect("E: self attribute", added(METHOD.format("        self.x = 1\n        y = {}\n        y['a'] = 1")), False)  # subscript
+expect("E: self attribute alone", added(METHOD.format("        self.x = 1\n        z = 2")), True)
+expect("E: locals alone", added(METHOD.format("        z = [1]\n        for i in z:\n            w = i")), True)
+for label, body in (
+    ("class attribute", "        TestA.LIMIT = 3"),
+    ("module attribute", "        unittest.foo = 3"),
+    ("imported class attribute", "        from sqlglot.generators.duckdb import DuckDBGenerator\n        DuckDBGenerator.LIMIT_FETCH = 'FETCH'"),
+    ("subscript", "        helper.cache['a'] = 1"),
+    ("augmented attribute", "        helper.count += 1"),
+    ("del attribute", "        del helper.count"),
+    ("del subscript", "        del helper.cache['a']"),
+    ("setattr", "        setattr(helper, 'a', 1)"),
+    ("delattr", "        delattr(helper, 'a')"),
+    ("__setattr__", "        object.__setattr__(helper, 'a', 1)"),
+    ("global", "        global helper\n        helper = None"),
+    ("nested nonlocal", "        n = 1\n        def inner():\n            nonlocal n\n            n = 2\n        inner()"),
+    ("nested attribute store", "        def inner(o):\n            o.a = 1\n        inner(helper)"),
+    ("store on self attribute", "        self.x.y = 1"),
+    ("store in a with", "        with open('f') as helper.handle:\n            pass"),
+    ("store in a for", "        for helper.x in range(2):\n            pass"),
+):
+    text = TESTS + METHOD.format(body)
+    expect("E: new test, " + label + " (accepted?)", added(METHOD.format(body)), False)
+    expect("E: new test, " + label + " (flagged?)", effects(text), True)
+expect("E: new helper function, module store", effects(TESTS + "\n\ndef other(y):\n    helper.cache = y\n"), True)
+expect("E: new helper function, locals", effects(TESTS + "\n\ndef other(y):\n    y.append(1)\n    return y\n"), False)
+expect("E: module level store", effects(TESTS + "\nunittest.foo = 1\n"), True)
+expect("E: class level store", effects(TESTS + "\nTestA.extra = 1\n"), True)
+expect("E: module level name", effects(TESTS + "\nVALUE = 1\n"), False)
+expect("E: self attribute is not flagged", effects(TESTS + METHOD.format("        self.x = 1")), False)
+# A store that was already there is not new; one added to an existing test is.
+BASE_STORES = TESTS + "\n\ndef setup_thing():\n    helper.cache = 1\n"
+expect("E: existing store unchanged", effects(BASE_STORES + "\n\ndef other():\n    return 1\n", BASE_STORES), False)
+expect("E: existing store, new copy", effects(BASE_STORES + "\n\ndef other():\n    helper.cache = 1\n", BASE_STORES), True)
+expect("E: store added to an existing test", effects(TESTS.replace("self.assertEqual(helper(1), 1)", "helper.cache = 1")), True)
+expect("E: text that does not parse", effects("def (:\n"), False)
+expect("E: new file, store", effects("import os\nos.environ['A'] = '1'\n", ""), True)
+expect("E: new file, plain", effects("import os\n\n\ndef test_a():\n    x = {}\n    x['a'] = 1\n    assert x\n", ""), True)  # subscript on a local: conservative
+expect("E: new file, really plain", effects("import os\n\n\ndef test_a():\n    x = 1\n    assert x\n", ""), False)
+expect("E: harmless new module with a store", pydiff.harmless_new_test_module(
+    "import os\n\n\ndef test_a():\n    os.environ['A'] = '1'\n"), False)
+expect("E: harmless new module", pydiff.harmless_new_test_module(
+    "import os\n\n\ndef test_a():\n    x = os.sep\n    assert x\n"), True)
+
+# ---- F: a new name must not change what existing code finds ---------------
+
+expect("F: new global is a builtin", added("\n\ndef set(*args):\n    return {'x'}\n"), False)
+expect("F: new global is a builtin (len)", added("\n\ndef len(x):\n    return 0\n"), False)
+expect("F: new class is a builtin", added("\n\nclass dict:\n    pass\n"), False)
+expect("F: new global loaded by old code", added("\n\ndef fixture_value():\n    return 1\n"), True)  # an attribute, not a global
+expect("F: new global the old module loads", pydiff.only_new_definitions(
+    TESTS + "\n\ndef use():\n    return later(1)\n", TESTS + "\n\ndef use():\n    return later(1)\n\n\ndef later(x):\n    return x\n",
+    KNOWN), False)
+expect("F: new global, fresh name", added("\n\ndef fresh_helper(x):\n    return x\n"), True)
+expect("F: new test named like an attribute the old code reads", added(METHOD.format("        pass").replace("test_two", "fixture_value")), False)
+expect("F: new test, read as attribute by old code", pydiff.only_new_definitions(
+    TESTS + "\n    def test_a(self):\n        self.test_two()\n",
+    TESTS + "\n    def test_a(self):\n        self.test_two()\n\n    def test_two(self):\n        pass\n", KNOWN), False)
+expect("F: new test with the name of a test elsewhere", added(METHOD.format("        pass"), reserved={"test_two"}), False)
+expect("F: new test, fresh name", added(METHOD.format("        pass"), reserved={"test_other"}), True)
+expect("F: new test, TestCase name", added("\n    def run(self):\n        pass\n"), False)
+expect("F: new method defined elsewhere in the module", pydiff.only_new_definitions(
+    TESTS + "\n\nclass Base:\n    def test_shared(self):\n        pass\n",
+    TESTS + "\n\nclass Base:\n    def test_shared(self):\n        pass\n\n    def test_new(self):\n        pass\n", KNOWN),
+    True)
+expect("F: new method named like another class's method", pydiff.only_new_definitions(
+    TESTS + "\n\nclass Base:\n    def test_shared(self):\n        pass\n",
+    TESTS.replace("self.assertTrue(self.fixture_value)", "self.assertTrue(self.fixture_value)\n\n    def test_shared(self):\n        pass")
+    + "\n\nclass Base:\n    def test_shared(self):\n        pass\n", KNOWN), False)
+
 # ---- D: a path in more than one section ------------------------------------
 
 
@@ -109,5 +207,12 @@ plan = plan_for(comment_patch("tests/helpers.py", "# Pytest fixtures live elsewh
 expect("C: helper module, its importers", plan.unverified != 0 and plan.unverified == covmap.file_any("tests/helpers.py") | covmap.tests_of_file("tests/helpers.py"), True)
 plan = plan_for(comment_patch("sqlglot/helper.py", "# pytest"))
 expect("C: not a test file", (plan.candidates, plan.unverified), (0, 0))
+
+plan = seed("E_pollution")
+expect("seed E: everything", plan.select_all, True)
+
+plan = seed("F_shadow_builtin")
+expect("seed F: not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
+expect("seed F: the shadowed test is a candidate", selected(plan, "tests/test_helper.py::TestHelper::test_tsort"), True)
 
 print(f"{checks} checks passed")
