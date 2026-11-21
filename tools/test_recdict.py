@@ -229,5 +229,29 @@ _expect("wrap: lookups through class, subclass and instance are key notes with t
 len(_A.ALONE)
 _expect("wrap: a whole read names the table", {recdict.TABLES[t]._br_pairs for t in recdict.WHOLE} == {("m:_A|ALONE",)})
 
+
+# ---- stored: a note is named by the key the table holds, not by the key the reader used ----
+
+import enum  # noqa: E402
+
+
+class _Name(str, enum.Enum):
+    HIVE = "hive"
+
+
+class _Kind(enum.IntEnum):
+    SELECT = 7
+
+
+_by_text = RecDict({"hive": 1, 7: 2, _Kind(7).name: 3}, ("m:C|BY_TEXT",))
+_by_member = RecDict({_Name.HIVE: 1, _Kind.SELECT: 2}, ("m:C|BY_MEMBER",))
+_expect("stored: a str enum member finds the entry of the plain string", _by_text[_Name.HIVE] == 1 and type(recdict.stored(_by_text, _Name.HIVE)) is str)
+_expect("stored: an int enum member finds the entry of the plain number", _by_text[_Kind.SELECT] == 2 and type(recdict.stored(_by_text, _Kind.SELECT)) is int)
+_expect("stored: a plain string finds the entry of the member", _by_member["hive"] == 1 and recdict.stored(_by_member, "hive") is _Name.HIVE)
+_expect("stored: a plain number finds the entry of the member", _by_member[7] == 2 and recdict.stored(_by_member, 7) is _Kind.SELECT)
+_expect("stored: a key the table does not hold stays as it is", recdict.stored(_by_text, "nope") == "nope" and recdict.stored(_by_text, _Name.HIVE.name) == "HIVE")
+_by_text["later"] = 4
+_expect("stored: entries added after the first call are found", recdict.stored(_by_text, "later") == "later" and recdict.stored(_by_text, ["x"]) == ["x"])
+
 print("failed:", failed)
 sys.exit(1 if failed else 0)

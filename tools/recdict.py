@@ -245,3 +245,24 @@ def wrap(watched, slot="value", ignore=()):
             setattr(descriptor, slot, table)
             key_pairs.append(pair)
     return sorted(key_pairs), whole
+
+
+_OWN: dict = {}  # id(table) -> {key: the key object the table holds}
+
+
+def stored(table, key):
+    """The key object the table itself holds for a lookup of `key`, else `key`.
+
+    A dict finds an entry by hash and ==, not by what the key is: a member of a
+    str or int enum finds the entry of the plain string or number and the other
+    way round, and a class whose metaclass defines __eq__ can find a string.
+    A note carries the key the reader used; an entry is named by the key the
+    table holds. Call this when the run is over, before naming a note.
+    """
+    own = _OWN.get(id(table))
+    if own is None or len(own) != dict.__len__(table):
+        own = _OWN[id(table)] = {held: held for held in dict.keys(table)}
+    try:
+        return own.get(key, key)
+    except TypeError:  # an unhashable lookup key cannot have found anything
+        return key
