@@ -81,6 +81,10 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 # For experiments only: run every candidate, whatever it costs, so that the
 # simulated time is what the failing tests alone come to.
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
+# For experiments only: decide what would be run for every commit (import
+# state is still compared), run none of it, and say in the commit's notes how
+# it would be checked. Everything that would be run is selected.
+PLAN_ONLY = os.environ.get("BR_PLAN_ONLY", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 # The lines of the executor phase that look a name up by a computed text or walk
@@ -182,6 +186,7 @@ class Job:
         # masks, and {attribute: names of the entries that differ} for tables.
         self.memo_block = (0, 0, {})
         self.memo_share: dict = {}
+        self.memo_why = ""  # why recorded executor results are off, when nothing else says so
         self.deadline = float("inf")  # wall-clock limit for checking this commit
         self.probed = False  # the state left by its import-time changes has been compared
         self.state: dict | None = None  # what that comparison found, once it has narrowed the candidates
@@ -726,10 +731,20 @@ class Coordinator:
             # changed runs during an import: function bodies alone, none of
             # them called while sqlglot is imported.
             lazy_ok = not job.plan.lazy or (job.plan.sliceable and job.plan.import_units == 0)
+            if job.mode == "clean":
+                # After a fresh import of the patched tree every module comes
+                # from the overlay, whenever it is first asked for, and the
+                # comparison of import state imported every one of them: what a
+                # module that loads on demand leaves is among the differences
+                # it lists (import_seen_by_executor wants that comparison).
+                lazy_ok = True
+            job.memo_why = "" if lazy_ok else "a module imported on demand runs changed code when it is imported"
             if self.memo_cost and lazy_ok and self.executor_phase():
                 if job.mode == "hot":
                     # Only function bodies changed: the state sqlglot builds at import is the pinned one.
                     block = (self.phase_lines(job.plan.units), 0, {}) if self.executor_setup_untouched(job) else None
+                    if block is None:
+                        job.memo_why = "the patch touches what the class setup runs or reads"
                 else:
                     block = self.import_seen_by_executor(job)
                 if block is not None and (not any(block) or self.exec_queries):
@@ -800,8 +815,14 @@ class Coordinator:
         """
         result = job.state
         if result is None or not self.clean_memo_possible(job):
+            job.memo_why = (
+                "its kind of patch is not one they can be told for"
+                if not self.clean_memo_possible(job)
+                else "import state was not compared, or the comparison narrowed nothing"
+            )
             return None
         if result.get("inconclusive") or result.get("widen") or result.get("failed"):
+            job.memo_why = f"import state: {result.get('inconclusive') or 'a module no longer imports'}"
             return None
         known = self.covmap._pack("treaders.bin") or {}
         # The changed lines of the code the patch itself edits.
@@ -1008,6 +1029,33 @@ class Coordinator:
             return False
         return self.rows_reusable(job) and self.executor_record()
 
+    def results_saving(self, job: Job) -> float:
+        """What recorded executor results would spare on this commit's candidates, in
+        recorded seconds of a plain test, if the comparison of import state found
+        nothing beyond the functions the patch edits.
+
+        Now, without the comparison, an executor test runs every query of the
+        fixture cases that reach the change (its estimate). With it, only the
+        queries whose recorded phase runs a changed line are executed.
+        """
+        rows = self.phase_lines(job.plan.units)
+        block = (rows, 0, {})
+        saving = 0.0
+        for bit in job.candidates:
+            if bit not in self.memo_cost or bit not in job.estimates:
+                continue
+            now = self.full_cost(job, bit)
+            if now <= 0.0:
+                continue
+            share = 0.0
+            if rows:
+                scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
+                mine = [entry for key, entry in (self.exec_queries or {}).items() if key.startswith(f"{scope}:")]
+                share = sum(1 for own in mine if runner.query_touched(own, block)) / len(mine) if mine else 1.0
+            then = self.memo_cost[bit] + share * max(0.0, self.changed_cost(job, bit) - self.memo_cost[bit])
+            saving += job.estimates[bit] * max(0.0, 1.0 - then / now)
+        return saving
+
     def wants_probe(self, job: Job) -> bool:
         """Whether to compare import state before deciding what to run for the commit."""
         plan = job.plan
@@ -1028,8 +1076,10 @@ class Coordinator:
             # the changed body of a function that already ran while the tests were
             # imported, on lines only tests run. Without the comparison nothing
             # says what the fresh import left, and the executor tests would run
-            # every query.
-            return for_results
+            # every query. It is asked for when that would spare more than it
+            # costs: not when the changed lines themselves are run by (nearly)
+            # every recorded query, nor when few fixture cases reach them anyway.
+            return for_results and self.results_saving(job) > 2.0 * PROBE_COST
         if plan.narrowed:
             # Tests were left out as unable to see the change to a class or
             # module body. That is only true if the module still imports, and
@@ -1149,6 +1199,25 @@ class Coordinator:
         job.estimate = sum(job.estimates.values())
         self.queue.insert(0, job)
 
+    def describe(self, job: Job) -> None:
+        """Experiments only (BR_PLAN_ONLY): note how the commit would be checked and select what would be run."""
+        tests = job.pending
+        job.pending = []
+        memo = [bit for bit in tests if bit in self.memo_cost]
+        state = ""
+        if memo:
+            names = ",".join(self.covmap.ids[bit].rsplit("::", 1)[-1] for bit in memo)
+            if self.executor_memo_ok(job):
+                state = f"; recorded results on for {names}"
+            else:
+                state = f"; recorded results OFF for {names} ({job.memo_why or 'see the note'})"
+        blind = [self.covmap.ids[bit].rsplit("::", 1)[-1] for bit in sorted(job.blind) if bit in self.memo_cost]
+        if blind:
+            state += "; not run: " + ",".join(blind)
+        cost = self.machine * (self.overhead(job, tests) + sum(job.estimates[bit] for bit in tests))
+        job.plan.note(f"plan only: {job.mode}, {len(tests)} to run (~{cost:.1f}s){state}")
+        self.finish_job(job, tests)
+
     def spawn(self, job: Job) -> None:
         tests = job.pending
         job.pending = []
@@ -1179,6 +1248,9 @@ class Coordinator:
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
         spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None
+        if job.memo_why and not spec["executor_memo"] and any(bit in self.memo_cost for bit in tests):
+            plan.note(f"no recorded results: {job.memo_why}")
+            job.memo_why = ""
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
         spec["lazy"] = plan.lazy if job.mode == "hot" else []
@@ -1403,7 +1475,10 @@ class Coordinator:
                 if not job.decided and self.wants_probe(job):
                     self.spawn_probe(job)
                 elif job.decided or self.decide(job):
-                    self.spawn(job)
+                    if PLAN_ONLY:
+                        self.describe(job)
+                    else:
+                        self.spawn(job)
             ready, _, _ = select.select(list(self.running), [], [], 0.05)
             now = time.monotonic()
             for fd in ready:
