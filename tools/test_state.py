@@ -5,6 +5,7 @@
 Two small "packages" are built from source text and compared the way the
 selector compares the pinned and the patched sqlglot.
 """
+import enum
 import os
 import sys
 import textwrap
@@ -153,5 +154,79 @@ expect(
     [row for row in differences(BASE.replace("class Child(Base):", "class Child(Base, object):")) if row[1] == "*"],
     [("Child", "*", "bases")],
 )
+
+
+# The entries of a table that differ, by name (the ninth element of a difference row).
+def entries(new_source, attribute):
+    comparer = state.Comparer(world(BASE), world(new_source), "/root")
+    found = [row[8] for row in comparer.run() if row[3] == attribute and row[4] == "value"]
+    return found[0] if found else "no difference"
+
+
+expect(
+    "a set that loses a member names that member",
+    entries(BASE.replace("MEMBERS = {Kind.ONE, Kind.TWO}", "MEMBERS = {Kind.ONE}"), "MEMBERS"),
+    ["enum:pkg.mod:Kind:TWO"],
+)
+expect(
+    "a table whose entry holds another value names its key (a changed function in it is reported as a function)",
+    entries(BASE.replace("Kind.TWO: helper,", "Kind.TWO: None,"), "TABLE"),
+    ["enum:pkg.mod:Kind:TWO"],
+)
+expect(
+    "a new key is named, under every name an equal key has",
+    entries(BASE.replace('TABLE = {**Base.TABLE, "extra": add_one}', 'TABLE = {**Base.TABLE, "extra": add_one, 1: None}'), "TABLE"),
+    ["int:1", "num:1"],
+)
+expect("a scalar has no entries", entries(BASE.replace("LIMIT = 10", "LIMIT = 11"), "LIMIT"), None)
+expect("neither has a tuple", entries(BASE.replace("SEEN = tuple({Base, Kind, Point})", "SEEN = (Base,)"), "SEEN"), None)
+
+
+class Mixed(str, enum.Enum):
+    HIVE = "hive"
+
+
+class Counted(enum.IntEnum):
+    SEVEN = 7
+
+
+class Meta(type):
+    def __eq__(cls, other):
+        return other == "named" or type.__eq__(cls, other)
+
+    def __hash__(cls):
+        return hash("named")
+
+
+class Named(metaclass=Meta):
+    pass
+
+
+for one, other, same in (
+    ("hive", Mixed.HIVE, True), (7, Counted.SEVEN, True), (1, True, True), (1, 1.0, True), (7.0, Counted.SEVEN, True),
+    ("7", 7, False), ("hive", "Hive", False), (1.5, 1, False), (b"a", "a", False), (None, 0, False),
+    ((1, "hive"), (True, Mixed.HIVE), True), (frozenset({1, 2}), frozenset({2.0, True}), True), ((1, 2), (2, 1), False),
+    (Mixed, Mixed, True), (Mixed, Counted, False), (complex(1, 0), 1, True),
+):
+    left, right = state.key_names(one), state.key_names(other)
+    expect(f"key_names: {one!r} and {other!r} share a name: {same}", bool(left & right), same)
+    expect(f"a dict agrees about {one!r} and {other!r}", (one == other and hash(one) == hash(other)), same)
+expect("a class whose metaclass defines equality has no name", state.key_names(Named), None)
+expect("neither has an object", state.key_names(object()), None)
+expect("nor a tuple that holds one", state.key_names((1, object())), None)
+
+expect(
+    "a module that binds its own builtins",
+    differences(BASE.replace("LIMIT = 10\n", "LIMIT = 10\n__builtins__ = {**__builtins__, 'any': all}\n")),
+    [("", "__builtins__", "value")],
+)
+before = state.outside_state()
+import builtins  # noqa: E402
+
+builtins.any, kept = all, builtins.any
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+builtins.any = kept
+expect("a builtin replaced for everyone", changed, ["the builtins"])
+expect("and put back", state.outside_state(), before)
 
 print(f"{checks} checks passed")

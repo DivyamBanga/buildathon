@@ -51,17 +51,26 @@ _HASNAME = frozenset(dis.hasname)
 _HASJUMP = frozenset(getattr(dis, "hasjump", ())) | frozenset(dis.hasjrel) | frozenset(dis.hasjabs)
 
 
+# Names through which a function can read its own local names (or a caller's).
+_INTROSPECTION = frozenset(
+    ("locals", "vars", "dir", "eval", "exec", "_getframe", "currentframe", "f_locals", "stack", "getframeinfo")
+)
+
+
 def _shape(code: CODE):
     """What must match exactly, whatever the instructions are."""
     flags = code.co_flags
     varnames = code.co_varnames
     if flags & CO_NEWLOCALS:
         # Parameters keep their names (callers may pass them by keyword); the other
-        # locals are slots in the bytecode and their names are never looked at.
+        # locals are slots in the bytecode and their names are never looked at,
+        # unless the function can ask for them (`locals()`, a frame): then which
+        # names there are matters (rule N), their order still does not.
         parameters = (
             code.co_argcount + code.co_kwonlyargcount + bool(flags & CO_VARARGS) + bool(flags & CO_VARKEYWORDS)
         )
-        varnames = (varnames[:parameters], len(varnames))
+        others = frozenset(varnames[parameters:]) if _INTROSPECTION.intersection(code.co_names) else None
+        varnames = (varnames[:parameters], others, len(varnames))
     return (
         varnames,
         code.co_freevars,
@@ -167,6 +176,137 @@ def same_behaviour(old: CODE, new: CODE) -> bool:
         return _normal_form(old) == _normal_form(new)
     except Exception:
         return False
+
+
+# Flags that say how a function is called and what calling it gives back: the
+# parameter kinds, generator, coroutine and async generator.
+_CALL_FLAGS = 0x0001 | 0x0002 | CO_VARARGS | CO_VARKEYWORDS | 0x0020 | 0x0080 | 0x0100 | 0x0200
+
+
+def _parameters(code: CODE):
+    count = code.co_argcount + code.co_kwonlyargcount
+    count += bool(code.co_flags & CO_VARARGS) + bool(code.co_flags & CO_VARKEYWORDS)
+    return code.co_varnames[:count]
+
+
+def signature_differs(old: CODE, new: CODE) -> bool:
+    """True when what is fixed about a function when `def` runs differs.
+
+    A decorator, a registry or `inspect.signature` reads the parameters (their
+    names, number, order and kind), the free variables, the name and what kind
+    of function it is at the time the function is defined, and keeps what it
+    found. Putting new bytecode in the old function object (`__code__`) does not
+    redo any of that, so such a change cannot be checked by swapping code.
+    """
+    return (
+        old.co_argcount != new.co_argcount
+        or old.co_posonlyargcount != new.co_posonlyargcount
+        or old.co_kwonlyargcount != new.co_kwonlyargcount
+        or _parameters(old) != _parameters(new)
+        or old.co_flags & _CALL_FLAGS != new.co_flags & _CALL_FLAGS
+        or old.co_freevars != new.co_freevars
+        or old.co_name != new.co_name
+        or old.co_qualname != new.co_qualname
+    )
+
+
+def last_line(code) -> int:
+    """The largest line number any instruction of a code object has, nested code objects included."""
+    best = code.co_firstlineno
+    for _start, _end, line in code.co_lines():
+        if line is not None and line > best:
+            best = line
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            best = max(best, last_line(const))
+    return best
+
+
+def bindings_differ(old: CODE, new: CODE) -> bool:
+    """True when the function binds other names than before (rule N).
+
+    Which names are local, cell or free decides what every other line of the
+    function means: `exp` stored once makes `exp.Expr` on a line nobody edited
+    raise UnboundLocalError, and `locals()` lists the names. The statements
+    that differ are then not the only ones a test must run. Compared as sets:
+    the order of the other locals is a slot number nobody reads.
+    """
+    return (
+        set(old.co_varnames) != set(new.co_varnames)
+        or set(old.co_cellvars) != set(new.co_cellvars)
+        or set(old.co_freevars) != set(new.co_freevars)
+    )
+
+
+_PAIRED = {
+    "LOAD_FAST_LOAD_FAST": ("LOAD_FAST", "LOAD_FAST"),
+    "STORE_FAST_STORE_FAST": ("STORE_FAST", "STORE_FAST"),
+    "STORE_FAST_LOAD_FAST": ("STORE_FAST", "LOAD_FAST"),
+}
+_PLAIN_OPNAME = {"LOAD_FAST_CHECK": "LOAD_FAST", "LOAD_FAST_BORROW": "LOAD_FAST"}
+_SKIPPED = frozenset(("NOP", "EXTENDED_ARG", "CACHE"))
+
+
+def _rows_by_line(code: CODE) -> dict[int, list]:
+    """The instructions of one code object, by source line, resolved: constants
+    by value, names and slots by name, jumps by opcode only. The compiler's
+    choices that carry no meaning (a fused pair of loads, a load that checks
+    for an unbound variable, a NOP that marks a line, a copied exit block) are undone."""
+    rows: dict[int, list] = {}
+    for instruction in dis.get_instructions(code):
+        name = instruction.opname
+        if name in _SKIPPED:
+            continue
+        positions = instruction.positions
+        line = positions.lineno if positions is not None and positions.lineno is not None else instruction.line_number
+        if line is None:
+            continue
+        opcode = instruction.opcode
+        if name in _PAIRED:
+            first, second = instruction.argval
+            rows.setdefault(line, []).extend(
+                [(_PAIRED[name][0], first), (_PAIRED[name][1], second)]
+            )
+            continue
+        if opcode in _HASCONST:
+            value = _canon(instruction.argval)
+        elif opcode in _HASJUMP:
+            value = None
+        elif opcode in _HASNAME or opcode in dis.haslocal or opcode in dis.hasfree:
+            value = (instruction.argval, instruction.argrepr)
+        else:
+            value = instruction.arg
+        rows.setdefault(line, []).append((_PLAIN_OPNAME.get(name, name), value))
+    return {line: _without_copies(found) for line, found in rows.items()}
+
+
+def _without_copies(rows: list) -> list:
+    """The compiler copies a small exit block (a `return`) to every path that
+    ends in it: a row list that is one block repeated is that block."""
+    size = len(rows)
+    for period in range(1, size // 2 + 1):
+        if size % period == 0 and rows == rows[:period] * (size // period):
+            return rows[:period]
+    return rows
+
+
+def changed_instruction_lines(old: CODE, new: CODE, new_line) -> set[int]:
+    """Old lines whose instructions differ from those of the same line in the new code.
+
+    `new_line` maps an old line to its place in the new file (None when the
+    patch edited it). Catches what the statement comparison cannot: a line
+    whose text is unchanged but whose names now resolve to something else (a
+    global that became a local, `global` or `nonlocal` added). A line the
+    patch edited and that has no counterpart counts as changed.
+    """
+    old_rows = _rows_by_line(old)
+    new_rows = _rows_by_line(new)
+    lines = set()
+    for line, rows in old_rows.items():
+        target = new_line(line)
+        if target is None or new_rows.get(target) != rows:
+            lines.add(line)
+    return lines
 
 
 def is_function_like(code: CODE) -> bool:
@@ -376,6 +516,19 @@ def changed_lines_in_function(
     # Fragment line `first_line` is line old_span[0] of the file.
     shift = old_span[0] - first_line
     return {line + shift for line in lines}
+
+
+def lines_to_run(old, new, old_lines, new_lines, old_span, new_span, new_line) -> set[int] | None:
+    """Old lines a test must execute to notice the change to a function; None
+    when any test that runs the function may. The statements that differ, plus
+    (rule N) the whole function when it binds other names, plus the lines whose
+    instructions differ although their text does not."""
+    lines = changed_lines_in_function(old_lines, new_lines, old_span, new_span)
+    if lines is None:
+        return None
+    if bindings_differ(old, new):
+        return None
+    return lines | changed_instruction_lines(old, new, new_line)
 
 
 _COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")

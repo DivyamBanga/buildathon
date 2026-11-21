@@ -22,6 +22,7 @@ os.environ["SKIP_INTEGRATION"] = "0"
 runner.warm_up(ROOT, list(dict.fromkeys(test["file"] for test in tests)))
 loaded = [name for name in sys.modules if name == "sqlglot" or name.startswith("sqlglot.")]
 covmap = CovMap("/repo/maps")
+state.load_order("/repo/maps/order.json")
 warm = {os.path.join(ROOT, path) for path in covmap.warm_files()}
 
 for patch_path in sys.argv[1:] or [None]:

@@ -21,7 +21,9 @@ the patched code**, and selects the ones that fail.
    (runs only when called) or a module or class body (ran at import). Inside a
    changed function, the old and new source of that function are parsed and
    compared statement by statement, to name the old lines a test must execute
-   to see the change.
+   to see the change. A function that binds other names afterwards (its local,
+   cell or free names differ as sets) counts as changed in full, and so does any
+   line whose instructions differ although its text does not.
 
 3. **Name the candidate tests** (`selector/analyze.py`, `selector/covmap.py`).
    `maps/` records, for every test run alone at the pinned commit, each line it
@@ -97,6 +99,13 @@ the patched code**, and selects the ones that fail.
    closures; tables entry by entry; classes attribute by attribute). What comes
    out is the list of (module or class, attribute) pairs that differ, including
    whatever sqlglot itself derived from the changed value while importing.
+   The comparison is also run, whatever the candidates cost, for a commit
+   that needs a fresh import and has an executor test with recorded results
+   (step 5) among its candidates: for instance an edit to the body of a parse
+   function that sqlglot itself calls while it is imported, on a line only
+   tests reach. Nothing is narrowed then, but only the comparison says that
+   the fresh import left what the pinned one left, which is what reusing a
+   recorded result needs.
 
    - No difference: the change cannot be observed (a flag only the type checker
      reads, a `not` on a value nothing uses), and it adds no candidate.
@@ -146,18 +155,29 @@ the patched code**, and selects the ones that fail.
    comparison accounts for. The comparison says "different" for anything it
    does not know how to compare, and the candidates fall back to the rule
    above when it is inconclusive (too many differences, state outside the
-   package changed). When a module no longer imports at all, every test that
+   package changed: the environment, logging, warning filters, the recursion
+   limit, or any builtin). A module that binds a `__builtins__` of its own
+   counts as a difference every test importing it can see: the names its code
+   leaves to the builtins may mean something else. When a module no longer imports at all, every test that
    imports it or a module that depends on it is a candidate, whether or not it
    could "see" the changed class: the comparison is therefore always run
    before tests are left out for that reason.
 
    What the comparison takes for granted, each checked against the pinned
    code: annotations, docstrings and what `typing` records about a TypedDict
-   are not read while tests run; nothing relies on the order of the entries of
-   a table keyed by classes, enum members or strings (sqlglot builds several
-   of them by looping over sets, so their order already differs from run to
-   run); a default or a closure value of a function matters only when the
-   function is called. A function that imports modules on demand (four in
+   are not read while tests run; a default or a closure value of a function
+   matters only when the function is called. The order of the entries of a
+   table (a dict, at any depth below an attribute of a module or class, also
+   inside a function's defaults and closure, a partial or an instance held
+   there) and of a tuple or list of classes is compared where it is fixed: `maps/order.json`
+   lists the attributes whose tables come out in the same order in every fresh
+   import of the pinned package (`tools/build_order.py`: 16 imports, each with
+   its own hash seed and memory layout), and for those another order is a
+   difference (`arg_types` is read in order to give positional arguments their
+   names). Only for the attributes that are not listed, whose order already
+   differs from run to run because sqlglot builds the table by looping over a
+   set, is the order taken as irrelevant, and so is the order of a set. The order of
+   the attributes of an instance (its `__dict__` itself) is not compared. A function that imports modules on demand (four in
    sqlglot) is outside all of this: when it runs depends on which tests ran
    before, so a change to one selects every test. So does a change to a
    function that reads the registry those imports fill (four more, around
@@ -172,7 +192,13 @@ the patched code**, and selects the ones that fail.
 
    - *hot*: when only function bodies changed (and none of them already ran
      while the tests were imported), the child swaps the new code objects into
-     the functions already in memory and runs the tests at once.
+     the functions already in memory and runs the tests at once. A function
+     whose signature changed (parameter names, number, order or kind, whether
+     it is a generator or a coroutine, its free variables, its name) is not
+     swapped: a decorator or a registry reads those when `def` runs and keeps
+     what it found, so such a commit gets a clean import and the comparison of
+     import state, whose differences name the tests that can see what the
+     definition made.
    - *on demand*: sqlglot imports most of its dialects only when one is first
      used, so about half of its modules have never run in the coordinator.
      Nothing of such a module exists in the child, whatever the patch changes
@@ -227,22 +253,6 @@ the patched code**, and selects the ones that fail.
      This holds for any patch, because it is decided by what the patched code
      really sends. The optimizer tests' small DuckDB database is held back the
      same way until a case executes a query.
-   - A patch that changes how a TPC query is written for DuckDB sends texts
-     the record does not have. The setup's views read gzip CSV files anew for
-     every query (15 CPU seconds for the 57 TPC-DS queries, 0.4 for the
-     queries themselves). So a plain SELECT with no recorded answer, sent
-     after a recognised setup, is run on tables that hold exactly what the
-     views show: made by the setup's own `READ_CSV` calls, same rows, same
-     order, same types. What DuckDB may vary between a view and a table is
-     the plan, hence the order of rows where the query leaves it open and the
-     last digits of floating-point sums. The query is therefore run a second
-     time on copies of the tables that store the rows in reverse, and the
-     answer is used only when both frames agree (exactly, sums to nine
-     digits); a result that depends on the order rows arrive in does not
-     pass that, and then, after any error, or for a text that could tell a
-     table from a view (`rowid`, the catalog), the views are asked as before.
-     This is an assumption, stated here: a result that survives reversing
-     every table is what the views give too.
    - `sqlglot.executor.execute` prepares the tables it was given, optimizes
      the query, plans it and runs the plan. The result of the last two steps
      depends on three things: the optimized query, the tables, and the code
@@ -269,7 +279,15 @@ the patched code**, and selects the ones that fail.
        behave differently either, a slot of an unusual shape stays in the
        key (comments that are not a list of strings, meta that is not a flat
        dictionary of plain values, an annotation that is the node itself or
-       holds something that is not an expression).
+       holds something that is not an expression). A node also caches its
+       hash, and the planner hashes nodes. A cached hash is a number of one
+       process, so no digest can cover it; it cannot be seen as long as it
+       is the true one. A patched optimizer can leave a node whose cached
+       hash predates a change below it, in a tree that is otherwise the
+       pinned one (found with a one-token edit of `simplify`). So before a
+       recorded result is used, every cached hash in the tree is compared
+       with a fresh one computed by the node's own class, and put back; one
+       stale hash and the query is executed (`runner.hashes_fresh`).
      - *The tables*: what `ensure_tables` returned for this call must hold
        exactly the pinned tables, by name and by content, at that moment (a
        table changed in place is not the pinned table any more).
@@ -284,9 +302,35 @@ the patched code**, and selects the ones that fail.
        other code must not be one it runs); a plain data
        attribute of a class must not be one it read (`execattrs.json`:
        recorded with a descriptor in the attribute's place that notes every
-       read through the class, a subclass or an instance); any other constant
-       must not be named in any function it runs (`execnames.json`);
-       anything else (an attribute added or removed, other bases, a
+       read through the class, a subclass or an instance; when the attribute
+       holds a table, a dict that differs in some entries only, the query
+       must have walked the table or looked one of those entries up:
+       `tools/recdict.py` puts a recording dict in the table's place, a
+       lookup and an entry are the same key when `state.key_names` gives them
+       a common name, and what a query looked up counts only if it ran the
+       same lines with and without the recording dicts); any other constant
+       must not be named by a statement it runs (`execnames.json`: a name or
+       attribute written in the code is read by the statement it stands in;
+       a name that only occurs in a string, an import or a `global` line
+       counts for its whole function); any other name of a module with
+       another value (a function replaced by a changed decorator, an object
+       made at import) is read the same way, by the statements that name it,
+       the names Python itself asks a module for (two underscores) excepted;
+       a name in capitals that appears or
+       vanishes (a constant renamed at its definition) is seen the same way,
+       by the statements that name it, as long as the lines of that code
+       that look a name up by a computed text or walk a namespace are the
+       ones reviewed at the pinned commit (the generator's `dir(cls)` for
+       names ending in `_sql`; `eval` of generated code in a dict built from
+       the executor's function table); that function table itself (`ENV` in
+       `executor/env.py`) is copied by every query, and a query uses of it
+       only the entries its code names, so a table that differs in some
+       entries concerns the queries whose evaluated code names one of them
+       (all names of every piece of code a query evaluates are recorded,
+       and the key of the one lookup by a computed name; used only while the
+       lines of the package that mention the table or a copy of it are the
+       ones this was read off);
+       anything else (other added or removed attributes, other bases, a
        difference on the classes the recorded results are made of) turns the
        reuse off, as does an inconclusive comparison or a patch outside
        `sqlglot/`. A patched module that is imported on demand is imported
@@ -303,7 +347,12 @@ the patched code**, and selects the ones that fail.
        result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
-     shared by the children.
+     shared by the children. A child that imports the patched tree afresh
+     cannot take the tables (their class may have changed), but for a patch
+     that touches no file outside `sqlglot/` the rows are what they were:
+     the files and the test code that parses them are untouched. Such a child
+     skips the parsing only and builds every table with the patched class
+     from the rows parsed at the pinned commit.
 
 6. **Weigh running against selecting** (`selector/main.py`). Running a test
    costs CPU seconds; selecting it costs its recorded seconds on a worker. A
@@ -336,6 +385,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `warm.json` | `build_map.py` | code that already ran once the test modules are imported |
 | `uses.bin`, `mentions.bin`, `classes.json`, `families.json` | `build_extra.py` | class → tests that instantiate or name it |
 | `readers.bin`, `constants.json` | `build_extra.py` | constant → tests that execute a line reading it |
+| `order.json` | `build_order.py` | module or class attribute → its tables come out in the same order in every fresh import |
 | `tcov.bin`, `tcov.json` | `trace_all.py` with `BR_TRACE_SPLIT=1`, `build_tcov.py` | (code object, line) → tests that execute it while the test itself runs, sqlglot being imported in full beforehand |
 | `treaders.bin` | `build_extra.py` | constant → tests that read it while the test itself runs |
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |

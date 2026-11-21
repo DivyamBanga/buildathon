@@ -25,7 +25,6 @@ import importlib.machinery
 import importlib.util
 import io
 import os
-import re
 import shutil
 import sys
 import unittest
@@ -425,106 +424,6 @@ def _only_reads(query: str) -> bool:
     return not any(word in lowered for word in ("nextval", "currval", "setseed", "into ", "pragma", "attach"))
 
 
-# A setup statement that makes a view of a whole CSV file, and nothing else.
-_CSV_VIEW = re.compile(r"\s*CREATE VIEW (\w+) AS\s+(SELECT \*\s+FROM READ_CSV\(.*\))\s*", re.DOTALL)
-# Words of a query that could tell a table from a view of the same rows, or look at the catalog.
-_NOT_FOR_TABLES = (
-    "rowid", "information_schema", "duckdb_", "pragma", "sqlite_", "pg_catalog", "describe", "summarize",
-    "current_schema", "current_setting", "table_info", "read_csv", "glob(", "getvariable", "main.", "memory.",
-    "temp.", "system.", "backwards",
-)
-# setup statements (as sent) -> (connection on the tables, connection on the same tables in reverse row order), or None
-_TABLE_COPIES: dict = {}
-
-
-def _table_copies(connect, statements: tuple):
-    """Two connections to tables holding what the setup's views show: rows as the files give them, and reversed."""
-    if statements not in _TABLE_COPIES:
-        copies = None
-        views = [_CSV_VIEW.fullmatch(statement) for statement in statements]
-        if views and all(views):
-            try:
-                forward = connect()
-                for view in views:
-                    forward.execute(f"CREATE TABLE {view.group(1)} AS {view.group(2)}")
-                forward.execute("CREATE SCHEMA backwards")
-                for view in views:
-                    name = view.group(1)
-                    forward.execute(f"CREATE TABLE backwards.{name} AS SELECT * FROM main.{name} ORDER BY rowid DESC")
-                backward = forward.cursor()
-                backward.execute("SET schema = 'backwards'")
-                copies = (forward, backward)
-            except Exception:
-                copies = None
-        _TABLE_COPIES[statements] = copies
-    return _TABLE_COPIES[statements]
-
-
-def _same_frames(one, other) -> bool:
-    """Two result frames are the same: names, types and every value, floating-point values to nine digits."""
-    import numpy
-
-    if list(one.columns) != list(other.columns) or len(one) != len(other) or list(one.dtypes) != list(other.dtypes):
-        return False
-    for position in range(one.shape[1]):
-        left, right = one.iloc[:, position], other.iloc[:, position]
-        if left.dtype.kind == "f":
-            # Sums taken in another order differ in their last digits, never in the ninth.
-            if not numpy.allclose(left.to_numpy(), right.to_numpy(), rtol=1e-9, atol=0.0, equal_nan=True):
-                return False
-        elif not left.equals(right):
-            return False
-    return True
-
-
-def _frame_from_tables(connect, statements: tuple, query: str):
-    """DuckDB's answer to a plain SELECT over the setup's views, computed on tables; None when it cannot be vouched for.
-
-    The views read gzip CSV files, anew for every query: fifty times the cost
-    of the query itself. The tables hold exactly the rows the views show, in
-    the same order and with the same types (they are made by the setup's own
-    READ_CSV calls), so a query means the same on both. What DuckDB is free to
-    vary between the two is the plan, and with it the order of rows where the
-    query leaves it open and the last digits of floating-point sums. So the
-    query is run twice, on the tables and on copies whose rows are stored in
-    reverse: a result that depends on the order rows arrive in differs
-    between the two, and then, or after any error, the views are asked.
-    """
-    lowered = query.lower()
-    if any(word in lowered for word in _NOT_FOR_TABLES):
-        return None
-    copies = _table_copies(connect, statements)
-    if copies is None:
-        return None
-    try:
-        frame = copies[0].execute(query).fetchdf()
-        other = copies[1].execute(query).fetchdf()
-        same = _same_frames(frame, other)
-    except BaseException as error:  # noqa: BLE001 - whatever it is, the real connection will say
-        if isinstance(error, (KeyboardInterrupt, SystemExit, MemoryError)):
-            raise
-        return None
-    return frame if same else None
-
-
-class _Frame:
-    """Stands in for a DuckDB result whose frame was computed on the table copies."""
-
-    def __init__(self, connection, query: str, frame) -> None:
-        self._connection = connection
-        self._query = query
-        self._frame = frame
-
-    def fetchdf(self):
-        return self._frame.copy()  # a fresh frame each time: callers rename columns in place
-
-    df = fetchdf
-
-    def __getattr__(self, name):
-        # Anything else is asked of DuckDB itself.
-        return getattr(self._connection._run(self._query), name)
-
-
 class _ProbingConnection:
     """Stands in for a DuckDB connection until DuckDB is really needed.
 
@@ -535,11 +434,9 @@ class _ProbingConnection:
     succeed on a fresh connection, so they will here, whenever they are run.
     Once the whole setup has been sent, a query the record has DuckDB's answer
     for is given that answer (the executor tests' TPC queries, maps/duckdb.bin).
-    Any other plain SELECT is answered from tables that hold what the setup's
-    views show, when that answer can be vouched for (_frame_from_tables).
 
-    Anything else, a statement that is not the setup's next one, a query that
-    could not be answered that way, any other use of the connection, opens the real
+    Anything else, a statement that is not the setup's next one, a query with
+    no recorded answer, any other use of the connection, opens the real
     connection, sends it what was held back, and is passed on. After a
     statement that is neither recognised nor a plain SELECT nothing is
     answered from the record any more.
@@ -556,8 +453,6 @@ class _ProbingConnection:
         self._held: list = []  # statements not yet sent to DuckDB, as given
         self._sent: list | None = []  # the same with the checkout's path marked; None: no longer a known setup
         self._answers = None
-        self._given: list = []  # the setup's statements, as given
-        self._setup: tuple | None = None  # those statements once the whole setup is recognised
 
     def _real(self):
         """The real connection, brought to where this one stands."""
@@ -572,7 +467,6 @@ class _ProbingConnection:
     def _forget(self) -> None:
         self._sent = None
         self._answers = None
-        self._setup = None
 
     def execute(self, query, *args, **kwargs):
         if args or kwargs or type(query) is not str:
@@ -585,10 +479,6 @@ class _ProbingConnection:
                 return _Answer(self, query, data)
             if not _only_reads(query):
                 self._forget()
-            elif self._setup is not None:
-                frame = _frame_from_tables(self._connect, self._setup, query)
-                if frame is not None:
-                    return _Frame(self, query, frame)
             return self._real().execute(query)
         sent = self._sent
         if sent is None:
@@ -603,11 +493,9 @@ class _ProbingConnection:
             self._sent = None
             return self._real().execute(query)
         sent.append(text)
-        self._given.append(query)
         if found is not None:
             self._sent = None
             self._answers = found
-            self._setup = tuple(self._given)
         if self._connection is None:
             self._held.append(query)
             return self
@@ -618,7 +506,6 @@ class _ProbingConnection:
         return self._real().execute(query)
 
     def close(self):
-        self._setup = None
         if self._connection is not None:
             return self._connection.close()
         self._held = []
@@ -697,7 +584,17 @@ def build_executor_tables() -> None:
     global EXECUTOR_TABLES
     import duckdb
 
-    test_class = sys.modules["tests.test_executor"].TestExecutor
+    global _SETUP_USES
+    module = sys.modules["tests.test_executor"]
+    test_class = module.TestExecutor
+    _SETUP_USES = (
+        test_class.__dict__["setUpClass"].__func__.__code__,
+        module.csv,
+        module.csv.reader,
+        module.ast,
+        module.ast.literal_eval,
+        module.open_file,
+    )
     real_connect = duckdb.connect
     duckdb.connect = lambda *args, **kwargs: _NoConnection()
     try:
@@ -742,6 +639,107 @@ def _use_executor_tables() -> None:
     test_class.setUpClass = classmethod(setUpClass)
 
 
+# True in a child that imports the patched tree afresh and whose patch touches
+# nothing outside sqlglot/: the executor tests' class setup takes the rows the
+# pinned setup parsed (see _use_executor_rows).
+CLEAN_ROWS = False
+
+
+# What the pinned class setup of the executor tests uses to turn the fixture
+# files into rows: its own code, csv and its reader, ast and literal_eval, and
+# the test module's open_file (set by build_executor_tables).
+_SETUP_USES = None
+
+
+def _setup_as_pinned(module, test_class) -> bool:
+    """True when the class setup would parse the fixture files here with what it parsed them with at the pinned commit."""
+    try:
+        code, csv_module, csv_reader, ast_module, literal_eval, pinned_open = _SETUP_USES
+        opener = module.open_file
+        return (
+            test_class.__dict__["setUpClass"].__func__.__code__ == code
+            and module.csv is csv_module
+            and csv_module.reader is csv_reader
+            and module.ast is ast_module
+            and ast_module.literal_eval is literal_eval
+            and type(opener) is type(pinned_open)
+            and opener.__code__ == pinned_open.__code__
+            and opener.__defaults__ == pinned_open.__defaults__
+            and opener.__kwdefaults__ == pinned_open.__kwdefaults__
+            and opener.__closure__ is None
+            and pinned_open.__closure__ is None
+            # Every name its code leaves to its module is the same object in both, or missing in both.
+            and all(
+                opener.__globals__.get(name, _SETUP_USES) is pinned_open.__globals__.get(name, _SETUP_USES)
+                for name in pinned_open.__code__.co_names
+            )
+        )
+    except Exception:
+        return False
+
+
+class _HeaderOnlyCsv:
+    """Stands in for the csv module while a class setup runs: every file is a header and nothing else."""
+
+    @staticmethod
+    def reader(*args, **kwargs):
+        return iter([[]])
+
+
+def _use_executor_rows() -> None:
+    """After a clean import: have TestExecutor.setUpClass skip the CSV parsing, and nothing else.
+
+    The setup reads the TPC fixtures with the test module's own code and the
+    standard library, and hands the rows to sqlglot's Table. For a patch that
+    touches nothing outside sqlglot/ the files and the test code are what they
+    were at the pinned commit, and _setup_as_pinned checks that the code the
+    setup parses with (its own, the module's open_file, csv.reader,
+    ast.literal_eval) is too: then so are the rows. The tables themselves are
+    still made here, by the patched Table class, called as the setup calls it,
+    with a copy of the list of those rows: whatever the patch changed runs.
+    """
+    module = sys.modules.get("tests.test_executor")
+    test_class = getattr(module, "TestExecutor", None)
+    if test_class is None or EXECUTOR_TABLES is None or "_br_rows" in test_class.__dict__:
+        return
+    if not _setup_as_pinned(module, test_class):
+        return
+    rows_of: dict = {}
+    for tables in EXECUTOR_TABLES:
+        for table in tables.values():
+            columns = tuple(table.columns)
+            if columns in rows_of:
+                return  # two tables with the same columns cannot be told apart
+            rows_of[columns] = table.rows
+    original = test_class.__dict__["setUpClass"].__func__
+
+    def setUpClass(cls):
+        real_table = module.Table
+        unknown = []
+
+        def table(columns, rows):
+            pinned = rows_of.get(tuple(columns))
+            if pinned is None:
+                unknown.append(columns)
+                return real_table(columns=columns, rows=rows)
+            return real_table(columns=columns, rows=list(pinned))
+
+        saved = module.csv, module.Table, module.open_file
+        module.csv = _HeaderOnlyCsv
+        module.open_file = lambda name: ()
+        module.Table = table
+        try:
+            original(cls)
+        finally:
+            module.csv, module.Table, module.open_file = saved
+        if unknown:
+            # Not the tables that were parsed at the pinned commit: the setup does all of it.
+            original(cls)
+
+    test_class.setUpClass = classmethod(setUpClass)
+    test_class._br_rows = True
+
+
 # What sqlglot's own executor returns for the TPC queries at the pinned commit,
 # keyed by the optimized query it was given (maps/execmemo.bin).
 EXECUTOR_MEMO = None
@@ -750,9 +748,10 @@ EXECUTOR_MEMO = None
 MEMO_SCOPE = None
 MEMO_TESTS = {"test_execute_tpch": "tpch", "test_execute_tpcds": "tpcds"}
 # memo key -> (bit mask of the phase lines, bit mask of the attributes) that one
-# query runs and reads when it is planned and executed, and for each slot of
-# SLOTS the digest of what the nodes of its tree hold there if that execution
-# reads the slot, else "" (maps/execqueries.bin).
+# query runs and reads when it is planned and executed; for each slot of SLOTS
+# the digest of what the nodes of its tree hold there if that execution reads
+# the slot, else ""; and for an attribute that holds a table and was only ever
+# looked up by key, {attribute number: names of those keys} (maps/execqueries.bin).
 EXECUTOR_QUERIES = None
 # (phase lines, attributes) the patch changes, or None when it changes none:
 # a recorded result is used only for a query whose own record touches neither.
@@ -787,12 +786,39 @@ def read_executor_queries(path: str) -> dict:
         with open(path, "rb") as handle:
             raw = marshal.loads(zlib.decompress(handle.read()))
         return {
-            key: (int.from_bytes(lines, "little"), int.from_bytes(attributes, "little"), tuple(slots))
-            for key, (lines, attributes, slots) in raw.items()
+            key: (
+                int.from_bytes(lines, "little"),
+                int.from_bytes(attributes, "little"),
+                tuple(slots),
+                {number: frozenset(names) for number, names in keyed.items()},
+            )
+            for key, (lines, attributes, slots, keyed) in raw.items()
             if len(slots) == len(SLOTS)
         }
     except Exception:
         return {}
+
+
+def query_touched(own: tuple, block: tuple) -> bool:
+    """Does a patch reach one query? `own` is the query's record (see EXECUTOR_QUERIES).
+
+    `block` says what the patch changes of what the phase runs and reads:
+    (bit mask of lines, bit mask of attributes, {attribute number: names of
+    the entries that differ}) for attributes that hold a table whose other
+    entries are what they were. A query reads such an attribute harmlessly
+    when it only ever looked up keys, none of them one of those entries
+    (state.key_names: a lookup and an entry mean the same key when they
+    share a name).
+    """
+    rows, reads, entries = block
+    if own[0] & rows or own[1] & reads:
+        return True
+    for number, names in entries.items():
+        if own[1] >> number & 1:
+            mine = own[3].get(number)
+            if mine is None or not names.isdisjoint(mine):
+                return True
+    return False
 
 
 def _query_untouched(key: str, slots: tuple) -> bool:
@@ -808,14 +834,15 @@ def _query_untouched(key: str, slots: tuple) -> bool:
     if own is None or any(recorded and recorded != now for recorded, now in zip(own[2], slots)):
         return False
     block = MEMO_BLOCK
-    return block is None or (not own[0] & block[0] and not own[1] & block[1])
+    return block is None or not query_touched(own, block)
 
 
 class _Planned:
     """Stands in for the plan of a query until its executor decides whether the result is known."""
 
-    def __init__(self, expression, digest: str, slots: tuple) -> None:
+    def __init__(self, expression, fresh: bool, digest: str, slots: tuple) -> None:
         self.expression = expression
+        self.fresh = fresh  # no cached hash in the tree is out of date (hashes_fresh)
         self.digest = digest  # of the tree without the slots: the key
         self.slots = slots  # one digest per slot of SLOTS
 
@@ -974,6 +1001,43 @@ def tree_digests(root) -> tuple[str, tuple[str, str, str]]:
     return hashers[0].hexdigest(), tuple(hasher.hexdigest() for hasher in hashers[1:])
 
 
+def hashes_fresh(root) -> bool:
+    """True when no node of the tree carries a cached hash other than the one hashing it now gives.
+
+    A node caches its hash in a fourth slot, and the planner hashes nodes
+    (dictionaries and sets of expressions). The digests do not cover that
+    slot: a cached hash is a number of this process. Where every cached hash
+    is the true one the cache cannot be seen. A patch to the optimizer can
+    leave a node whose cached hash predates a change below it, with the tree
+    otherwise the pinned one; such a tree is not the recorded one to the
+    planner. So every cached hash is compared with a fresh one, computed by
+    the node's own class, and put back: the tree is left exactly as it was.
+    """
+    nodes = []
+    seen = set()
+    todo = [root]
+    while todo:
+        node = todo.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        nodes.append(node)
+        for value in list(node.args.values()) + [getattr(node, "_type", None)]:
+            for item in value if type(value) is list else (value,):
+                if type(getattr(item, "args", None)) is dict and hasattr(item, "parent"):
+                    todo.append(item)
+    saved = [(node, node._hash) for node in nodes]
+    try:
+        for node in nodes:
+            node._hash = None
+        return all(cached is None or hash(node) == cached for node, cached in saved)
+    except Exception:
+        return False
+    finally:
+        for node, cached in saved:
+            node._hash = cached
+
+
 def tree_digest(root) -> str:
     """One digest of an expression tree with everything in it (see tree_digests)."""
     import hashlib
@@ -1081,10 +1145,12 @@ def install_executor_memo() -> None:
         scope = MEMO_SCOPE
         if scope is None:
             return real_plan(expression)
+        # Looked at before the phase begins: the check is ours, not something the query runs.
+        fresh = hashes_fresh(expression)
         if MEMO_PHASE is not None:
             MEMO_PHASE("X")
         try:
-            return _Planned(expression, *tree_digests(expression))
+            return _Planned(expression, fresh, *tree_digests(expression))
         except Exception:
             return real_plan(expression)
 
@@ -1106,11 +1172,13 @@ def install_executor_memo() -> None:
                     and MEMO_RECORD is None
                     and EXECUTOR_MEMO is not None
                     and key in EXECUTOR_MEMO
+                    and planned.fresh
                     and _query_untouched(key, planned.slots)
                 ):
                     return pickle.loads(EXECUTOR_MEMO[key])
                 result = real_executor(*self._args, **self._kwargs).execute(real_plan(planned.expression))
-                if MEMO_RECORD is not None and key is not None:
+                # A result is recorded only for a tree whose cached hashes are all true ones.
+                if MEMO_RECORD is not None and key is not None and planned.fresh:
                     name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{len(os.listdir(MEMO_RECORD))}")
                     with open(name, "wb") as handle:
                         pickle.dump((key, planned.slots, pickle.dumps(result, protocol=4)), handle)
@@ -1444,6 +1512,8 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
             for index, _ in members:
                 emit(f"R {index} 1\n")
             continue
+        if CLEAN_ROWS and module_name == "tests.test_executor":
+            _use_executor_rows()
         cases = []
         for index, method in members:
             try:
@@ -1471,7 +1541,7 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
-    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK
+    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK, CLEAN_ROWS
     code = 0
     try:
         os.setpgid(0, 0)
@@ -1510,6 +1580,7 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
             if changes:
                 _keep_resolved_paths_in(overlay, root)
             MEMO_AFTER_IMPORT = bool(job.get("executor_memo") and EXECUTOR_MEMO and EXECUTOR_TABLES is not None)
+            CLEAN_ROWS = bool(job.get("executor_rows") and EXECUTOR_TABLES is not None)
         else:
             lazy = list(job.get("lazy") or ())
             swaps = []
