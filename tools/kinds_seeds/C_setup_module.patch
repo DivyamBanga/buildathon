@@ -1,0 +1,13 @@
+diff --git a/tests/test_time.py b/tests/test_time.py
+--- a/tests/test_time.py
++++ b/tests/test_time.py
+@@ -1,5 +1,9 @@
+ import re
+ import unittest
++
++
++def setup_module():
++    raise RuntimeError('x')
+ import sys
+ 
+ from sqlglot.dialects.dialect import Dialect, Dialects

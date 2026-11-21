@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import marshal
 import os
+import re
 import posixpath
 
 from . import patchlib, pydiff
@@ -20,6 +21,13 @@ from .covmap import CovMap
 # so a change to how pytest is configured cannot be reproduced by running.
 _PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py")
 _MAYBE_PYTEST_CONFIG = ("pyproject.toml", "setup.cfg")
+# What only pytest honours in a unittest-based test file: its name, the xunit hooks (the runner calls
+# setUpModule and setUp, never these), marks, fixtures, collection switches.
+_PYTEST_ONLY = re.compile(
+    r"pytest|\b(?:setup|teardown)_(?:module|function|class|method)\b|\b(?:setUp|tearDown)Module\b"
+    r"|__test__|\bnose\b|collect_ignore|\bxfail\b|\bfixture\b",
+    re.IGNORECASE,
+)
 # Only these two trees are reproduced faithfully for a child: a test that
 # resolves the real location of its own file ends up in the pinned checkout
 # for anything else.
@@ -414,16 +422,16 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
         return
     if patch.old_text is None:
         return
-    added = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] == "+").lower()
-    if "pytest" in added:
-        # Added lines that speak to pytest (marks, skips, fixtures, hooks): only
-        # pytest sees them, so the tests of the file, or those that import it
+    touched = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-")
+    if _PYTEST_ONLY.search(touched):
+        # Added or removed lines that speak to pytest (marks, skips, fixtures, the
+        # hooks only it calls): only pytest sees them, so the tests of the file, or those that import it
         # when it is a helper, are selected as they are.
         found = covmap.tests_of_file(old_path) | covmap.file_any(old_path)
         plan.candidates |= found
         plan.rest_candidates |= found
         plan.unverified |= found
-        plan.note(f"{path}: added lines mention pytest, {found.bit_count()} tests selected unchecked")
+        plan.note(f"{path}: lines about pytest-only behaviour changed, {found.bit_count()} tests selected unchecked")
 
 
 def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:

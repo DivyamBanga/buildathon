@@ -46,27 +46,34 @@ the patched code**, and selects the ones that fail.
    analysed one by one against the pinned file here, which is not what applying
    them in order gives.
 
-   **Added lines that mention pytest**, in a file under `tests/`, select every
-   test of that file unchecked, and every test that imports it when it is a
-   helper module. Marks, skips, fixtures and hooks mean something only to
-   pytest, and the runner uses unittest, so running the test says nothing.
-   (A new or changed `conftest.py` and the pytest configuration files select
-   everything, as before.)
+   **Changed lines that speak to pytest**, in a file under `tests/` (the word
+   itself, marks, fixtures, `xfail`, `__test__`, and the hooks only pytest calls
+   on a unittest module or class: `setup_module`, `teardown_module`,
+   `setup_class`, `setup_method`, `setup_function` and their `teardown_`
+   twins), select every test of that file unchecked, and every test that
+   imports it when it is a helper module. Added and removed lines count. The
+   runner uses unittest, which ignores all of these, so running the test says
+   nothing. (A new or changed `conftest.py` and the pytest configuration files
+   select everything, as before.)
 
    **New tests and helpers in a test file.** A file that only gained whole new
    tests, test classes or helper functions selects nothing, but only if what
    was added can neither act nor be found by existing code. pytest runs the new
    test in the same process as every other, so a new or changed statement that
-   stores to anything but its own locals and `self` (an attribute or subscript
-   store or `del` on something else, `setattr`, `delattr`, `global`,
-   `nonlocal`), in a new or an edited test file, selects every test. A new
+   may act outside its own locals, in a new or an edited test file, selects
+   every test: an attribute or subscript store or `del` on anything but `self`
+   (and on `self` anywhere but in a method that never rebinds it nor passes it
+   on as another parameter), `global`, `nonlocal`, a read of `__dict__`,
+   `__class__` and the like, and a call named like something that changes
+   shared state or runs text (`setattr`, `update`, `clear`, `pop`, `append`,
+   `exec`, `eval`, `reload`, `patch`, `start`, `register`, `setenv`, ...). The
+   list of call names is a list, not a proof: a call into sqlglot that changes
+   a shared table under another name is not found. A new
    module-level name must not be a builtin or a name the old module loads
    anywhere (existing code would find the new one); a new method must not be a
    name `unittest.TestCase` has, one the old module reads as an attribute or
    defines elsewhere, or the name of any test in the suite. Otherwise the file
-   counts as changed, and its own tests run as for any edited test file. A
-   store done by a method that is called (`registry.update(...)`) is not looked
-   for.
+   counts as changed, and its own tests run as for any edited test file.
 
    **A file that appears or vanishes** changes what its directory lists. The
    tests that listed that directory in their own run (`dirs.json`, from the
@@ -318,8 +325,8 @@ observed failing on the patched code or could not be ruled out.
   patched files: redirected `open` and `io.open_code`, resolved paths that
   stay in the overlay, and modules imported on demand from patched text.
 - `tools/test_kinds.py` holds the unit checks for the rules about kinds of
-  change that one test run cannot settle (a path in several sections, added
-  lines that mention pytest, new tests and helpers that store outside their
+  change that one test run cannot settle (a path in several sections, changed
+  lines that speak to pytest, new tests and helpers that store outside their
   locals or shadow a name, a file that appears or vanishes) and replays the
   patches in `tools/kinds_seeds/`: each was a commit for which pytest failed a
   test and the selector selected nothing of the kind.
