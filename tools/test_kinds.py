@@ -80,7 +80,8 @@ for label, body in (
     expect("E: new test, " + label + " (accepted?)", added(METHOD.format(body)), False)
     expect("E: new test, " + label + " (flagged?)", effects(text), True)
 expect("E: new helper function, module store", effects(TESTS + "\n\ndef other(y):\n    helper.cache = y\n"), True)
-expect("E: new helper function, locals", effects(TESTS + "\n\ndef other(y):\n    y.append(1)\n    return y\n"), False)
+expect("E: new helper function, locals", effects(TESTS + "\n\ndef other(y):\n    z = [y]\n    return z\n"), False)
+expect("E: new helper function, a call that mutates its argument", effects(TESTS + "\n\ndef other(y):\n    y.append(1)\n    return y\n"), True)
 expect("E: module level store", effects(TESTS + "\nunittest.foo = 1\n"), True)
 expect("E: class level store", effects(TESTS + "\nTestA.extra = 1\n"), True)
 expect("E: module level name", effects(TESTS + "\nVALUE = 1\n"), False)
@@ -98,6 +99,27 @@ expect("E: harmless new module with a store", pydiff.harmless_new_test_module(
     "import os\n\n\ndef test_a():\n    os.environ['A'] = '1'\n"), False)
 expect("E: harmless new module", pydiff.harmless_new_test_module(
     "import os\n\n\ndef test_a():\n    x = os.sep\n    assert x\n"), True)
+
+# calls and tricks that change shared state without a store statement
+for label, body in (
+    ("clear on a class table", "import sqlglot\nsqlglot.Parser.FUNCTIONS.clear()"),
+    ("environ update", "import os\nos.environ.update({})"),
+    ("mock patch started", "from unittest import mock\nmock.patch.object(object, 'x').start()"),
+    ("exec", "exec('x = 1')"),
+    ("reload", "import importlib, sqlglot\nimportlib.reload(sqlglot)"),
+    ("self rebound to a class", "import sqlglot\nself = sqlglot.Parser\nself.FUNCTIONS = {}"),
+    ("nested def taking self", "import sqlglot\ndef f(self):\n    self.F = {}\nf(sqlglot.Parser)"),
+    ("dict of a class", "import sqlglot\nsqlglot.Parser.__dict__"),
+):
+    text = METHOD.format("\n".join("        " + row for row in body.split("\n")))
+    expect("E: " + label, added(text), False)
+    expect("E: " + label + ", as new_global_effects", effects(TESTS + text), True)
+expect("E: a helper whose parameter is called self", added("\n\ndef helper2(self):\n    self.F = 1\n"), False)
+expect("E: the same store in a method of the class", added(METHOD.format("        self.F = 1")), True)
+expect("E: a plain assertion", added(METHOD.format("        self.assertEqual(helper(1).real, 1)")), True)
+expect("E: a store to self in a new class", added("\n\nclass B:\n    def setUp(self):\n        self.x = 1\n"), True)
+expect("E: a class whose setUp clears a table", added(
+    "\n\nclass B:\n    def setUp(self):\n        import sqlglot\n        sqlglot.Parser.FUNCTIONS.clear()\n"), False)
 
 # ---- F: a new name must not change what existing code finds ---------------
 
@@ -214,6 +236,17 @@ expect("seed E: everything", plan.select_all, True)
 plan = seed("F_shadow_builtin")
 expect("seed F: not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
 expect("seed F: the shadowed test is a candidate", selected(plan, "tests/test_helper.py::TestHelper::test_tsort"), True)
+
+TIME_TESTS = covmap.tests_of_file("tests/test_time.py")
+for name in ("C_setup_module", "C_setup_method"):
+    expect("seed " + name + ": the tests of the file, unchecked", seed(name).unverified & TIME_TESTS, TIME_TESTS)
+for hook in ("def teardown_class(cls):", "def teardown_function(f):", "def setup_class(cls):", "def teardown_method(self):", "def setUpModule():"):
+    expect("C: " + hook, plan_for(comment_patch("tests/test_time.py", hook)).unverified & TIME_TESTS, TIME_TESTS)
+for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
+    if name.startswith("E_"):
+        plan = seed(name[:-6])
+        expect("seed " + name[:-6] + ": not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
+        expect("seed " + name[:-6] + ": selected", plan.select_all or plan.candidates != 0, True)
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):

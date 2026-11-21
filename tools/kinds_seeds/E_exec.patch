@@ -1,0 +1,13 @@
+diff --git a/tests/dialects/test_bigquery.py b/tests/dialects/test_bigquery.py
+--- a/tests/dialects/test_bigquery.py
++++ b/tests/dialects/test_bigquery.py
+@@ -232,6 +232,9 @@
+                 )
+                 self.assertEqual(expression.sql("duckdb"), expected)
+ 
++    def test_zz_pollute(self):
++        exec('import sqlglot\nsqlglot.Parser.FUNCTIONS = {}')
++
+     def test_bigquery(self):
+         # Presto's SHA512 takes VARBINARY, so annotated string args are wrapped in TO_UTF8
+         expr = self.parse_one("SELECT SHA512('foo')")

@@ -1,0 +1,14 @@
+diff --git a/tests/dialects/test_bigquery.py b/tests/dialects/test_bigquery.py
+--- a/tests/dialects/test_bigquery.py
++++ b/tests/dialects/test_bigquery.py
+@@ -17,6 +17,10 @@
+ from tests.dialects.test_dialect import Validator
+ from sqlglot.optimizer.annotate_types import annotate_types
+ from sqlglot.optimizer.qualify import qualify
++
++
++def zz_helper(self):
++    self.FUNCTIONS = {}
+ 
+ 
+ class TestBigQuery(Validator):

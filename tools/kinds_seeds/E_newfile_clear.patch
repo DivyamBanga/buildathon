@@ -1,0 +1,13 @@
+diff --git a/tests/dialects/test_aaa_new.py b/tests/dialects/test_aaa_new.py
+new file mode 100644
+--- /dev/null
++++ b/tests/dialects/test_aaa_new.py
+@@ -0,0 +1,8 @@
++import unittest
++
++import sqlglot
++
++
++class TestAaa(unittest.TestCase):
++    def test_zz_pollute(self):
++        sqlglot.Parser.FUNCTIONS.clear()

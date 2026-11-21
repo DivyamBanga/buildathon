@@ -397,8 +397,11 @@ def _bound_names(body: list) -> set[str]:
     return names
 
 
-def _plain_function(node) -> bool:
-    """A def that cannot fail or act when it is merely defined."""
+def _plain_function(node, method: bool = False) -> bool:
+    """A def that cannot fail or act when it is merely defined.
+
+    `method` is true for a def directly in a class body: stores to `self` count as its own there.
+    """
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.decorator_list:
         return False
     arguments = node.args
@@ -406,34 +409,70 @@ def _plain_function(node) -> bool:
     if any(not isinstance(default, ast.Constant) for default in defaults):
         return False
     annotated = [a.annotation for a in arguments.posonlyargs + arguments.args + arguments.kwonlyargs]
-    return node.returns is None and not any(annotated) and not any(_global_effects(node))
+    return node.returns is None and not any(annotated) and not any(_global_effects(node, "", _own_self(node) if method else False))
 
 
-def _global_effects(tree, scope: str = ""):
-    """Signatures of the statements under `tree` that can store outside the local scope.
+# calls that change something other than the callee's own locals, or run arbitrary text
+_MUTATORS = frozenset((
+    "setattr", "delattr", "__setattr__", "__delattr__", "__setitem__", "__delitem__", "exec", "eval", "compile",
+    "__import__", "import_module", "reload", "update", "pop", "popitem", "clear", "setdefault", "append", "extend",
+    "insert", "remove", "add", "discard", "sort", "reverse", "start", "patch", "register", "setenv", "putenv",
+    "unsetenv", "chdir", "chroot", "filterwarnings", "simplefilter", "setrecursionlimit", "settrace", "setprofile",
+    "disable", "_exit", "exit", "signal", "set", "setLevel", "addHandler", "addFilter", "monkeypatch",
+    "__init_subclass__", "setUpClass", "tearDownClass", "addCleanup", "enterContext",
+))
+_ESCAPES = frozenset(("__dict__", "__class__", "__globals__", "__builtins__", "__code__", "__bases__", "__mro__", "__subclasses__"))
+
+
+def _rebinds_self(func) -> bool:
+    for node in ast.walk(func):
+        if isinstance(node, ast.Name) and node.id == "self" and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return True
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            return True
+    # a second parameter named self anywhere inside (a nested def or a lambda)
+    return sum(1 for node in ast.walk(func) if isinstance(node, ast.arg) and node.arg == "self") > 1
+
+
+def _own_self(node) -> bool:
+    return bool(node.args.args) and node.args.args[0].arg == "self" and not _rebinds_self(node)
+
+
+def _global_effects(tree, scope: str = "", method_ok: bool = False):
+    """Signatures of the statements under `tree` that can act outside the local scope.
 
     A function that only stores to its own locals and to attributes of `self`
-    leaves every other test as it was; these are the ones that do not: an
-    attribute or subscript store (or `del`) on anything but `self`, `setattr` and
-    `delattr`, and `global` or `nonlocal`.
+    leaves every other test as it was. These are the ones that may not:
+    `global` or `nonlocal`; an attribute or subscript store (or `del`) on
+    anything but `self`, and on `self` unless it sits in a def directly in a
+    class body whose first parameter is `self` and which never rebinds it, nor
+    takes another parameter of that name; a call named like something that
+    changes shared state or runs text (`setattr`, `update`, `clear`, `exec`,
+    `reload`, `patch`, ...; a list of names, not a proof); and a read of
+    `__dict__`, `__class__`, `__globals__` and the like.
     """
     found = []
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            found.extend(_global_effects(node, scope + "." + node.name))
+            own = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(tree, ast.ClassDef) and _own_self(node)
+            found.extend(_global_effects(node, scope + "." + node.name, own))
             continue
         flagged = False
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             flagged = True
         elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            flagged = not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self")
+            flagged = not (
+                method_ok and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self"
+            )
+        elif isinstance(node, ast.Attribute) and node.attr in _ESCAPES:
+            flagged = True
         elif isinstance(node, ast.Call):
             callee = node.func
             name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
-            flagged = name in ("setattr", "delattr", "__setattr__", "__delattr__")
+            flagged = name in _MUTATORS
         if flagged:
             found.append((scope, ast.dump(node)))
-        found.extend(_global_effects(node, scope))
+        found.extend(_global_effects(node, scope, method_ok))
     return found
 
 
@@ -488,14 +527,14 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
                 not name.startswith("test")
                 or hasattr(unittest.TestCase, name)
                 or name in method_taken
-                or not _plain_function(statement)
+                or not _plain_function(statement, True)
             ):
                 return False
         elif isinstance(statement, ast.ClassDef):
             if statement.decorator_list or statement.keywords or name in module_taken:
                 return False
             for member in statement.body:
-                simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member)
+                simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member, True)
                 if isinstance(member, ast.Assign) and isinstance(member.value, ast.Constant):
                     simple = all(isinstance(target, ast.Name) for target in member.targets)
                 if not simple or getattr(member, "name", "x").startswith("__"):
