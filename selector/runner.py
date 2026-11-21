@@ -25,6 +25,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import re
 import shutil
 import sys
 import unittest
@@ -424,6 +425,106 @@ def _only_reads(query: str) -> bool:
     return not any(word in lowered for word in ("nextval", "currval", "setseed", "into ", "pragma", "attach"))
 
 
+# A setup statement that makes a view of a whole CSV file, and nothing else.
+_CSV_VIEW = re.compile(r"\s*CREATE VIEW (\w+) AS\s+(SELECT \*\s+FROM READ_CSV\(.*\))\s*", re.DOTALL)
+# Words of a query that could tell a table from a view of the same rows, or look at the catalog.
+_NOT_FOR_TABLES = (
+    "rowid", "information_schema", "duckdb_", "pragma", "sqlite_", "pg_catalog", "describe", "summarize",
+    "current_schema", "current_setting", "table_info", "read_csv", "glob(", "getvariable", "main.", "memory.",
+    "temp.", "system.", "backwards",
+)
+# setup statements (as sent) -> (connection on the tables, connection on the same tables in reverse row order), or None
+_TABLE_COPIES: dict = {}
+
+
+def _table_copies(connect, statements: tuple):
+    """Two connections to tables holding what the setup's views show: rows as the files give them, and reversed."""
+    if statements not in _TABLE_COPIES:
+        copies = None
+        views = [_CSV_VIEW.fullmatch(statement) for statement in statements]
+        if views and all(views):
+            try:
+                forward = connect()
+                for view in views:
+                    forward.execute(f"CREATE TABLE {view.group(1)} AS {view.group(2)}")
+                forward.execute("CREATE SCHEMA backwards")
+                for view in views:
+                    name = view.group(1)
+                    forward.execute(f"CREATE TABLE backwards.{name} AS SELECT * FROM main.{name} ORDER BY rowid DESC")
+                backward = forward.cursor()
+                backward.execute("SET schema = 'backwards'")
+                copies = (forward, backward)
+            except Exception:
+                copies = None
+        _TABLE_COPIES[statements] = copies
+    return _TABLE_COPIES[statements]
+
+
+def _same_frames(one, other) -> bool:
+    """Two result frames are the same: names, types and every value, floating-point values to nine digits."""
+    import numpy
+
+    if list(one.columns) != list(other.columns) or len(one) != len(other) or list(one.dtypes) != list(other.dtypes):
+        return False
+    for position in range(one.shape[1]):
+        left, right = one.iloc[:, position], other.iloc[:, position]
+        if left.dtype.kind == "f":
+            # Sums taken in another order differ in their last digits, never in the ninth.
+            if not numpy.allclose(left.to_numpy(), right.to_numpy(), rtol=1e-9, atol=0.0, equal_nan=True):
+                return False
+        elif not left.equals(right):
+            return False
+    return True
+
+
+def _frame_from_tables(connect, statements: tuple, query: str):
+    """DuckDB's answer to a plain SELECT over the setup's views, computed on tables; None when it cannot be vouched for.
+
+    The views read gzip CSV files, anew for every query: fifty times the cost
+    of the query itself. The tables hold exactly the rows the views show, in
+    the same order and with the same types (they are made by the setup's own
+    READ_CSV calls), so a query means the same on both. What DuckDB is free to
+    vary between the two is the plan, and with it the order of rows where the
+    query leaves it open and the last digits of floating-point sums. So the
+    query is run twice, on the tables and on copies whose rows are stored in
+    reverse: a result that depends on the order rows arrive in differs
+    between the two, and then, or after any error, the views are asked.
+    """
+    lowered = query.lower()
+    if any(word in lowered for word in _NOT_FOR_TABLES):
+        return None
+    copies = _table_copies(connect, statements)
+    if copies is None:
+        return None
+    try:
+        frame = copies[0].execute(query).fetchdf()
+        other = copies[1].execute(query).fetchdf()
+        same = _same_frames(frame, other)
+    except BaseException as error:  # noqa: BLE001 - whatever it is, the real connection will say
+        if isinstance(error, (KeyboardInterrupt, SystemExit, MemoryError)):
+            raise
+        return None
+    return frame if same else None
+
+
+class _Frame:
+    """Stands in for a DuckDB result whose frame was computed on the table copies."""
+
+    def __init__(self, connection, query: str, frame) -> None:
+        self._connection = connection
+        self._query = query
+        self._frame = frame
+
+    def fetchdf(self):
+        return self._frame.copy()  # a fresh frame each time: callers rename columns in place
+
+    df = fetchdf
+
+    def __getattr__(self, name):
+        # Anything else is asked of DuckDB itself.
+        return getattr(self._connection._run(self._query), name)
+
+
 class _ProbingConnection:
     """Stands in for a DuckDB connection until DuckDB is really needed.
 
@@ -434,9 +535,11 @@ class _ProbingConnection:
     succeed on a fresh connection, so they will here, whenever they are run.
     Once the whole setup has been sent, a query the record has DuckDB's answer
     for is given that answer (the executor tests' TPC queries, maps/duckdb.bin).
+    Any other plain SELECT is answered from tables that hold what the setup's
+    views show, when that answer can be vouched for (_frame_from_tables).
 
-    Anything else, a statement that is not the setup's next one, a query with
-    no recorded answer, any other use of the connection, opens the real
+    Anything else, a statement that is not the setup's next one, a query that
+    could not be answered that way, any other use of the connection, opens the real
     connection, sends it what was held back, and is passed on. After a
     statement that is neither recognised nor a plain SELECT nothing is
     answered from the record any more.
@@ -453,6 +556,8 @@ class _ProbingConnection:
         self._held: list = []  # statements not yet sent to DuckDB, as given
         self._sent: list | None = []  # the same with the checkout's path marked; None: no longer a known setup
         self._answers = None
+        self._given: list = []  # the setup's statements, as given
+        self._setup: tuple | None = None  # those statements once the whole setup is recognised
 
     def _real(self):
         """The real connection, brought to where this one stands."""
@@ -467,6 +572,7 @@ class _ProbingConnection:
     def _forget(self) -> None:
         self._sent = None
         self._answers = None
+        self._setup = None
 
     def execute(self, query, *args, **kwargs):
         if args or kwargs or type(query) is not str:
@@ -479,6 +585,10 @@ class _ProbingConnection:
                 return _Answer(self, query, data)
             if not _only_reads(query):
                 self._forget()
+            elif self._setup is not None:
+                frame = _frame_from_tables(self._connect, self._setup, query)
+                if frame is not None:
+                    return _Frame(self, query, frame)
             return self._real().execute(query)
         sent = self._sent
         if sent is None:
@@ -493,9 +603,11 @@ class _ProbingConnection:
             self._sent = None
             return self._real().execute(query)
         sent.append(text)
+        self._given.append(query)
         if found is not None:
             self._sent = None
             self._answers = found
+            self._setup = tuple(self._given)
         if self._connection is None:
             self._held.append(query)
             return self
@@ -506,6 +618,7 @@ class _ProbingConnection:
         return self._real().execute(query)
 
     def close(self):
+        self._setup = None
         if self._connection is not None:
             return self._connection.close()
         self._held = []

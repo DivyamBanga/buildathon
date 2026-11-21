@@ -233,7 +233,7 @@ class Comparer:
 
     # ---- reporting -------------------------------------------------------
 
-    def report(self, owner: tuple, attribute: str, reason: str, function=None) -> None:
+    def report(self, owner: tuple, attribute: str, reason: str, function=None, entries=None) -> None:
         kind, module, qualname = owner
         path = ""
         first = 0
@@ -244,7 +244,8 @@ class Comparer:
             if code.co_filename.startswith(self.old_root):
                 path = code.co_filename[len(self.old_root):]
                 first = code.co_firstlineno
-        self.differences.append([kind, module, qualname, attribute, reason, owner_path, path, first])
+        # `entries`: for a table that differs entry by entry, the names of those entries (see changed_entries).
+        self.differences.append([kind, module, qualname, attribute, reason, owner_path, path, first, entries])
         if self.explain:
             self.differences[-1].append(self.why)
             self.why = ""
@@ -378,6 +379,34 @@ class Comparer:
                 return None
             return (kind.__name__, tuple(parts) if kind is tuple else frozenset(parts))
         return None
+
+    def changed_entries(self, a, b) -> list | None:
+        """For two dicts (or two sets) that differ: the names of the keys (members)
+        that one has and the other lacks, or that hold another value.
+
+        None when that cannot be told entry by entry: another kind of container,
+        or a key that has no name of its own. The order of the entries is not
+        part of this: only something that walks the whole table can see it.
+        """
+        kind = type(a)
+        if kind is not type(b) or kind not in (dict, set, frozenset):
+            return None
+        sides = []
+        for table in (a, b):
+            named: dict = {}
+            for key in table:
+                token = self._token(key)
+                if token is None or token in named:
+                    return None
+                named[token] = table[key] if kind is dict else key
+            sides.append(named)
+        left, right = sides
+        changed = [
+            token
+            for token in list(left) + [token for token in right if token not in left]
+            if token not in left or token not in right or not self.same(left[token], right[token])
+        ]
+        return sorted(token_text(token) for token in changed)
 
     def _members(self, a, b) -> bool:
         if len(a) != len(b):
@@ -611,7 +640,8 @@ class Comparer:
                 continue
             found = self._difference(value_a, value_b)
             if found is not None:
-                self.report(owner, key, found[0], found[1])
+                entries = self.changed_entries(value_a, value_b) if found[0] == "value" else None
+                self.report(owner, key, found[0], found[1], entries)
 
     def _class(self, a: type, b: type, module_name: str) -> None:
         owner = ("class", module_name, a.__qualname__)
@@ -646,6 +676,15 @@ class Comparer:
                 reported.add(key)
                 self.report(("module", function.__module__, ""), function.__qualname__, reason, function)
         return self.differences
+
+
+def token_text(token) -> str:
+    """A token of Comparer._token as text, the same in every process."""
+    if token[0] == "frozenset":
+        return "frozenset(" + ",".join(sorted(token_text(part) for part in token[1])) + ")"
+    if token[0] == "tuple":
+        return "(" + ",".join(token_text(part) for part in token[1]) + ")"
+    return ":".join(token)
 
 
 def watchable(cls: type, name: str, value) -> bool:

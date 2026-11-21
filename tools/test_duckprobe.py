@@ -177,4 +177,121 @@ for query, expected in (
 ):
     check(runner._only_reads(query) is expected, f"_only_reads({query!r}) should be {expected}")
 
+# 14. A query with no recorded answer over views of CSV files: answered from tables when that can be vouched for.
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+if duckdb is not None:
+    import gzip
+    import tempfile
+
+    from pandas.testing import assert_frame_equal
+
+    folder = tempfile.mkdtemp()
+    rows = [(i, i % 3, round(i * 0.1, 1)) for i in range(1, 61)]
+    with gzip.open(os.path.join(folder, "t.csv.gz"), "wt", newline="") as handle:
+        handle.write("k|g|v\n" + "".join(f"{k}|{g}|{v}\n" for k, g, v in rows))
+    with gzip.open(os.path.join(folder, "u.csv.gz"), "wt", newline="") as handle:
+        handle.write("g|name\n0|zero\n1|one\n2|two\n")
+    views = (
+        f"\n   CREATE VIEW t AS\n   SELECT *\n   FROM READ_CSV('{MARK}/t.csv.gz', delim='|', header=True, "
+        "columns={'k': 'bigint', 'g': 'bigint', 'v': 'double'})\n  ",
+        f"CREATE VIEW u AS SELECT * FROM READ_CSV('{MARK}/u.csv.gz', delim='|', header=True, "
+        "columns={'g': 'bigint', 'name': 'string'})",
+    )
+    recorded = {"SELECT 1 AS one": pickle.dumps("recorded")}
+    real_log = []
+
+    class Logged:
+        """A real connection; what is sent to one that holds the views is noted."""
+
+        def __init__(self):
+            self.inner = duckdb.connect()
+            self.views = False
+
+        def execute(self, query, *args, **kwargs):
+            self.views = self.views or "CREATE VIEW" in query
+            if self.views:
+                real_log.append(query)
+            return self.inner.execute(query, *args, **kwargs)
+
+        def cursor(self):
+            return self.inner.cursor()
+
+        def close(self):
+            self.inner.close()
+
+    def real_views():
+        connection = duckdb.connect()
+        for statement in views:
+            connection.execute(statement.replace(MARK + "/", folder + "/"))
+        return connection
+
+    def stand_in():
+        del real_log[:]
+        runner._TABLE_COPIES.clear()
+        connection = runner._ProbingConnection(Logged, {views: recorded}, [folder + "/"])
+        for statement in views:
+            connection.execute(statement.replace(MARK + "/", folder + "/"))
+        return connection
+
+    truth = real_views()
+    c = stand_in()
+    check(c.execute("SELECT 1 AS one").fetchdf() == "recorded", "a recorded answer is still given as recorded")
+    determined = "SELECT u.name, SUM(t.v) AS total, COUNT(*) AS n FROM t JOIN u ON t.g = u.g GROUP BY u.name ORDER BY u.name"
+    frame = c.execute(determined).fetchdf()
+    check(not real_log, f"a fully ordered query is answered without the views: {real_log}")
+    assert_frame_equal(frame, truth.execute(determined).fetchdf(), check_exact=False, rtol=1e-9)
+    checks += 1
+    frame.rename(columns={"total": "x"}, inplace=True)
+    check("total" in c.execute(determined).fetchdf().columns, "every caller gets a frame of its own")
+    for open_ended, why in (
+        ("SELECT k FROM t", "no order at all"),
+        ("SELECT k, g FROM t ORDER BY g LIMIT 7", "ties under the ORDER BY decide what LIMIT keeps"),
+        ("SELECT g, FIRST(k) AS k FROM t GROUP BY g ORDER BY g", "an aggregate that depends on arrival order"),
+    ):
+        del real_log[:]
+        frame = c.execute(open_ended).fetchdf()
+        check(open_ended in real_log, f"the views are asked when the result is not fixed by the query ({why})")
+        assert_frame_equal(frame, truth.execute(open_ended).fetchdf())
+        checks += 1
+    del real_log[:]
+    for telltale in ("SELECT rowid FROM t ORDER BY 1", "SELECT COUNT(*) AS n FROM main.t"):
+        try:
+            c.execute(telltale).fetchdf()
+        except Exception:
+            pass
+        check(telltale in real_log, f"a query that could tell a table from a view goes to the views: {telltale}")
+    del real_log[:]
+    try:
+        c.execute("SELECT nothing FROM t ORDER BY 1")
+        check(False, "an invalid query must raise")
+    except Exception as error:
+        check("nothing" in str(error) and "SELECT nothing FROM t ORDER BY 1" in real_log, "an error is the views' own error")
+    c = stand_in()
+    c.execute("CREATE TABLE extra AS SELECT 1 AS k")
+    del real_log[:]
+    c.execute(determined).fetchdf()
+    check(determined in real_log, "after a statement that changes the connection the views are asked")
+    check(
+        runner._frame_from_tables(Logged, ("CREATE TABLE b (x INT)",), "SELECT 1 AS k") is None,
+        "a setup of anything but CSV views has no table copies",
+    )
+    import pandas
+
+    base = pandas.DataFrame({"k": [1, 2], "v": [0.1 + 0.2, float("nan")], "s": ["a", None]})
+    for other, expected, what in (
+        (base.copy(), True, "a copy"),
+        (base.assign(v=[0.3, float("nan")]), True, "a sum taken in another order"),
+        (base.assign(v=[0.3000001, float("nan")]), False, "another value in the seventh digit"),
+        (base.assign(k=[1, 3]), False, "another integer"),
+        (base.assign(k=[1.0, 2.0]), False, "another type"),
+        (base.assign(s=["a", "b"]), False, "a value where there was none"),
+        (base.rename(columns={"k": "j"}), False, "another column name"),
+        (base.iloc[::-1].reset_index(drop=True), False, "the rows in another order"),
+        (base.iloc[:1], False, "fewer rows"),
+    ):
+        check(runner._same_frames(base, other) is expected, f"_same_frames: {what} should be {expected}")
+
 print(f"{checks} checks passed")
