@@ -46,6 +46,13 @@ the patched code**, and selects the ones that fail.
    analysed one by one against the pinned file here, which is not what applying
    them in order gives.
 
+   **Added lines that mention pytest**, in a file under `tests/`, select every
+   test of that file unchecked, and every test that imports it when it is a
+   helper module. Marks, skips, fixtures and hooks mean something only to
+   pytest, and the runner uses unittest, so running the test says nothing.
+   (A new or changed `conftest.py` and the pytest configuration files select
+   everything, as before.)
+
    **A closer look at import-time changes** (`selector/state.py`). A module or
    class body runs once, at import, and all it can do is leave the package in
    another state: other module globals, class attributes, defaults or closures.

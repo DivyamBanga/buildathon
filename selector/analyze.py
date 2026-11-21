@@ -359,6 +359,30 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.redirects[os.path.join(root, path)] = patch.new_text
 
 
+def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> None:
+    """Rules for a Python file under tests/ that no run of one test can settle.
+
+    The runner executes tests with unittest in one forked child each, while the
+    labels come from pytest running every test file in one process.
+    """
+    path = patch.path
+    old_path = patch.old_path or path
+    if not (path.startswith("tests/") or old_path.startswith("tests/")):
+        return
+    if patch.old_text is None:
+        return
+    added = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] == "+").lower()
+    if "pytest" in added:
+        # Added lines that speak to pytest (marks, skips, fixtures, hooks): only
+        # pytest sees them, so the tests of the file, or those that import it
+        # when it is a helper, are selected as they are.
+        found = covmap.tests_of_file(old_path) | covmap.file_any(old_path)
+        plan.candidates |= found
+        plan.rest_candidates |= found
+        plan.unverified |= found
+        plan.note(f"{path}: added lines mention pytest, {found.bit_count()} tests selected unchecked")
+
+
 def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
     """`loaded` holds the absolute paths of the modules already imported by the coordinator."""
     plan = Plan(commit)
@@ -423,6 +447,7 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             continue
         try:
             if path.endswith(".py") or old_path.endswith(".py"):
+                _test_file_rules(plan, patch, covmap)
                 _analyze_python(plan, patch, covmap, root, loaded)
             else:
                 _analyze_data(plan, patch, covmap, root)

@@ -79,4 +79,35 @@ def selected(plan, test_id):
 for name in ("D_two_sections_a", "D_two_sections_b", "D_two_sections_c"):
     expect("seed " + name, seed(name).select_all, True)
 
+plan = seed("C_pytest_mark")
+TIME = "tests/test_time.py::TestTime::test_format_time"
+expect("seed C: the test is a candidate", bool(plan.candidates >> ID[TIME] & 1), True)
+expect("seed C: and is not run", bool(plan.unverified >> ID[TIME] & 1), True)
+expect("seed C: every test of the file", plan.candidates & covmap.tests_of_file("tests/test_time.py"), covmap.tests_of_file("tests/test_time.py"))
+
+
+def comment_patch(path, comment):
+    """A patch that puts one comment line first in a file of the pinned tree."""
+    import difflib
+
+    with open(os.path.join(ROOT, path), encoding="utf-8", newline="") as handle:
+        old = handle.read().splitlines(keepends=True)
+    new = [comment + "\n"] + old
+    body = "".join(difflib.unified_diff(old, new, "a/" + path, "b/" + path, n=3))
+    return f"diff --git a/{path} b/{path}\n" + body
+
+
+def plan_for(text):
+    return analyze.analyze("x", text, covmap, ROOT, frozenset())
+
+
+plan = plan_for(comment_patch("tests/test_time.py", "# pytest only"))
+expect("C: comment that mentions pytest", plan.unverified & covmap.tests_of_file("tests/test_time.py") == covmap.tests_of_file("tests/test_time.py") != 0, True)
+plan = plan_for(comment_patch("tests/test_time.py", "# nothing to see"))
+expect("C: comment that does not", (plan.candidates, plan.select_all), (0, False))
+plan = plan_for(comment_patch("tests/helpers.py", "# Pytest fixtures live elsewhere"))
+expect("C: helper module, its importers", plan.unverified != 0 and plan.unverified == covmap.file_any("tests/helpers.py") | covmap.tests_of_file("tests/helpers.py"), True)
+plan = plan_for(comment_patch("sqlglot/helper.py", "# pytest"))
+expect("C: not a test file", (plan.candidates, plan.unverified), (0, 0))
+
 print(f"{checks} checks passed")

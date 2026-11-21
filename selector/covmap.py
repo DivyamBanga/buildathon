@@ -86,6 +86,15 @@ class CovMap:
                 result |= bitmap
         return result
 
+    def tests_of_file(self, path: str) -> int:
+        """Every test whose id names this test file."""
+        prefix = path + "::"
+        result = 0
+        for bit, test_id in enumerate(self.ids):
+            if test_id.startswith(prefix):
+                result |= 1 << bit
+        return result
+
     def code_any(self, path: str, first: int) -> int:
         result = 0
         for bitmap in self.file(path).get(first, {}).values():
