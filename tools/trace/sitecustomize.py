@@ -90,6 +90,14 @@ if _DIR:
             _kind = "P"
             _mon.restart_events()
 
+    def _phase(kind):
+        """Write what was recorded so far and record afresh under another row letter."""
+        global _kind
+        if kind != _kind:
+            _dump()
+            _kind = kind
+            _mon.restart_events()
+
     def _dump():
         global _seen
         seen, _seen = _seen, []

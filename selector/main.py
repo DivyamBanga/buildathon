@@ -109,6 +109,8 @@ class Job:
         # Test files of non-candidates that import a changed module: the child
         # imports them first, and a file that fails takes all its tests with it.
         self.import_files: list[str] = []
+        self.setup_untouched: bool | None = None
+        self.memo_ok: bool | None = None
         self.deadline = float("inf")  # wall-clock limit for checking this commit
 
 
@@ -151,6 +153,9 @@ class Coordinator:
         # The executor tests' costs when their class setup is reused (see runner).
         self.fast_cost: dict[int, float] = {}
         self.fast_setup: dict[str, float] = {}
+        # ... and when, on top of that, recorded executor results can be reused.
+        self.memo_cost: dict[int, float] = {}
+        self.exec_phase: dict | None = None
         try:
             runcost = json.load(open(os.path.join(MAPS, "runcost.json")))
             measured = runcost["tests"][: len(self.bit_cost)]
@@ -169,6 +174,9 @@ class Coordinator:
             fast = runcost.get("fast", {})
             self.fast_cost = {int(bit): value * scale for bit, value in fast.get("tests", {}).items()}
             self.fast_setup = {name: value * scale for name, value in fast.get("setup", {}).items()}
+            self.memo_cost = {
+                int(bit): value * scale for bit, value in runcost.get("memo", {}).get("tests", {}).items()
+            }
         except (OSError, ValueError, KeyError, ZeroDivisionError):
             pass
         # CPU seconds this machine needs per recorded second of a plain test. It
@@ -275,11 +283,8 @@ class Coordinator:
                     shares.append(min(1.0, part))
                 if shares:
                     share = max(0.03, max(shares))
-            cost = self.bit_cost[bit]
-            if bit in self.fast_cost and self.executor_setup_untouched(job):
-                cost = self.fast_cost[bit]
             # In recorded seconds of a plain test; `self.machine` turns it into CPU here.
-            job.estimates[bit] = cost * share
+            job.estimates[bit] = self.full_cost(job, bit) * share
 
     def weigh(self, bits: list[int], estimates: dict, chosen: list[int], passing: float):
         """Split `bits` into (worth checking, selected unchecked), given `chosen` is selected anyway.
@@ -386,7 +391,12 @@ class Coordinator:
         # Before paying for an expensive check, find out cheaply whether the change
         # is real: run a few of the cheapest tests that were going to be selected
         # anyway. If one fails, the expensive tests are weighed again as likely to fail.
-        costly = sum(job.estimates[bit] for bit in check if job.estimates[bit] * self.machine > PROBE_ABOVE)
+        costly = 0.0
+        for bit in check:
+            # What the check may come to if the change turns out to be real.
+            potential = job.estimates[bit] * self.worst_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
+            if potential * self.machine > PROBE_ABOVE:
+                costly += potential
         if costly and blind:
             budget = max(0.5 / self.machine, PROBE_SHARE * costly)
             probes = []
@@ -417,6 +427,13 @@ class Coordinator:
         remaining = [bit for bit in run.tests if bit not in run.done]
         if not remaining:
             return False
+        if self.memo_cost and self.executor_memo_ok(job):
+            # A real change usually alters some optimized queries, and those are
+            # executed in full: expect half way between the best and the worst.
+            for bit in remaining:
+                if bit in self.memo_cost:
+                    ratio = self.worst_cost(job, bit) / max(self.full_cost(job, bit), 1e-9)
+                    job.estimates[bit] *= (1.0 + ratio) / 2.0
         check, blind = self.weigh(remaining, job.estimates, list(job.blind | job.failed), PASS_LIVE)
         if not blind:
             return False
@@ -493,8 +510,25 @@ class Coordinator:
                 cases[(kind, fixture)] = frozenset(allowed)
         return cases
 
+    @staticmethod
+    def touches(plan: Plan, ran: dict) -> bool:
+        """Whether the patch changes any of the lines in `ran` (path -> [[code firstlineno, line]])."""
+        for path, entries in plan.units.items():
+            rows = ran.get(path)
+            if not rows:
+                continue
+            for first, lines in entries:
+                if any(first == ran_first and (lines is None or line in lines) for ran_first, line in rows):
+                    return True
+        return False
+
     def executor_setup_untouched(self, job: Job) -> bool:
-        """True when the patch touches nothing the executor tests' class setup executes or reads."""
+        """True when the patch touches nothing the class setup of the executor tests executes or reads."""
+        if job.setup_untouched is None:
+            job.setup_untouched = self._executor_setup_untouched(job)
+        return job.setup_untouched
+
+    def _executor_setup_untouched(self, job: Job) -> bool:
         if job.mode != "hot" or not job.plan.sliceable:
             return False
         if self.setup_map is None:
@@ -503,18 +537,39 @@ class Coordinator:
             except (OSError, ValueError):
                 self.setup_map = {}
         setup = self.setup_map.get(EXECUTOR_CLASS)
-        if not setup:
+        if not setup or self.touches(job.plan, setup["units"]):
             return False
-        for path, entries in job.plan.units.items():
-            ran = setup["units"].get(path)
-            if not ran:
-                continue
-            for first, lines in entries:
-                if any(first == ran_first and (lines is None or line in lines) for ran_first, line in ran):
-                    return False
         # The .sql fixtures are read again by the child itself; the data files are not.
         changed = {path[len(ROOT) + 1:] for path in job.plan.redirects}
         return not any(path in changed and not path.endswith(".sql") for path in setup["opens"])
+
+    def executor_memo_ok(self, job: Job) -> bool:
+        """True when recorded executor results may stand in for unchanged TPC queries:
+        the patch changes nothing that runs between the optimized form of a query and its result."""
+        if job.memo_ok is None:
+            job.memo_ok = False
+            if self.memo_cost and self.executor_setup_untouched(job):
+                if self.exec_phase is None:
+                    try:
+                        self.exec_phase = json.load(open(os.path.join(MAPS, "execphase.json")))
+                    except (OSError, ValueError):
+                        self.exec_phase = {}
+                job.memo_ok = bool(self.exec_phase) and not self.touches(job.plan, self.exec_phase)
+        return job.memo_ok
+
+    def worst_cost(self, job: Job, bit: int) -> float:
+        """The same when no recorded executor result can be reused (every query changed)."""
+        if bit in self.fast_cost and self.executor_setup_untouched(job):
+            return self.fast_cost[bit]
+        return self.bit_cost[bit]
+
+    def full_cost(self, job: Job, bit: int) -> float:
+        """What the whole test costs to run for this commit, in recorded seconds of a plain test."""
+        if bit in self.memo_cost and self.executor_memo_ok(job):
+            return self.memo_cost[bit]
+        if bit in self.fast_cost and self.executor_setup_untouched(job):
+            return self.fast_cost[bit]
+        return self.bit_cost[bit]
 
     def executor_tables(self, job: Job, tests: list[int]) -> bool:
         """Whether the child may take the executor tests' tables ready-made.
@@ -530,6 +585,7 @@ class Coordinator:
             try:
                 runner.build_executor_tables()
                 runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
+                runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
                 gc.freeze()
             except Exception as error:
                 log(f"could not prebuild the executor tables: {error!r}")
@@ -563,6 +619,7 @@ class Coordinator:
             "cases": self.case_filter(job, tests),
             "imports": job.import_files if job.mode == "clean" else [],
             "executor_tables": self.executor_tables(job, tests),
+            "executor_memo": self.executor_memo_ok(job),
         }
         read_fd, write_fd = os.pipe()
         pid = os.fork()
@@ -597,13 +654,11 @@ class Coordinator:
     def cpu_allowance(self, job: Job, bit: int) -> float:
         """CPU seconds a test may burn before it counts as failing.
 
-        Twice what the whole test normally costs: a patch that makes a test
-        crawl would otherwise be paid for in CPU time until the wall-clock limit.
+        Well above what the whole test normally costs (with no recorded result
+        reused): a patch that makes a test crawl would otherwise be paid for in
+        CPU time until the wall-clock limit.
         """
-        cost = self.bit_cost[bit]
-        if bit in self.fast_cost and self.executor_setup_untouched(job):
-            cost = self.fast_cost[bit]
-        return max(3.0, 2.0 * cost * max(self.machine, 1.0) + 1.0)
+        return max(3.0, 1.6 * self.worst_cost(job, bit) * max(self.machine, 1.0) + 1.0)
 
     def feed(self, run: Run, data: bytes, now: float) -> None:
         run.buffer += data

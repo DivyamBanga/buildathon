@@ -110,6 +110,18 @@ if EXECUTOR in groups:
     measured, fast["setup"][EXECUTOR] = measure(EXECUTOR + " (setup reused)", groups[EXECUTOR], runner._use_executor_tables)
     fast["tests"] = {str(bit): value for bit, value in measured.items()}
 
-json.dump({"tests": costs, "setup": setup, "fast": fast}, open(sys.argv[3], "w"), separators=(",", ":"))
+memo = {"tests": {}}
+if EXECUTOR in groups and os.path.exists(os.path.join(maps, "execmemo.bin")):
+    runner.load_executor_memo(os.path.join(maps, "execmemo.bin"))
+
+    def with_memo():
+        runner._use_executor_tables()
+        runner.install_executor_memo()
+
+    measured, _ = measure(EXECUTOR + " (results reused)", groups[EXECUTOR], with_memo)
+    memo["tests"] = {str(bit): value for bit, value in measured.items()
+                     if ids[bit].rsplit("::", 1)[-1] in runner.MEMO_TESTS}
+
+json.dump({"tests": costs, "setup": setup, "fast": fast, "memo": memo}, open(sys.argv[3], "w"), separators=(",", ":"))
 recorded = sum(test["seconds"] for test in tests)
 print(f"total measured {sum(c for c in costs if c):.1f}s vs recorded {recorded:.1f}s")

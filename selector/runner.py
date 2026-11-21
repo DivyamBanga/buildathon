@@ -338,6 +338,107 @@ def _use_executor_tables() -> None:
     test_class.setUpClass = classmethod(setUpClass)
 
 
+# What sqlglot's own executor returns for the TPC queries at the pinned commit,
+# keyed by the optimized query it was given (maps/execmemo.bin).
+EXECUTOR_MEMO = None
+# Which query set the running test executes ("tpch", "tpcds"), or None: the memo
+# applies only inside the two tests it was recorded from.
+MEMO_SCOPE = None
+MEMO_TESTS = {"test_execute_tpch": "tpch", "test_execute_tpcds": "tpcds"}
+# For the offline tools: a directory to record results into, and a callable
+# told when the planning-and-execution phase starts ("X") and ends ("L").
+MEMO_RECORD = None
+MEMO_PHASE = None
+
+
+def load_executor_memo(path: str) -> None:
+    global EXECUTOR_MEMO
+    import pickle
+    import zlib
+
+    try:
+        with open(path, "rb") as handle:
+            EXECUTOR_MEMO = pickle.loads(zlib.decompress(handle.read()))
+    except Exception:
+        EXECUTOR_MEMO = None
+
+
+class _Planned:
+    """Stands in for the plan of a query whose result is already known."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+
+def install_executor_memo() -> None:
+    """Skip planning and executing a TPC query that is unchanged since the pinned commit.
+
+    `sqlglot.executor.execute` optimizes the query, plans it and runs the plan.
+    The plan and its result depend only on the optimized query and on the
+    planner and executor code. This is installed only for a patch that touches
+    none of that code (maps/execphase.json), so a query whose optimized form is
+    exactly the pinned one must give the pinned result, which is returned
+    without running it. Any other query is planned and executed as usual.
+    """
+    import hashlib
+    import json
+    import pickle
+
+    import sqlglot.executor as executor
+    from sqlglot import serde
+
+    real_plan = executor.Plan
+    real_executor = executor.PythonExecutor
+    if getattr(real_plan, "_br_memo", False):
+        return
+    pending: dict = {}
+
+    def plan(expression):
+        scope = MEMO_SCOPE
+        if scope is None:
+            return real_plan(expression)
+        if MEMO_PHASE is not None:
+            MEMO_PHASE("X")
+        try:
+            text = json.dumps(serde.dump(expression), sort_keys=True, default=str)
+            key = scope + ":" + hashlib.sha1(text.encode()).hexdigest()
+        except Exception:
+            return real_plan(expression)
+        if MEMO_RECORD is None and EXECUTOR_MEMO is not None and key in EXECUTOR_MEMO:
+            return _Planned(key)
+        planned = real_plan(expression)
+        pending["plan"], pending["key"] = planned, key
+        return planned
+
+    plan._br_memo = True
+
+    class Executor:
+        def __init__(self, *args, **kwargs) -> None:
+            self._args = args
+            self._kwargs = kwargs
+
+        def execute(self, planned):
+            try:
+                if isinstance(planned, _Planned):
+                    return pickle.loads(EXECUTOR_MEMO[planned.key])
+                result = real_executor(*self._args, **self._kwargs).execute(planned)
+                if MEMO_RECORD is not None and pending.get("plan") is planned:
+                    name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{pending['key'].replace(':', '-')}")
+                    with open(name, "wb") as handle:
+                        pickle.dump((pending["key"], pickle.dumps(result, protocol=4)), handle)
+                return result
+            finally:
+                pending.clear()
+                if MEMO_PHASE is not None and MEMO_SCOPE is not None:
+                    MEMO_PHASE("L")
+
+        def __getattr__(self, name):
+            return getattr(real_executor(*self._args, **self._kwargs), name)
+
+    executor.Plan = plan
+    executor.PythonExecutor = Executor
+
+
 # (module, attribute, case name): module-level collections a test loops over,
 # each member an independent case, sliced like fixture cases (kind "members").
 ENUMERATIONS = (("tests.test_generator", "Dialects", "Dialects@tests/test_generator.py"),)
@@ -451,9 +552,12 @@ class _Result(unittest.TestResult):
         pass
 
     def startTest(self, test) -> None:
+        global MEMO_SCOPE
         super().startTest(test)
         self._failed = False
         self.started.append(test._br_index)
+        # Pool workers are forked inside the test and inherit this.
+        MEMO_SCOPE = MEMO_TESTS.get(getattr(test, "_testMethodName", ""))
         self._emit(f"S {test._br_index}\n")
 
     def stopTest(self, test) -> None:
@@ -573,6 +677,8 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
                 )
             if job.get("executor_tables") and EXECUTOR_TABLES is not None:
                 _use_executor_tables()
+                if job.get("executor_memo") and EXECUTOR_MEMO:
+                    install_executor_memo()
         for path in job.get("imports") or ():
             # pytest fails every test of a file it cannot import.
             try:
