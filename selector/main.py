@@ -759,7 +759,9 @@ class Coordinator:
         if result.get("inconclusive") or result.get("widen") or result.get("failed"):
             return None
         known = self.covmap._pack("treaders.bin") or {}
+        # The changed lines of the code the patch itself edits.
         rows = self.phase_lines(job.plan.units)
+        own = {(path, first) for path, entries in job.plan.units.items() for first, _ in entries}
         reads = 0
         for kind, module, qualname, attribute, reason, _owner, path, first, *_ in result["differences"]:
             where = f"{module}:{qualname}.{attribute}" if qualname else f"{module}.{attribute}"
@@ -771,6 +773,11 @@ class Coordinator:
                 if self.covmap.is_loader(path, first):
                     job.plan.note(f"no recorded results: {where} imports on demand")
                     return None
+                if reason == "function-code" and (path, first) in own:
+                    # Only its code differs, and it is code the patch edits: a
+                    # query sees that by running a changed line, as after a
+                    # hot swap, and those lines are in `rows` already.
+                    continue
                 rows |= self.phase_lines({path: [(first, None)]})
                 continue
             if (

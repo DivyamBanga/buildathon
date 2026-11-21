@@ -230,17 +230,26 @@ the patched code**, and selects the ones that fail.
      are what they were at the pinned commit, the recorded result is returned
      and the query is not planned and executed again. Each is checked, not
      assumed:
-     - *The query*: two digests taken from the tree itself, with no sqlglot
-       code involved (`runner.tree_digests`). The first covers every node's
-       class, arguments in order, comments and meta, the type of every leaf
-       value, and the wiring (a node held in two places, a child that names
-       another parent or position); it is the key. The second adds the type
-       annotation of every node. Planning and executing a query can see an
-       annotation only by asking a node for its type (`Expr.is_type`, the
-       `type` property); the record of each query says whether it does, and
-       if so the second digest must be the recorded one as well. (The
-       builder fails over to "every query asks" when any other executed line
-       reads the annotation; copying it along with a node does not count.)
+     - *The query*: digests taken from the tree itself, with no sqlglot code
+       involved (`runner.tree_digests`). The key covers every node's class,
+       arguments in order, the type of every leaf value, and the wiring (a
+       node held in two places, a child that names another parent or
+       position). What the optimizer leaves on a node besides its arguments
+       sits in three slots: the type annotation, the comments, and the meta
+       dictionary (token positions). Each slot has a digest of its own. A
+       patch to the tokenizer, the parser or the type annotator can change
+       those slots on every tree without changing one argument, and planning
+       and executing a query hardly ever looks at them. Whether it does is
+       recorded per query (`tools/trace_slots.py`: a descriptor in each
+       slot's place notes every read of a node of the optimized tree, or of a
+       copy of one, between planning and the end of execution; copying a slot
+       along with its node is not a read): no query reads meta, 15 of 57 read
+       comments, one asks a node for its type. For a slot a query reads, the
+       slot's digest must be the recorded one too. So that a copy cannot
+       behave differently either, a slot of an unusual shape stays in the
+       key (comments that are not a list of strings, meta that is not a flat
+       dictionary of plain values, an annotation that is the node itself or
+       holds something that is not an expression).
      - *The tables*: what `ensure_tables` returned for this call must hold
        exactly the pinned tables, by name and by content, at that moment (a
        table changed in place is not the pinned table any more).
@@ -249,7 +258,10 @@ the patched code**, and selects the ones that fail.
        swap nothing else can differ. After a clean import the comparison of
        import state (step 3) lists every module or class attribute that
        differs, and each must be out of that code's sight: a function with
-       other code, defaults or closure must not be one it runs; a plain data
+       other defaults or closure must not be one it runs; a function whose
+       code alone differs, and which the patch itself edits, counts through
+       its changed lines exactly as after a hot swap (any other function with
+       other code must not be one it runs); a plain data
        attribute of a class must not be one it read (`execattrs.json`:
        recorded with a descriptor in the attribute's place that notes every
        read through the class, a subclass or an instance); any other constant

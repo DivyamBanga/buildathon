@@ -12,7 +12,10 @@ pinned commit:
                    the tables it was given, planning and running the plan
   execattrs.json   every plain data attribute of a sqlglot class that those lines read
   execqueries.bin  the same two, query by query: memo key -> (which of the
-                   lines, which of the attributes) as bit masks over the two lists
+                   lines, which of the attributes) as bit masks over the two
+                   lists, and the digests of the slots that query reads
+                   (type annotation, comments, meta; from tools/trace_slots.py,
+                   whose slots.json is the optional fifth argument)
 
 The selector reuses a recorded result only for a query whose optimized form is
 exactly the recorded one, run on tables that hold exactly the pinned data, and
@@ -39,6 +42,7 @@ from selector import runner, state  # noqa: E402
 memo_path, phase_path = sys.argv[1], sys.argv[2]
 attrs_path = sys.argv[3] if len(sys.argv) > 3 else None
 queries_path = sys.argv[4] if len(sys.argv) > 4 else None
+slots_path = sys.argv[5] if len(sys.argv) > 5 else None
 trace_dir = os.environ.get("BR_TRACE_DIR")
 work_dir = "/tmp/execmemo-work"
 shutil.rmtree(work_dir, ignore_errors=True)
@@ -127,12 +131,12 @@ if queries_path:
         in_fork(lambda: record_lines([case[1]], case, os.path.join(work_dir, f"lines-case-{number}.json")))
 
 memo = {}
-typed_of = {}  # memo key -> digest of the tree with its type annotations
+slots_of = {}  # memo key -> the digests of what its tree holds in each slot of runner.SLOTS
 for name in os.listdir(record_dir):
     with open(os.path.join(record_dir, name), "rb") as handle:
-        key, typed, data = pickle.load(handle)
-    if typed_of.setdefault(key, typed) != typed:
-        raise SystemExit(f"two sets of type annotations for {key}")
+        key, slots, data = pickle.load(handle)
+    if slots_of.setdefault(key, slots) != slots:
+        raise SystemExit(f"two trees with other annotations, comments or meta for {key}")
     known = memo.setdefault(key, data)
     if known != data:
         one, two = pickle.loads(known), pickle.loads(data)
@@ -295,15 +299,30 @@ if queries_path and trace_dir and attrs_path:
                     asking.update(row for row in every if row[0] == path and first <= row[2] <= last)
     if stray:
         print(f"the type slot is read outside is_type and the type property: {stray[:5]}; every query counts as asking")
-    queries = {
-        key: (
+    # Which slots does planning and executing a query read on the nodes of its
+    # tree (or on copies of them)? tools/trace_slots.py answers that with a
+    # descriptor in each slot's place, query by query. A query it has no
+    # answer for reads them all. For the annotation the line rule above
+    # counts as well.
+    traced = json.load(open(slots_path)) if slots_path else {}
+    queries = {}
+    for key in sorted(memo):
+        found = traced.get(key)
+        wanted = []
+        for slot, digest in zip(runner.SLOTS, slots_of[key]):
+            reads_it = found is None or bool(found.get(slot))
+            if slot == "_type":
+                reads_it = reads_it or bool(stray) or bool(lines_of[key] & asking)
+            wanted.append(digest if reads_it else "")
+        queries[key] = (
             mask(row_index[row] for row in lines_of[key]),
             mask(read_index[name] for name in reads_of[key]),
-            typed_of[key] if stray or lines_of[key] & asking else "",
+            tuple(wanted),
         )
-        for key in sorted(memo)
-    }
-    print(f"{sum(1 for entry in queries.values() if entry[2])} of {len(queries)} queries ask a node for its type")
+    for position, slot in enumerate(runner.SLOTS):
+        print(f"{sum(1 for entry in queries.values() if entry[2][position])} of {len(queries)} queries read {slot}")
+    if traced and set(traced) != set(memo):
+        print(f"slot trace and record disagree on the queries: {len(set(traced) ^ set(memo))} keys in one only")
     with open(queries_path, "wb") as handle:
         handle.write(zlib.compress(marshal.dumps(queries), 9))
     sizes = sorted(len(rows) for rows in lines_of.values())

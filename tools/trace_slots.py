@@ -418,7 +418,7 @@ def main_run(args) -> None:
                         with open(os.path.join(record, name), "rb") as handle:
                             key, typed, data = pickle.load(handle)
                         result["result_sha"] = hashlib.sha1(data).hexdigest()
-                        result["typed_sha"] = hashlib.sha1(typed.encode()).hexdigest()
+                        result["typed_sha"] = hashlib.sha1(repr(typed).encode()).hexdigest()
                         if key in recorded:
                             one, two = pickle.loads(recorded[key]), pickle.loads(data)
                             result["same_as_recorded"] = recorded[key] == data or (
