@@ -81,6 +81,10 @@ SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1"))
 # For experiments only: run every candidate, whatever it costs, so that the
 # simulated time is what the failing tests alone come to.
 ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
+# For experiments only: decide what would be run for every commit (import
+# state is still compared), run none of it, and say in the commit's notes how
+# it would be checked. Everything that would be run is selected.
+PLAN_ONLY = os.environ.get("BR_PLAN_ONLY", "") != ""
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 # The lines of the executor phase that look a name up by a computed text or walk
@@ -182,6 +186,7 @@ class Job:
         # masks, and {attribute: names of the entries that differ} for tables.
         self.memo_block = (0, 0, {})
         self.memo_share: dict = {}
+        self.memo_why = ""  # why recorded executor results are off, when nothing else says so
         self.deadline = float("inf")  # wall-clock limit for checking this commit
         self.probed = False  # the state left by its import-time changes has been compared
         self.state: dict | None = None  # what that comparison found, once it has narrowed the candidates
@@ -555,16 +560,57 @@ class Coordinator:
             numbers = sorted(set(numbers).union(self.unmapped))
         self.decisions[plan.commit] = numbers
 
+    def unproven_importers(self, job: Job) -> set[int]:
+        """Tests that were left out as unable to see a change to a module or class
+        body, while nothing has shown yet that the patched file still imports.
+
+        Leaving them out rests on that: a body that raises takes every importer
+        with it. The comparison of import state shows it, or a child that
+        imports their test files (job.import_files, emptied once it has). A
+        commit that is finished before either happened (the batch deadline, a
+        child that died, an error here) selects them.
+        """
+        if not job.import_files:
+            return set()
+        return {bit for bit in self.covmap.bits(job.plan.import_check) if self.bit_number[bit] >= 0}
+
     def finish_job(self, job: Job, unchecked=()) -> None:
         if not job.decided:
             # Never got as far as choosing what to run: every candidate is selected.
-            self.finish(job.plan, job.everything)
+            self.finish(job.plan, job.everything | self.unproven_importers(job))
             return
-        selected = job.blind | job.failed | set(unchecked)
+        selected = job.blind | job.failed | set(unchecked) | self.unproven_importers(job)
         for lead, members in job.followers.items():
             if lead in selected:
                 selected.update(members)
         self.finish(job.plan, selected)
+
+    def abandon(self, job: Job, error: BaseException) -> None:
+        """Something went wrong here while handling this one commit: select what it has left
+        unchecked and go on with the others."""
+        log(f"{job.plan.commit}: {error!r} while handling it, its candidates are selected unchecked")
+        job.plan.note(f"selected unchecked after {error!r}")
+        self.queue = [other for other in self.queue if other is not job]
+        for fd, run in list(self.running.items()):
+            if run.job is job:
+                del self.running[fd]
+                self.kill(run)
+                try:
+                    os.close(fd)
+                    os.waitpid(run.pid, 0)
+                except OSError:
+                    pass
+                if run.overlay:
+                    shutil.rmtree(run.overlay, ignore_errors=True)
+        try:
+            # Whatever the plan names now and whatever the job held: the error may
+            # have come between the two being brought in line.
+            bits = set(self.covmap.bits(job.plan.candidates & ~job.plan.unverified))
+            bits = {bit for bit in bits if self.bit_number[bit] >= 0}
+            self.finish(job.plan, bits | job.everything | job.blind | job.failed | self.unproven_importers(job))
+        except Exception:
+            job.plan.select_all = True
+            self.decisions[job.plan.commit] = list(self.numbers)
 
     # ---- running --------------------------------------------------------
 
@@ -726,10 +772,13 @@ class Coordinator:
             # changed runs during an import: function bodies alone, none of
             # them called while sqlglot is imported.
             lazy_ok = not job.plan.lazy or (job.plan.sliceable and job.plan.import_units == 0)
+            job.memo_why = "" if lazy_ok else "a module imported on demand runs changed code when it is imported"
             if self.memo_cost and lazy_ok and self.executor_phase():
                 if job.mode == "hot":
                     # Only function bodies changed: the state sqlglot builds at import is the pinned one.
                     block = (self.phase_lines(job.plan.units), 0, {}) if self.executor_setup_untouched(job) else None
+                    if block is None:
+                        job.memo_why = "the patch touches what the class setup runs or reads"
                 else:
                     block = self.import_seen_by_executor(job)
                 if block is not None and (not any(block) or self.exec_queries):
@@ -800,8 +849,14 @@ class Coordinator:
         """
         result = job.state
         if result is None or not self.clean_memo_possible(job):
+            job.memo_why = (
+                "its kind of patch is not one they can be told for"
+                if not self.clean_memo_possible(job)
+                else "import state was not compared, or the comparison narrowed nothing"
+            )
             return None
         if result.get("inconclusive") or result.get("widen") or result.get("failed"):
+            job.memo_why = f"import state: {result.get('inconclusive') or 'a module no longer imports'}"
             return None
         known = self.covmap._pack("treaders.bin") or {}
         # The changed lines of the code the patch itself edits.
@@ -1008,6 +1063,33 @@ class Coordinator:
             return False
         return self.rows_reusable(job) and self.executor_record()
 
+    def results_saving(self, job: Job) -> float:
+        """What recorded executor results would spare on this commit's candidates, in
+        recorded seconds of a plain test, if the comparison of import state found
+        nothing beyond the functions the patch edits.
+
+        Now, without the comparison, an executor test runs every query of the
+        fixture cases that reach the change (its estimate). With it, only the
+        queries whose recorded phase runs a changed line are executed.
+        """
+        rows = self.phase_lines(job.plan.units)
+        block = (rows, 0, {})
+        saving = 0.0
+        for bit in job.candidates:
+            if bit not in self.memo_cost or bit not in job.estimates:
+                continue
+            now = self.full_cost(job, bit)
+            if now <= 0.0:
+                continue
+            share = 0.0
+            if rows:
+                scope = runner.MEMO_TESTS.get(self.covmap.ids[bit].rsplit("::", 1)[-1])
+                mine = [entry for key, entry in (self.exec_queries or {}).items() if key.startswith(f"{scope}:")]
+                share = sum(1 for own in mine if runner.query_touched(own, block)) / len(mine) if mine else 1.0
+            then = self.memo_cost[bit] + share * max(0.0, self.changed_cost(job, bit) - self.memo_cost[bit])
+            saving += job.estimates[bit] * max(0.0, 1.0 - then / now)
+        return saving
+
     def wants_probe(self, job: Job) -> bool:
         """Whether to compare import state before deciding what to run for the commit."""
         plan = job.plan
@@ -1028,8 +1110,10 @@ class Coordinator:
             # the changed body of a function that already ran while the tests were
             # imported, on lines only tests run. Without the comparison nothing
             # says what the fresh import left, and the executor tests would run
-            # every query.
-            return for_results
+            # every query. It is asked for when that would spare more than it
+            # costs: not when the changed lines themselves are run by (nearly)
+            # every recorded query, nor when few fixture cases reach them anyway.
+            return for_results and self.results_saving(job) > 2.0 * PROBE_COST
         if plan.narrowed:
             # Tests were left out as unable to see the change to a class or
             # module body. That is only true if the module still imports, and
@@ -1149,6 +1233,25 @@ class Coordinator:
         job.estimate = sum(job.estimates.values())
         self.queue.insert(0, job)
 
+    def describe(self, job: Job) -> None:
+        """Experiments only (BR_PLAN_ONLY): note how the commit would be checked and select what would be run."""
+        tests = job.pending
+        job.pending = []
+        memo = [bit for bit in tests if bit in self.memo_cost]
+        state = ""
+        if memo:
+            names = ",".join(self.covmap.ids[bit].rsplit("::", 1)[-1] for bit in memo)
+            if self.executor_memo_ok(job):
+                state = f"; recorded results on for {names}"
+            else:
+                state = f"; recorded results OFF for {names} ({job.memo_why or 'see the note'})"
+        blind = [self.covmap.ids[bit].rsplit("::", 1)[-1] for bit in sorted(job.blind) if bit in self.memo_cost]
+        if blind:
+            state += "; not run: " + ",".join(blind)
+        cost = self.machine * (self.overhead(job, tests) + sum(job.estimates[bit] for bit in tests))
+        job.plan.note(f"plan only: {job.mode}, {len(tests)} to run (~{cost:.1f}s){state}")
+        self.finish_job(job, tests)
+
     def spawn(self, job: Job) -> None:
         tests = job.pending
         job.pending = []
@@ -1179,6 +1282,9 @@ class Coordinator:
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
         spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None
+        if job.memo_why and not spec["executor_memo"] and any(bit in self.memo_cost for bit in tests):
+            plan.note(f"no recorded results: {job.memo_why}")
+            job.memo_why = ""
         # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
         spec["duckdb_probe"] = self.duckdb_record()
         spec["lazy"] = plan.lazy if job.mode == "hot" else []
@@ -1400,56 +1506,78 @@ class Coordinator:
             limit = 1 if now - self.start < self.sequential_until else MAX_PARALLEL
             while self.queue and len(self.running) < limit:
                 job = self.queue.pop(0)
-                if not job.decided and self.wants_probe(job):
-                    self.spawn_probe(job)
-                elif job.decided or self.decide(job):
-                    self.spawn(job)
+                # An error while one commit is handled must not stop the checking
+                # of the others: that commit alone is selected unchecked (abandon).
+                try:
+                    if not job.decided and self.wants_probe(job):
+                        self.spawn_probe(job)
+                    elif job.decided or self.decide(job):
+                        if PLAN_ONLY:
+                            self.describe(job)
+                        else:
+                            self.spawn(job)
+                except Exception as error:
+                    self.abandon(job, error)
             ready, _, _ = select.select(list(self.running), [], [], 0.05)
             now = time.monotonic()
             for fd in ready:
-                run = self.running[fd]
+                run = self.running.get(fd)
+                if run is None:
+                    continue
                 try:
                     data = os.read(fd, 65536)
                 except OSError:
                     data = b""
-                if data:
-                    self.feed(run, data, now)
-                if not data or run.finished or run.fatal is not None or run.stopped:
-                    self.close(fd)
+                try:
+                    if data:
+                        self.feed(run, data, now)
+                    if not data or run.finished or run.fatal is not None or run.stopped:
+                        self.close(fd)
+                except Exception as error:
+                    self.abandon(run.job, error)
             for fd, run in list(self.running.items()):
-                if now > run.job.deadline:
-                    log(f"{run.job.plan.commit}: over its time budget, the rest is selected unchecked")
-                    run.job.timeouts = 99
-                    self.close(fd)
-                    continue
-                used = None
-                if now - run.cpu_checked > 0.25:
-                    run.cpu_checked = now
-                    cpu, resident = tree_usage(run.pid)
-                    used = cpu - run.current_cpu
-                    if resident > self.resident + MEMORY_ALLOWANCE:
-                        # The run has 4 GB in all; a test that keeps allocating is stopped.
-                        log(f"{run.job.plan.commit}: child over its memory allowance")
-                        if run.current is None:
-                            run.job.strikes += 1
-                        else:
-                            run.job.timeouts += 1
-                        self.close(fd)
-                        continue
-                if run.current is not None:
-                    over = now - run.current_started > self.allowance(run.current)
-                    if used is not None and used > self.cpu_allowance(run.job, run.current):
-                        over = True
-                    if over:
-                        log(f"{run.job.plan.commit}: {self.covmap.ids[run.current]} timed out")
-                        run.job.timeouts += 1
-                        self.close(fd)
-                elif now - run.last_event > SETUP_ALLOWANCE or (
-                    used is not None and used > SETUP_CPU * max(self.machine, 1.0)
-                ):
-                    log(f"{run.job.plan.commit}: child stalled outside a test")
+                try:
+                    self.watch(fd, run, now)
+                except Exception as error:
+                    self.abandon(run.job, error)
+
+    def watch(self, fd: int, run: Run, now: float) -> None:
+        """Stop a child that is over its time, CPU or memory allowance."""
+        if fd not in self.running:
+            return
+        if now > run.job.deadline:
+            log(f"{run.job.plan.commit}: over its time budget, the rest is selected unchecked")
+            run.job.timeouts = 99
+            self.close(fd)
+            return
+        used = None
+        if now - run.cpu_checked > 0.25:
+            run.cpu_checked = now
+            cpu, resident = tree_usage(run.pid)
+            used = cpu - run.current_cpu
+            if resident > self.resident + MEMORY_ALLOWANCE:
+                # The run has 4 GB in all; a test that keeps allocating is stopped.
+                log(f"{run.job.plan.commit}: child over its memory allowance")
+                if run.current is None:
                     run.job.strikes += 1
-                    self.close(fd)
+                else:
+                    run.job.timeouts += 1
+                self.close(fd)
+                return
+        if run.current is not None:
+            over = now - run.current_started > self.allowance(run.current)
+            if used is not None and used > self.cpu_allowance(run.job, run.current):
+                over = True
+            if over:
+                log(f"{run.job.plan.commit}: {self.covmap.ids[run.current]} timed out")
+                run.job.timeouts += 1
+                self.close(fd)
+        elif now - run.last_event > SETUP_ALLOWANCE or (
+            used is not None and used > SETUP_CPU * max(self.machine, 1.0)
+        ):
+            log(f"{run.job.plan.commit}: child stalled outside a test")
+            run.job.strikes += 1
+            self.close(fd)
 
     # ---- driver ---------------------------------------------------------
 

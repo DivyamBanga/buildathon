@@ -99,13 +99,15 @@ the patched code**, and selects the ones that fail.
    closures; tables entry by entry; classes attribute by attribute). What comes
    out is the list of (module or class, attribute) pairs that differ, including
    whatever sqlglot itself derived from the changed value while importing.
-   The comparison is also run, whatever the candidates cost, for a commit
-   that needs a fresh import and has an executor test with recorded results
-   (step 5) among its candidates: for instance an edit to the body of a parse
-   function that sqlglot itself calls while it is imported, on a line only
-   tests reach. Nothing is narrowed then, but only the comparison says that
-   the fresh import left what the pinned one left, which is what reusing a
-   recorded result needs.
+   The comparison is also run for a commit that needs a fresh import and has
+   an executor test with recorded results (step 5) among its candidates: for
+   instance an edit to the body of a parse function that sqlglot itself calls
+   while it is imported, on a line only tests reach. Nothing is narrowed then,
+   but only the comparison says that the fresh import left what the pinned
+   one left, which is what reusing a recorded result needs. For such a commit
+   with nothing to narrow it is run when the recorded results would spare
+   more than it costs: not when the changed lines themselves are run by
+   nearly every recorded query, nor when few fixture cases reach them anyway.
 
    - No difference: the change cannot be observed (a flag only the type checker
      reads, a `not` on a value nothing uses), and it adds no candidate.
@@ -361,8 +363,13 @@ the patched code**, and selects the ones that fail.
 
 If anything goes wrong (a crash, a timeout, the wall-clock deadline), the
 affected commit selects every candidate it has not verified, and a commit that
-cannot be analysed at all selects every test. A test is never left out on a
-guess.
+cannot be analysed at all selects every test. Where tests had been left out as
+unable to see a changed class or module body, they are selected as well unless
+it has been shown by then that the patched file still imports (by the
+comparison of import state, or by a child importing their test files). An
+error of the coordinator itself while it handles one commit is treated the
+same way and stays with that commit: the others are checked as usual. A test
+is never left out on a guess.
 
 ## What is precomputed
 
