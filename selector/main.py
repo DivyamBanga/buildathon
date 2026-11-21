@@ -192,6 +192,10 @@ class Coordinator:
         # ... and when, on top of that, recorded executor results can be reused.
         self.memo_cost: dict[int, float] = {}
         self.exec_phase: dict | None = None
+        # ... and when they run their own setup but DuckDB's recorded answers are
+        # reused (a clean import, or a patch that touches what the setup runs).
+        self.answer_cost: dict[int, float] = {}
+        self.duckdb_ready: bool | None = None
         try:
             runcost = json.load(open(os.path.join(MAPS, "runcost.json")))
             measured = runcost["tests"][: len(self.bit_cost)]
@@ -212,6 +216,9 @@ class Coordinator:
             self.fast_setup = {name: value * scale for name, value in fast.get("setup", {}).items()}
             self.memo_cost = {
                 int(bit): value * scale for bit, value in runcost.get("memo", {}).get("tests", {}).items()
+            }
+            self.answer_cost = {
+                int(bit): value * scale for bit, value in runcost.get("answers", {}).get("tests", {}).items()
             }
         except (OSError, ValueError, KeyError, ZeroDivisionError):
             pass
@@ -613,7 +620,34 @@ class Coordinator:
             return self.memo_cost[bit]
         if bit in self.fast_cost and self.executor_setup_untouched(job):
             return self.fast_cost[bit]
+        if bit in self.answer_cost and self.duckdb_answers_expected(job):
+            return self.answer_cost[bit]
         return self.bit_cost[bit]
+
+    def duckdb_record(self) -> bool:
+        """Load DuckDB's recorded answers and the setup statements they belong to."""
+        if self.duckdb_ready is None:
+            if runner.DUCKDB_ANSWERS is None:
+                runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
+            runner.load_duckdb_setups(os.path.join(MAPS, "ducksetup.json"))
+            self.duckdb_ready = runner.prepare_duck_probe()
+        return self.duckdb_ready
+
+    def duckdb_answers_expected(self, job: Job) -> bool:
+        """For the estimate only: will the child's own setup be recognised as the pinned one?
+
+        The child finds out for itself (runner._ProbingConnection); here the
+        answer is no when the patch edits the executor tests, their helpers or a
+        file the setup hands to DuckDB.
+        """
+        if not self.answer_cost or not self.duckdb_record() or not runner.DUCKDB_ANSWERS:
+            return False
+        touched = set()
+        for patch in job.plan.files:
+            touched.update(path for path in (patch.path, patch.old_path) if path)
+        if "tests/test_executor.py" in touched or "tests/helpers.py" in touched:
+            return False
+        return not any(path in touched for setup in runner.DUCKDB_SETUPS.values() for path in setup.get("files", ()))
 
     def executor_tables(self, job: Job, tests: list[int]) -> bool:
         """Whether the child may take the executor tests' tables ready-made.
@@ -786,6 +820,8 @@ class Coordinator:
             "executor_tables": self.executor_tables(job, tests),
             "executor_memo": self.executor_memo_ok(job),
         }
+        # The child keeps DuckDB closed until a test really asks it something (runner._ProbingConnection).
+        spec["duckdb_probe"] = self.duckdb_record()
         read_fd, write_fd = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -853,6 +889,12 @@ class Coordinator:
                 if bit not in run.done:
                     run.done.add(bit)
                     self.ran_seconds += self.bit_seconds[bit]
+                if TRACE and now - run.current_started > 0.25:
+                    log(
+                        f"    {run.job.plan.commit}: {self.covmap.ids[bit].split('::')[-1]} took "
+                        f"{now - run.current_started:.2f}s (recorded {self.bit_seconds[bit]:.2f}s)"
+                        + (" FAILED" if status == b"1" else "")
+                    )
                 run.current = None
                 run.current_cpu = tree_cpu(run.pid)
                 run.cpu_checked = now

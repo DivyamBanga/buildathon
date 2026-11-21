@@ -99,19 +99,23 @@ for bit, test_id in enumerate(ids):
 costs = [None] * len(ids)
 setup = {}
 for name, bits in groups.items():
+    if os.environ.get("BR_CALIBRATE_ONLY"):
+        break
     measured, setup[name] = measure(name, bits)
     for bit, value in measured.items():
         costs[bit] = value
 
 fast = {"tests": {}, "setup": {}}
-if EXECUTOR in groups:
+if EXECUTOR in groups and os.environ.get("BR_CALIBRATE_ONLY") == "answers":
+    runner.load_duckdb_answers(os.path.join(maps, "duckdb.bin"))
+elif EXECUTOR in groups:
     runner.build_executor_tables()
     runner.load_duckdb_answers(os.path.join(maps, "duckdb.bin"))
     measured, fast["setup"][EXECUTOR] = measure(EXECUTOR + " (setup reused)", groups[EXECUTOR], runner._use_executor_tables)
     fast["tests"] = {str(bit): value for bit, value in measured.items()}
 
 memo = {"tests": {}}
-if EXECUTOR in groups and os.path.exists(os.path.join(maps, "execmemo.bin")):
+if EXECUTOR in groups and os.path.exists(os.path.join(maps, "execmemo.bin")) and not os.environ.get("BR_CALIBRATE_ONLY"):
     runner.load_executor_memo(os.path.join(maps, "execmemo.bin"))
 
     def with_memo():
@@ -122,6 +126,22 @@ if EXECUTOR in groups and os.path.exists(os.path.join(maps, "execmemo.bin")):
     memo["tests"] = {str(bit): value for bit, value in measured.items()
                      if ids[bit].rsplit("::", 1)[-1] in runner.MEMO_TESTS}
 
-json.dump({"tests": costs, "setup": setup, "fast": fast, "memo": memo}, open(sys.argv[3], "w"), separators=(",", ":"))
+answers = {"tests": {}}
+if EXECUTOR in groups and os.path.exists(os.path.join(maps, "ducksetup.json")):
+    # Own class setup, DuckDB's answers reused: how the executor tests run after
+    # a clean import, or when the patch touches something their setup runs.
+    runner.load_duckdb_setups(os.path.join(maps, "ducksetup.json"))
+    measured, answers["setup"] = measure(
+        EXECUTOR + " (own setup, answers reused)", groups[EXECUTOR],
+        lambda: runner._install_duck_probe(("/sqlglot",), set()),
+    )
+    answers["tests"] = {str(bit): value for bit, value in measured.items()}
+
+result = {"tests": costs, "setup": setup, "fast": fast, "memo": memo, "answers": answers}
+if os.environ.get("BR_CALIBRATE_ONLY") == "answers":
+    # Keep every other figure of an existing file: only this measurement is new.
+    result = json.load(open(sys.argv[3]))
+    result["answers"] = answers
+json.dump(result, open(sys.argv[3], "w"), separators=(",", ":"))
 recorded = sum(test["seconds"] for test in tests)
 print(f"total measured {sum(c for c in costs if c):.1f}s vs recorded {recorded:.1f}s")

@@ -97,7 +97,19 @@ the patched code**, and selects the ones that fail.
      only the cases that reach the changed code, plus any case the patch itself
      edits, are run.
    - The executor tests compare sqlglot's executor with DuckDB. DuckDB's answer
-     depends only on the SQL text it is given, so it is recorded once per text.
+     depends on the SQL text it is given and on what the connection holds, and
+     what a connection holds is decided by the statements it was sent. The
+     answers are recorded once per text, together with the statements the
+     pinned class setup sends. In a child, `duckdb.connect()` returns a
+     stand-in that watches what it is sent: while that is, one for one, a
+     recorded setup (the same views over the same unchanged files), DuckDB is
+     not even opened, and once the whole setup has been sent a recorded query
+     gets its recorded answer. Anything else opens the real connection, sends
+     it what was held back, and is passed on; after a statement that is
+     neither recognised nor a plain SELECT nothing is answered from the record.
+     This holds for any patch, because it is decided by what the patched code
+     really sends. The optimizer tests' small DuckDB database is held back the
+     same way until a case executes a query.
    - `sqlglot.executor.execute` optimizes a query, plans it and runs the plan.
      For a patch that changes none of the lines that run from planning to the
      result, a TPC query whose optimized form is exactly the pinned one is not
@@ -141,6 +153,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `cases.bin`, `cases.json`, `casesrc.json` | `trace_cases.py`, `build_cases.py` | per fixture case, the lines it reaches |
 | `setup.json` | `trace_setup.py` | what the executor tests' class setup executes and reads |
 | `duckdb.bin` | `build_duckdb_answers.py` | SQL text → DuckDB's answer over the TPC tables |
+| `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `execmemo.bin`, `execphase.json` | `build_executor_memo.py` | optimized TPC query → executor result; the lines that produce it |
 | `runcost.json` | `calibrate.py` | CPU seconds each test takes in this runner |
 
@@ -168,6 +181,9 @@ observed failing on the patched code or could not be ruled out.
   `tools/state_probe.py` shows what a given patch changes at import (for the
   unchanged tree: nothing). `tools/mutate_import.py` generates one-token
   patches to code that runs at import, labeled like the others.
+- `tools/test_duckprobe.py` holds the unit checks for the DuckDB stand-in: what
+  the caller sees and what really reaches DuckDB, in order, for every way a
+  connection can leave the recorded setup.
 - The runner was run on synthetic worst cases: infinite loops in tests, in
   imports and in class bodies, unbounded allocation, `os._exit`, stack
   overflow, and binary, renamed, deleted, new and non-applying files.
