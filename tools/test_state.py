@@ -223,6 +223,92 @@ def shapes(new_source, old_source=BASE):
 
 
 ERR = "\nclass Err(Exception):\n    pass\n"
+
+
+def sharing(new_source, old_source):
+    comparer = state.Comparer(world(old_source), world(new_source), "/root")
+    rows = sorted((row[2], row[3], row[4]) for row in comparer.run())
+    return rows, comparer.sharing()
+
+
+SHARED = BASE + textwrap.dedent("""
+    TABLE = {'a': 1}
+    ALIAS = TABLE
+    OTHER = {'a': 1}
+    NESTED = {'x': TABLE, 'y': [1, 2]}
+
+
+    def reader(key, table=TABLE):
+        return table[key]
+
+
+    def make():
+        held = TABLE
+
+        def inner(key):
+            return held[key]
+
+        return inner
+
+
+    CLOSED = make()
+
+
+    class Holder:
+        ROWS = TABLE
+        OWN = [1, 2]
+""")
+expect("sharing: the same source", sharing(SHARED, SHARED), ([], ""))
+expect(
+    "sharing: an alias becomes an equal copy",
+    sharing(SHARED.replace("ALIAS = TABLE", "ALIAS = dict(TABLE)"), SHARED),
+    ([], "pkg.mod:.ALIAS / pkg.mod:.TABLE"),
+)
+expect(
+    "sharing: an equal copy becomes an alias",
+    sharing(SHARED.replace("OTHER = {'a': 1}", "OTHER = TABLE"), SHARED),
+    ([], "pkg.mod:.OTHER / pkg.mod:.TABLE"),
+)
+expect(
+    "sharing: a class attribute stops sharing the module's table",
+    sharing(SHARED.replace("ROWS = TABLE", "ROWS = {**TABLE}"), SHARED)[1] != "",
+    True,
+)
+expect(
+    "sharing: a default argument stops sharing the module's table",
+    sharing(SHARED.replace("def reader(key, table=TABLE)", "def reader(key, table=dict(TABLE))"), SHARED),
+    ([], "pkg.mod:.TABLE / pkg.mod:.reader"),
+)
+expect(
+    "sharing: a closure stops sharing the module's table",
+    sharing(SHARED.replace("held = TABLE", "held = dict(TABLE)"), SHARED)[1] != "",
+    True,
+)
+expect(
+    "sharing: a table inside a table stops sharing",
+    sharing(SHARED.replace("NESTED = {'x': TABLE,", "NESTED = {'x': dict(TABLE),"), SHARED),
+    ([], "pkg.mod:.NESTED / pkg.mod:.TABLE"),
+)
+expect(
+    "sharing: other content with the same sharing is a difference of value only",
+    sharing(SHARED.replace("TABLE = {'a': 1}", "TABLE = {'a': 2}"), SHARED)[1],
+    "",
+)
+expect(
+    "sharing: a list of a class changed in content only",
+    sharing(SHARED.replace("OWN = [1, 2]", "OWN = [1, 3]"), SHARED),
+    ([("Holder", "OWN", "value")], ""),
+)
+expect(
+    "sharing: a name added is not a difference of sharing",
+    sharing(SHARED + "\nMORE = TABLE\n", SHARED),
+    ([("", "MORE", "added")], ""),
+)
+expect(
+    "sharing: an equal copy under one name and a changed table under another",
+    sharing(SHARED.replace("ALIAS = TABLE", "ALIAS = {'a': 1, 'b': 2}"), SHARED),
+    ([("", "ALIAS", "value")], "pkg.mod:.ALIAS / pkg.mod:.TABLE"),
+)
 expect("added function", shapes(BASE + "\ndef extra():\n    return 1\n"), [("extra", "added", "")])
 expect("added plain class", shapes(BASE + "\nclass Plain:\n    pass\n"), [("Plain", "added", "")])
 expect("added class with a base of the package", shapes(BASE + "\nclass Sub(Base):\n    pass\n"), [("Sub", "added", "R")])
