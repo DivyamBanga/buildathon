@@ -185,6 +185,9 @@ class Job:
         # What the patch changes of the executor phase: lines and attributes as bit
         # masks, and {attribute: names of the entries that differ} for tables.
         self.memo_block = (0, 0, {})
+        # The lines of the optimizer's own window that the patch changes, as a bit
+        # mask; None when a result may not be taken from the tree `optimize` is handed.
+        self.front_block: int | None = None
         self.memo_share: dict = {}
         self.memo_why = ""  # why recorded executor results are off, when nothing else says so
         self.deadline = float("inf")  # wall-clock limit for checking this commit
@@ -237,6 +240,7 @@ class Coordinator:
         self.memo_cost: dict[int, float] = {}
         self.exec_phase: dict | None = None
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
+        self.front_rows: dict | None = None  # the same for the lines `optimize` runs inside `execute`; None without that map
         self.exec_names: dict | None = None
         self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
         self.env_reviewed = False
@@ -729,6 +733,18 @@ class Coordinator:
                     self.exec_rows.setdefault((path, first), []).append((line, number))
                     number += 1
             self.exec_queries = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
+            # The optimizer's own window, numbered the same way (maps/execfront.json):
+            # every line `optimize` runs for a tree `execute` hands it, up to the planner.
+            try:
+                front = json.load(open(os.path.join(MAPS, "execfront.json")))["lines"]
+                self.front_rows = {}
+                number = 0
+                for path, rows in front.items():
+                    for first, line in rows:
+                        self.front_rows.setdefault((path, first), []).append((line, number))
+                        number += 1
+            except (OSError, ValueError, KeyError, TypeError):
+                self.front_rows = None
         return self.exec_phase
 
     def lines_naming(self, name: str) -> int:
@@ -753,6 +769,19 @@ class Coordinator:
                         mask |= 1 << number
         return mask
 
+    def front_lines(self, units: dict) -> int | None:
+        """Bit mask of the optimizer's lines that belong to the changed code in `units`
+        (as phase_lines); None when the map of that window is not there."""
+        if not self.front_rows:
+            return None
+        mask = 0
+        for path, entries in units.items():
+            for first, lines in entries:
+                for line, number in self.front_rows.get((path, first), ()):
+                    if lines is None or line in lines:
+                        mask |= 1 << number
+        return mask
+
     def executor_memo_ok(self, job: Job) -> bool:
         """True when recorded executor results may stand in for unchanged TPC queries.
 
@@ -765,6 +794,7 @@ class Coordinator:
         if job.memo_ok is None:
             job.memo_ok = False
             job.memo_block = (0, 0, {})
+            job.front_block = None
             job.memo_share = {}
             # A patched module that is imported on demand is imported from its
             # new source when a test first asks for it. That leaves the state
@@ -779,11 +809,15 @@ class Coordinator:
                     block = (self.phase_lines(job.plan.units), 0, {}) if self.executor_setup_untouched(job) else None
                     if block is None:
                         job.memo_why = "the patch touches what the class setup runs or reads"
+                    # The optimizer too runs pinned code on pinned state wherever it runs no
+                    # changed line; not said for a module that is first imported in the child.
+                    front = None if block is None or job.plan.lazy else self.front_lines(job.plan.units)
                 else:
-                    block = self.import_seen_by_executor(job)
+                    block, front = self.import_seen_by_executor(job)
                 if block is not None and (not any(block) or self.exec_queries):
                     job.memo_ok = True
                     job.memo_block = block
+                    job.front_block = front
         return job.memo_ok
 
     def memo_share(self, job: Job, bit: int) -> float:
@@ -820,7 +854,7 @@ class Coordinator:
                 return False
         return bool(self.exec_queries) or not self.phase_lines(plan.units)
 
-    def import_seen_by_executor(self, job: Job) -> tuple[int, int, dict] | None:
+    def import_seen_by_executor(self, job: Job) -> tuple:
         """After a clean import: what of the patch the executor phase can see, as
         (bit mask of phase lines, bit mask of attributes the phase reads,
         {attribute: names of its entries that differ}); all three empty when
@@ -846,6 +880,12 @@ class Coordinator:
           (maps/execnames.json, by the same rule as the reader map);
         - anything else (attributes added or removed, other bases, anything on
           the classes the recorded results are made of) cannot be pinned down.
+
+        Returned with it: the bit mask of the optimizer's lines the patch
+        changes (front_lines), or None when the optimizer may see the patch in
+        another way. For that window only lines are recorded, so it is a mask
+        only when every difference is a function with other code: one the
+        patch edits (its changed lines) or another one (all its lines).
         """
         result = job.state
         if result is None or not self.clean_memo_possible(job):
@@ -854,22 +894,25 @@ class Coordinator:
                 if not self.clean_memo_possible(job)
                 else "import state was not compared, or the comparison narrowed nothing"
             )
-            return None
+            return None, None
         if result.get("inconclusive") or result.get("widen") or result.get("failed"):
             job.memo_why = f"import state: {result.get('inconclusive') or 'a module no longer imports'}"
-            return None
+            return None, None
         known = self.covmap._pack("treaders.bin") or {}
         # The changed lines of the code the patch itself edits.
         rows = self.phase_lines(job.plan.units)
+        front = None if job.plan.lazy else self.front_lines(job.plan.units)
         own = {(path, first) for path, entries in job.plan.units.items() for first, _ in entries}
         reads = 0
         tables: dict = {}
         for kind, module, qualname, attribute, reason, _owner, path, first, *more in result["differences"]:
             where = f"{module}:{qualname}.{attribute}" if qualname else f"{module}.{attribute}"
+            if not (reason in ("function-meta", "function-code") and path):
+                front = None  # not a function: how the optimizer could see it is not recorded
             if module == "sqlglot.executor.table" and reason not in ("function-meta", "function-code"):
                 # What the recorded results are made of.
                 job.plan.note(f"no recorded results: {where} differs")
-                return None
+                return None, None
             if kind == "module" and attribute == "ENV" and module in ENV_HOLDERS and reason == "value":
                 # The executor's function table differs in some entries: a query
                 # sees that through the entries its code names.
@@ -885,13 +928,15 @@ class Coordinator:
             if reason in ("function-meta", "function-code") and path:
                 if self.covmap.is_loader(path, first):
                     job.plan.note(f"no recorded results: {where} imports on demand")
-                    return None
+                    return None, None
                 if reason == "function-code" and (path, first) in own:
                     # Only its code differs, and it is code the patch edits: a
                     # query sees that by running a changed line, as after a
                     # hot swap, and those lines are in `rows` already.
                     continue
                 rows |= self.phase_lines({path: [(first, None)]})
+                if front is not None:
+                    front |= self.front_lines({path: [(first, None)]}) or 0
                 continue
             if (
                 kind == "class"
@@ -929,7 +974,7 @@ class Coordinator:
                 continue
             if reason != "value":
                 job.plan.note(f"no recorded results: {where} {reason}")
-                return None
+                return None, None
             if attribute in known and attribute.isupper():
                 # Read by name: seen by the queries that run code mentioning it.
                 rows |= self.lines_naming(attribute)
@@ -951,8 +996,8 @@ class Coordinator:
                 rows |= self.lines_naming(attribute)
                 continue
             job.plan.note(f"no recorded results: {where} may be read by the executor")
-            return None
-        return rows, reads, {number: names for number, names in tables.items() if not reads >> number & 1}
+            return None, None
+        return (rows, reads, {number: names for number, names in tables.items() if not reads >> number & 1}), front
 
     def executor_record(self) -> bool:
         """Build the pinned executor tables and load the recorded results, once. False when that fails."""
@@ -964,6 +1009,7 @@ class Coordinator:
                 runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
                 runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
                 runner.EXECUTOR_QUERIES = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
+                runner.EXECUTOR_FRONT = runner.read_executor_front(os.path.join(MAPS, "execfrontq.bin")) or None
                 gc.freeze()
             except Exception as error:
                 log(f"could not prebuild the executor tables: {error!r}")
@@ -1294,6 +1340,7 @@ class Coordinator:
             "executor_memo": self.executor_memo_ok(job) and (job.mode == "hot" or self.executor_record()),
         }
         spec["memo_block"] = job.memo_block if spec["executor_memo"] and any(job.memo_block) else None
+        spec["front_block"] = job.front_block if spec["executor_memo"] else None
         if job.memo_why and not spec["executor_memo"] and any(bit in self.memo_cost for bit in tests):
             plan.note(f"no recorded results: {job.memo_why}")
             job.memo_why = ""

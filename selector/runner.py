@@ -818,8 +818,20 @@ MEMO_BLOCK = None
 # True in a child that imports the patched tree afresh and may reuse recorded
 # results: the memo is put in place when one of those two tests starts.
 MEMO_AFTER_IMPORT = False
+# What the optimizer makes of the tree `execute` hands it, at the pinned commit:
+# front key -> (digest of the optimized tree, bit mask of the lines the optimizer
+# runs for that tree) (maps/execfrontq.bin). The front key covers the tree with
+# everything its nodes hold, and the schema (front_key).
+EXECUTOR_FRONT = None
+# Bit mask of those lines that the patch changes (0: none of them); None when
+# the front key may not be used for this patch at all.
+FRONT_BLOCK = None
+# The `execute` call that is under way: the tables it prepared, its front key.
+_FRONT_CALL = {"tables": None, "key": None}
 # For the offline tools: a directory to record results into, and a callable
-# told when the planning-and-execution phase starts ("X") and ends ("L").
+# told when the planning-and-execution phase starts ("X"), when the optimizer
+# starts ("F": that window ends where the planner starts) and when neither is
+# on ("L").
 MEMO_RECORD = None
 MEMO_PHASE = None
 
@@ -856,6 +868,125 @@ def read_executor_queries(path: str) -> dict:
         }
     except Exception:
         return {}
+
+
+def read_executor_front(path: str) -> dict:
+    """maps/execfrontq.bin as {front key: (digest of the optimized tree, line mask as an int)}; {} when it is not there."""
+    import marshal
+    import zlib
+
+    try:
+        with open(path, "rb") as handle:
+            raw = marshal.loads(zlib.decompress(handle.read()))
+        return {
+            key: (digest, int.from_bytes(lines, "little"))
+            for key, (digest, lines) in raw.items()
+            if type(key) is str and type(digest) is str
+        }
+    except Exception:
+        return {}
+
+
+def _plain(value, out: list, depth: int = 0) -> None:
+    """Appends a text for a value made of dicts with text keys, lists, tuples and
+    plain values only, with the order of everything kept. Raises TypeError for
+    anything else: such a value is not one this module can call equal to another."""
+    kind = type(value)
+    if depth > 12:
+        raise TypeError("nested too deep")
+    if value is None or kind is bool or kind is int or kind is float:
+        out.append(f"{kind.__name__}:{value!r};")
+    elif kind is str:
+        out.append(f"s{len(value)}:{value};")
+    elif kind is dict:
+        out.append("{")
+        for name, item in value.items():
+            if type(name) is not str:
+                raise TypeError("a key that is not text")
+            out.append(f"k{len(name)}:{name};")
+            _plain(item, out, depth + 1)
+        out.append("}")
+    elif kind is list or kind is tuple:
+        out.append("[" if kind is list else "(")
+        for item in value:
+            _plain(item, out, depth + 1)
+        out.append("]" if kind is list else ")")
+    else:
+        raise TypeError(kind.__name__)
+
+
+def _schema_text(schema) -> str:
+    """What a schema object holds that the optimizer can ask it for, as text; TypeError when that cannot be said.
+
+    Read off the object without calling it: the mapping (table and column
+    order kept: a star is expanded in that order), the visible columns, the
+    functions, whether names are normalized, and the dialect it normalizes
+    with (its class and its own settings). What it works out from those and
+    keeps (its depth, the table arguments in use, its caches) is not part of
+    it: the code that fills them in is the pinned code whenever this text is
+    used (see _front_known), and what they hold then follows from the rest.
+    """
+    kind = type(schema)
+    if kind.__name__ != "MappingSchema" or kind.__module__ != "sqlglot.schema":
+        raise TypeError("not a mapping schema")
+    held = vars(schema)
+    dialect = held["_dialect"]
+    settings = dict(vars(dialect))
+    strategy = settings.pop("normalization_strategy", None)
+    out = [type(dialect).__module__, ".", type(dialect).__qualname__, ";", type(strategy).__qualname__, ".", str(getattr(strategy, "name", strategy)), ";"]
+    _plain(settings, out)
+    for name in ("mapping", "visible", "udf_mapping", "normalize"):
+        out.append(name + "=")
+        _plain(held[name], out)
+    return "".join(out)
+
+
+def _no_stale_hash(root) -> bool:
+    """True when no node of the tree carries a cached hash, or every cached hash is the true one (hashes_fresh)."""
+    seen = set()
+    todo = [root]
+    while todo:
+        node = todo.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if node._hash is not None:
+            return hashes_fresh(root)
+        for value in list(node.args.values()) + [getattr(node, "_type", None)]:
+            for item in value if type(value) is list else (value,):
+                if type(getattr(item, "args", None)) is dict and hasattr(item, "parent"):
+                    todo.append(item)
+    return True
+
+
+def front_key(scope: str, args: tuple, kwargs: dict) -> str | None:
+    """The key of one `optimize` call made by `execute` for a TPC query, or None when the call is not one this module knows.
+
+    `execute` calls `optimize(tree, schema, leave_tables_isolated=True,
+    dialect=dialect)`. What comes back depends on the tree, on the schema, on
+    those two settings and on the code that runs. The key covers the first
+    three: the tree with everything its nodes hold (tree_digests: the key and
+    all three slots), the schema by content, and a call of exactly that shape
+    with no dialect. A tree with a cached hash that is out of date is not one
+    the digest describes, and gets no key.
+    """
+    import hashlib
+
+    if len(args) != 2 or len(kwargs) != 2 or kwargs.get("leave_tables_isolated") is not True or "dialect" not in kwargs:
+        return None
+    if kwargs["dialect"] is not None:
+        return None
+    tree, schema = args
+    if type(getattr(tree, "args", None)) is not dict or not hasattr(tree, "parent"):
+        return None
+    try:
+        if not _no_stale_hash(tree):
+            return None
+        digest, slots = tree_digests(tree)
+        text = "|".join((digest,) + slots + (_schema_text(schema),))
+    except Exception:
+        return None
+    return scope + ":" + hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def query_touched(own: tuple, block: tuple) -> bool:
@@ -904,6 +1035,52 @@ class _Planned:
         self.fresh = fresh  # no cached hash in the tree is out of date (hashes_fresh)
         self.digest = digest  # of the tree without the slots: the key
         self.slots = slots  # one digest per slot of SLOTS
+
+
+class _Known:
+    """Stands in for the optimized tree of a query whose result is known before it is optimized.
+
+    `execute` does three things with what `optimize` returns: it formats it
+    for a debug line (`sql(pretty=True)`, whether or not anything logs it),
+    plans it and runs the plan. The first is answered here with an empty
+    text; the lines it would run are part of the window the front key
+    stands for. The other two go through the stand-ins of
+    install_executor_memo, which hand back the recorded result.
+    """
+
+    def __init__(self, key: str, tables, args: tuple, kwargs: dict) -> None:
+        self.key = key  # the memo key of the recorded result
+        self.tables = tables  # the tables that key was checked against
+        self.call = (args, kwargs)  # what `optimize` was called with
+
+    def sql(self, *args, **kwargs) -> str:
+        return ""
+
+
+def _front_known(scope: str, front: str):
+    """The memo key of the result that the front key stands for, or None when it does not stand for one here.
+
+    It does when the pinned optimizer was recorded on exactly this input
+    (EXECUTOR_FRONT), the patch changes none of the lines the optimizer runs
+    for it, and the recorded result of the tree it then made may be used:
+    same tables by content (memo_key), nothing the patch changes run or read
+    by that query's planning and execution. The slots of the optimized tree
+    need no look: with the same input and no changed line run, the pinned
+    optimizer builds the recorded tree, slots and cached hashes included.
+    """
+    block = FRONT_BLOCK
+    if block is None or EXECUTOR_FRONT is None or EXECUTOR_MEMO is None or MEMO_RECORD is not None:
+        return None
+    own = EXECUTOR_FRONT.get(front)
+    if own is None or own[1] & block:
+        return None
+    key = memo_key(scope, own[0], (), {"tables": _FRONT_CALL["tables"]})
+    if key is None or key not in EXECUTOR_MEMO:
+        return None
+    record = (EXECUTOR_QUERIES or {}).get(key)
+    if record is None or (MEMO_BLOCK is not None and query_touched(record, MEMO_BLOCK)):
+        return None
+    return key
 
 
 SLOTS = ("_type", "comments", "_meta")
@@ -1200,10 +1377,16 @@ def install_executor_memo() -> None:
     if getattr(real_plan, "_br_memo", False):
         return
 
+    real_tables = executor.ensure_tables
+    real_optimize = executor.optimize
+
     def plan(expression):
         scope = MEMO_SCOPE
-        if scope is None:
-            return real_plan(expression)
+        if scope is None or type(expression) is _Known:
+            # A stand-in goes on to the executor, which knows what to do with it.
+            return expression if type(expression) is _Known else real_plan(expression)
+        if MEMO_PHASE is not None:
+            MEMO_PHASE("L")  # the optimizer's window ends here
         # Looked at before the phase begins: the check is ours, not something the query runs.
         fresh = hashes_fresh(expression)
         if MEMO_PHASE is not None:
@@ -1222,6 +1405,14 @@ def install_executor_memo() -> None:
 
         def execute(self, planned):
             try:
+                if type(planned) is _Known:
+                    if not self._args and list(self._kwargs) == ["tables"] and self._kwargs["tables"] is planned.tables:
+                        return pickle.loads(EXECUTOR_MEMO[planned.key])
+                    # Not the call the key was checked for: optimize now, and go on as `execute` would have.
+                    args, kwargs = planned.call
+                    optimized = real_optimize(*args, **kwargs)
+                    optimized.sql(pretty=True)
+                    planned = plan(optimized)
                 if not isinstance(planned, _Planned):
                     return real_executor(*self._args, **self._kwargs).execute(planned)
                 scope = MEMO_SCOPE
@@ -1237,39 +1428,60 @@ def install_executor_memo() -> None:
                     return pickle.loads(EXECUTOR_MEMO[key])
                 result = real_executor(*self._args, **self._kwargs).execute(real_plan(planned.expression))
                 # A result is recorded only for a tree whose cached hashes are all true ones.
+                # With it goes the front key of the `optimize` call that made the tree.
                 if MEMO_RECORD is not None and key is not None and planned.fresh:
                     name = os.path.join(MEMO_RECORD, f"{os.getpid()}-{len(os.listdir(MEMO_RECORD))}")
                     with open(name, "wb") as handle:
-                        pickle.dump((key, planned.slots, pickle.dumps(result, protocol=4)), handle)
+                        pickle.dump((key, planned.slots, pickle.dumps(result, protocol=4), _FRONT_CALL["key"]), handle)
                 return result
             finally:
+                _FRONT_CALL["tables"] = _FRONT_CALL["key"] = None
                 if MEMO_PHASE is not None and MEMO_SCOPE is not None:
                     MEMO_PHASE("L")
 
         def __getattr__(self, name):
             return getattr(real_executor(*self._args, **self._kwargs), name)
 
+    # `execute` prepares the tables it was given before the query is optimized,
+    # and the executor runs on those: that code decides the result too, and
+    # everything `execute` does outside the optimizer counts as the phase.
+    def ensure_tables(*args, **kwargs):
+        if MEMO_PHASE is not None and MEMO_SCOPE is not None:
+            MEMO_PHASE("X")
+        _FRONT_CALL["tables"] = _FRONT_CALL["key"] = None
+        made = real_tables(*args, **kwargs)
+        _FRONT_CALL["tables"] = made
+        return made
+
+    def optimize(*args, **kwargs):
+        scope = MEMO_SCOPE
+        if scope is None:
+            return real_optimize(*args, **kwargs)
+        if MEMO_PHASE is not None:
+            MEMO_PHASE("L")
+        # The key is ours: worked out before the optimizer's window opens.
+        front = front_key(scope, args, kwargs)
+        _FRONT_CALL["key"] = front
+        if front is not None:
+            try:
+                known = _front_known(scope, front)
+            except Exception:
+                known = None
+            if known is not None:
+                return _Known(known, _FRONT_CALL["tables"], args, kwargs)
+        if MEMO_PHASE is None:
+            return real_optimize(*args, **kwargs)
+        MEMO_PHASE("F")
+        try:
+            return real_optimize(*args, **kwargs)
+        except BaseException:
+            MEMO_PHASE("L")
+            raise
+
     executor.Plan = plan
     executor.PythonExecutor = Executor
-    if MEMO_PHASE is not None:
-        # Recording only. The executor also runs on tables that `execute`
-        # prepares before the query is optimized, so that code decides the
-        # result too: everything `execute` does counts, except optimizing.
-        real_tables = executor.ensure_tables
-        real_optimize = executor.optimize
-
-        def ensure_tables(*args, **kwargs):
-            if MEMO_SCOPE is not None:
-                MEMO_PHASE("X")
-            return real_tables(*args, **kwargs)
-
-        def optimize(*args, **kwargs):
-            if MEMO_SCOPE is not None:
-                MEMO_PHASE("L")
-            return real_optimize(*args, **kwargs)
-
-        executor.ensure_tables = ensure_tables
-        executor.optimize = optimize
+    executor.ensure_tables = ensure_tables
+    executor.optimize = optimize
 
 
 # (module, attribute, case name): module-level collections a test loops over,
@@ -1600,7 +1812,7 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
 
 def child_main(job, write_fd: int, root: str, function_index) -> None:
     """Runs in the forked child and never returns."""
-    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK, CLEAN_ROWS
+    global _pinned_fixtures, _changed_fixtures, MEMO_AFTER_IMPORT, MEMO_BLOCK, FRONT_BLOCK, CLEAN_ROWS
     code = 0
     try:
         os.setpgid(0, 0)
@@ -1632,6 +1844,7 @@ def child_main(job, write_fd: int, root: str, function_index) -> None:
         CASE_FILTER.clear()
         CASE_FILTER.update(job.get("cases") or {})
         MEMO_BLOCK = job.get("memo_block")
+        FRONT_BLOCK = job.get("front_block")
         if job["mode"] == "clean":
             _purge(root)
             sys.path.insert(0, overlay)
