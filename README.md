@@ -63,7 +63,11 @@ the patched code**, and selects the ones that fail.
    twins), select every test of that file unchecked, and every test that
    imports it when it is a helper module. Added and removed lines count. The
    runner uses unittest, which ignores all of these, so running the test says
-   nothing. (A new or changed `conftest.py` and the pytest configuration files
+   nothing. A changed line that names `pytest_plugins` selects every test:
+   pytest registers what it names (the file itself, if it names itself) as
+   plugins when it imports the file as a test module or as a test package, and
+   their hooks then act on the whole run. (A new or changed `conftest.py` and
+   the pytest configuration files
    select everything, as before. So does a `pyproject.toml` or `setup.cfg`, at the
    root or under `tests/`, that appears, vanishes, moves, or is edited so that
    pytest's own loader raises on it or finds pytest settings in either text;

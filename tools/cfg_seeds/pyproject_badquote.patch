@@ -1,0 +1,13 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 949ece8..5c0aee6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ dynamic = ["version", "optional-dependencies"]
+ description = "An easily customizable SQL parser and transpiler"
+ readme = "README.md"
+ authors = [{ name = "Toby Mao", email = "toby.mao@gmail.com" }]
+-license = "MIT"
++license = "MIT'
+ license-files = ["LICENSE"]
+ requires-python = ">= 3.9"
+ classifiers = [
