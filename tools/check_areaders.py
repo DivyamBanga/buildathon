@@ -1,6 +1,6 @@
 """Compare the candidates with and without the class-attribute read map, against labels.
 
-    python tools/check_areaders.py <patch dir> <labels> <out.jsonl> [first last]
+    python tools/check_areaders.py [--keys] <patch dir> <labels> <out.jsonl> [first last]
 
 Inside the lab image, with the selector and maps next to this tool's parent
 directory. For every patch the plan goes through what the coordinator does up
@@ -12,6 +12,10 @@ Coordinator.finish_probe does. <labels> is a directory of <commit>.json
 
 One line per commit that went through the comparison, and at the end the
 labeled commits that have a failing test outside the new candidates.
+
+--keys: the two maps are the same except that the "old" one lacks maps/akeys.bin (the
+key-level map): the candidates before and after the entries of dict-valued attributes
+narrow them (tools/trace_keys.py, tools/build_akeys.py).
 """
 
 import json
@@ -26,8 +30,11 @@ from selector.analyze import analyze  # noqa: E402
 from selector.covmap import CovMap  # noqa: E402
 
 ROOT = "/sqlglot"
-patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in sys.argv[1:4])
-first, last = (int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) > 5 else (0, 1 << 30)
+KEYS = "--keys" in sys.argv
+DUMP = "--dump" in sys.argv
+ARGV = [argument for argument in sys.argv[1:] if argument not in ("--keys", "--dump")]
+patches, labels, output = (os.path.abspath(path) if path != "-" else path for path in ARGV[0:3])
+first, last = (int(ARGV[3]), int(ARGV[4])) if len(ARGV) > 4 else (0, 1 << 30)
 maps = os.path.join(HERE, "maps")
 os.environ["SKIP_INTEGRATION"] = "0"
 ids = json.load(open(os.path.join(maps, "tests.json")))
@@ -65,7 +72,7 @@ state.load_pinned(ROOT)
 loaded = [name for name in sys.modules if name == "sqlglot" or name.startswith("sqlglot.")]
 new_map = CovMap(maps)
 old_map = CovMap(maps)
-old_map._packs["areaders.bin"] = None
+old_map._packs["akeys.bin" if KEYS else "areaders.bin"] = None
 warm = {os.path.join(ROOT, path) for path in new_map.warm_files()}
 
 
@@ -136,6 +143,7 @@ with open(output, "w") as log:
             "differences": len(result["differences"]),
             "inconclusive": result["inconclusive"],
             "pairs": pairs[:12],
+            "entries": [row[8] if len(row) > 8 else "-" for row in result["differences"]][:12],
             "old": None if old is None else old.bit_count(),
             "new": None if new is None else new.bit_count(),
             "left_s": None if old is None or new is None else round(cost(old & ~new), 2),
@@ -144,6 +152,11 @@ with open(output, "w") as log:
             "slow_old": [t for t in SLOW if old is not None and old >> index[t] & 1],
             "slow_new": [t for t in SLOW if new is not None and new >> index[t] & 1],
         }
+        if DUMP and old is not None and new is not None:
+            # for labelling by real pytest: the test files of the old candidates, the new candidates by number
+            record["old_files"] = sorted({ids[bit].split("::")[0] for bit in CovMap.bits(old)})
+            record["new_bits"] = list(CovMap.bits(new))
+            record["old_bits"] = list(CovMap.bits(old))
         if commit in truth:
             failing = truth[commit]
             record["failing"] = len(failing)
