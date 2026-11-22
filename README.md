@@ -123,6 +123,14 @@ the patched code**, and selects the ones that fail.
    `finally` or `tearDown` only undoes what it did itself. Of one that is
    removed as a whole, only the stores still count.
 
+   **A binary patch to a file that is not code** (`GIT binary patch`, `Binary
+   files differ`) is not applied here, so a child could not be given the new
+   bytes. When neither path names code (`.py`, `.pyi`, `.pyc`, `.so`, `.pth`,
+   an archive, a pytest configuration file, `__pycache__`), the tests that open
+   the file (`opens.json`) and, if it appears, vanishes or moves, those that list
+   its directory or ask for its name are selected unchecked; with no such test
+   the commit selects nothing instead of every test.
+
    **A file that appears or vanishes** changes what its directory lists. Two
    kinds of test can notice (`dirs.json`, from a run of every test alone under
    `tools/trace_names/sitecustomize.py` and one run of the whole suite):

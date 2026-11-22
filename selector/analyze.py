@@ -555,6 +555,44 @@ def _import_checker(root: str, plan: Plan):
     return check
 
 
+# What a binary patch may not touch: code, in any form Python or the loader runs.
+_CODE_SUFFIXES = (".py", ".pyi", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".pth", ".zip", ".whl", ".egg")
+
+
+def _inert_binary(path: str) -> bool:
+    name = os.path.basename(path)
+    return (
+        not name.endswith(_CODE_SUFFIXES)
+        and ".so." not in name
+        and name not in _PYTEST_CONFIG
+        and name not in _MAYBE_PYTEST_CONFIG
+        and "__pycache__" not in path.split("/")
+        # pytest collects tests/**/test*.txt as doctest files and stops on one it cannot read
+        and not (path.startswith("tests/") and fnmatch.fnmatch(name, "test*.txt"))
+    )
+
+
+def _binary_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
+    """A binary patch to a file that is not code. The patch is not applied here, so a child
+    cannot be given the new bytes: the tests that open the file, and those that list its
+    directory when it appears or vanishes, are selected as they are."""
+    path = patch.path
+    old_path = patch.old_path or path
+    found = 0
+    opened = covmap.opened(old_path)
+    if opened:
+        found |= opened
+    if patch.new_file or old_path != path or patch.deleted:
+        for entry in {path, old_path}:
+            listed, _ = covmap.entry_listers(entry, root)
+            found |= listed
+    plan.candidates |= found
+    plan.rest_candidates |= found
+    plan.unverified |= found
+    plan.sliceable = False
+    plan.note(f"{path}: binary, not code: {found.bit_count()} tests open it or list its directory, selected unchecked")
+
+
 def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """A file that appears or vanishes changes what its directory lists.
 
@@ -687,6 +725,9 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
                 patch.binary = True
         if patch.binary:
             patch.unapplied = True
+            if _inert_binary(path) and _inert_binary(old_path):
+                _binary_rules(plan, patch, covmap, root)
+                continue
         else:
             try:
                 patchlib.apply(patch, old_text)

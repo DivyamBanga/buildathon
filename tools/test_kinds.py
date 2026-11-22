@@ -688,4 +688,28 @@ if covmap._dirs["names"] is not None:
         plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
         expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)
 
+# ---- P: a binary patch to a file that is not code -------------------------------
+
+def binary_patch(path, new=True):
+    head = "new file mode 100644\n" if new else ""
+    return f"diff --git a/{path} b/{path}\n{head}index 0000000..1234567\nGIT binary patch\nliteral 1\nIcmZPo000\n\n"
+
+
+plan = plan_for(binary_patch("tests/fixtures/zz_logo.png"))
+expect("P: a new image nobody lists", (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+for path in ("docs/logo.png", "sqlglot.png", "posts/zz.jpg", "tests/fixtures/notes.bin", "sqlglot/zz.dat"):
+    plan = plan_for(binary_patch(path))
+    expect("P: a new binary file that is not code: " + path, (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+plan = plan_for(binary_patch("zz.dist-info/RECORD"))
+expect("P: a binary file in a new dist-info at the root counts like a text one", plan.candidates, covmap.all)
+opened_paths = sorted(p for p in covmap._opens if not p.endswith((".py", ".pyc", ".so")) and "__pycache__" not in p)
+if opened_paths:
+    path = opened_paths[0]
+    plan = plan_for(binary_patch(path, new=False))
+    expect("P: a binary file a test opens: those tests, unchecked", (plan.select_all, plan.candidates != 0, plan.candidates == plan.unverified), (False, True, True))
+    expect("P: and exactly the tests that open it", plan.candidates, covmap.opened(path))
+for path in ("sqlglot/zz.so", "sqlglot/zz.pyc", "x.pth", "sqlglot/__pycache__/a.cpython-313.pyc", "sqlglot/zz.cpython-313-x86_64-linux-gnu.so.1", "pytest.ini",
+             "tests/test_notes.txt", "tests/dialects/test_a.txt"):
+    expect("P: " + path + " may be code", plan_for(binary_patch(path)).select_all or plan_for(binary_patch(path)).candidates != 0, True)
+
 print(f"{checks} checks passed")
