@@ -788,6 +788,17 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.select_all = True
             plan.note(f"{path}: patch does not apply")
             continue
+        if patch.copied and old_path != path:
+            # A copy: the source stays where it is, so nothing vanishes. From here on the section
+            # is a new file that holds the text the copy has.
+            patch.old_path = None
+            patch.new_file = True
+            patch.old_text = None
+            patch.old_lines_changed = []
+            patch.pure_insert_after = []
+            patch._anchors = [(1, 0)]
+            old_path = path
+            old_text = None
         if old_text is None and not patch.new_file and patch.hunks:
             # The patch edits a file the pinned commit does not have.
             plan.select_all = True

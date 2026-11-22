@@ -24,6 +24,7 @@ class FilePatch:
         "old_text",
         "new_text",
         "unapplied",
+        "copied",
         "old_lines_changed",
         "pure_insert_after",
         "_anchors",
@@ -39,6 +40,8 @@ class FilePatch:
         self.old_text: str | None = None
         self.new_text: str | None = None
         self.unapplied = False
+        # `copy from` / `copy to`: the hunks apply to the source's text, and the source stays.
+        self.copied = False
         # 1-based old line numbers removed or replaced by the patch.
         self.old_lines_changed: list[int] = []
         # Old line numbers after which lines were inserted with no removal (0 = file start).
@@ -108,6 +111,7 @@ def parse(text: str) -> list[FilePatch]:
             current.new_path = line[len("rename to "):].strip()
         elif line.startswith("copy from "):
             current.old_path = line[len("copy from "):].strip()
+            current.copied = True
         elif line.startswith("copy to "):
             current.new_path = line[len("copy to "):].strip()
         elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):

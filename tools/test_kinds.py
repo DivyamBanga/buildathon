@@ -753,4 +753,25 @@ for directory, _, names in os.walk(os.path.join(ROOT, "tests")):
             taken += [node.name for node in _ast.walk(tree) if isinstance(node, _ast.ClassDef) and node.name.upper() in analyze._registry_names(ROOT)]
 expect("K: no class of the pinned tests is named like a built-in dialect", taken, [])
 
+
+# ---- a copied file (`copy from` / `copy to`): the source stays, the copy is a new file ----
+
+def copy_patch(source, target):
+    return f"diff --git a/{source} b/{target}\nsimilarity index 100%\ncopy from {source}\ncopy to {target}\n"
+
+
+if covmap._dirs["names"] is not None:
+    plan = plan_for(copy_patch("sqlglot/time.py", "sqlglot/time_copy.py"))
+    expect("copy: a module copied under a name nobody asks for", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("README.md", "docs/README_copy.md"))
+    expect("copy: a text file copied", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("sqlglot/time.py", "json.py"))
+    expect("copy: the copy still counts as a new file under its own name", plan.candidates, everything)
+    plan = plan_for(copy_patch("tests/dialects/test_dune.py", "tests/dialects/test_dune_copy.py"))
+    expect("copy: a plain test file copied is a harmless new test file", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("tests/test_dialect_entry_points.py", "tests/test_entry_points_copy.py"))
+    expect("copy: a test file that stores outside its locals, copied, selects everything", plan.select_all, True)
+plan = plan_for(copy_patch("sqlglot/time.py", "sqlglot/time_copy.py"))
+expect("copy: the source is not taken for removed", any("removed or renamed" in note for note in plan.notes), False)
+
 print(f"{checks} checks passed")
