@@ -87,6 +87,9 @@ ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 PLAN_ONLY = os.environ.get("BR_PLAN_ONLY", "") != ""
 # For experiments only: BR_FRONT=0 never takes a recorded result by the tree the optimizer is handed.
 FRONT_KEY = os.environ.get("BR_FRONT", "1") != "0"
+# Working out the key before the optimizer means walking every tree once more: not
+# worth it when fewer recorded queries than this could be found by it.
+FRONT_MIN = 5
 # For experiments only: BR_ONLY=text leaves only the candidates whose id holds that text (the rest count as not there).
 ONLY = os.environ.get("BR_ONLY", "")
 TRACE = os.environ.get("BR_TRACE", "") != ""
@@ -245,6 +248,7 @@ class Coordinator:
         self.exec_phase: dict | None = None
         self.exec_rows: dict = {}  # (path, code firstlineno) -> [(line, its number among the phase lines)]
         self.front_rows: dict | None = None  # the same for the lines `optimize` runs inside `execute`; None without that map
+        self.front_masks: list = []  # per recorded query, which of those lines the optimizer runs for it
         self.exec_names: dict | None = None
         self.exec_dynamic: set = {("?", 0)}  # not reviewed until the map says what it holds
         self.env_reviewed = False
@@ -752,6 +756,7 @@ class Coordinator:
                         number += 1
             except (OSError, ValueError, KeyError, TypeError):
                 self.front_rows = None
+            self.front_masks = [mask for _digest, mask in runner.read_executor_front(os.path.join(MAPS, "execfrontq.bin")).values()]
         return self.exec_phase
 
     def lines_naming(self, name: str) -> int:
@@ -824,6 +829,8 @@ class Coordinator:
                 if block is not None and (not any(block) or self.exec_queries):
                     job.memo_ok = True
                     job.memo_block = block
+                    if front is not None and sum(1 for mask in self.front_masks if not mask & front) < FRONT_MIN:
+                        front = None  # (nearly) every query's optimizer runs a changed line
                     job.front_block = front if FRONT_KEY else None
                 if TRACE:
                     log(
