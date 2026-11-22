@@ -18,6 +18,10 @@ is dict's own (PyDict_Merge). What a subclass changes that no override can undo:
   other holders of the original dict (a copy is made: tools/trace_keys.py moves every holder it can
   find, and leaves a table alone, "whole", when something else holds it)
 
+A copy that is itself handed out as a RecDict for the same pairs can be followed instead of
+noted: while MUTED is the id of a table, reads of that table make no note (the one use is
+tools/trace_keys.py follow_dispatch, which says why that is faithful).
+
 tools/test_recdict.py checks each route. The note is the cheapest possible (one tuple into a
 set); the keys are turned into tokens (selector.state.Comparer._token) when a test ends.
 """
@@ -28,9 +32,13 @@ TABLES: dict = {}  # id(table) -> table, so that a note can be turned into pairs
 # While a window is open (the executor's planning and execution of one query), its notes go here as well.
 WINDOW_KEYS = None
 WINDOW_WHOLE = None
+# id of a table whose reads are not noted for the moment: it is being copied into a RecDict that stands for it.
+MUTED = None
 
 
 def _key(table, key):
+    if id(table) == MUTED:
+        return
     note = (id(table), key)
     KEYS.add(note)
     window = WINDOW_KEYS
@@ -40,6 +48,8 @@ def _key(table, key):
 
 def _whole(table):
     note = id(table)
+    if note == MUTED:
+        return
     WHOLE.add(note)
     window = WINDOW_WHOLE
     if window is not None:
@@ -122,10 +132,14 @@ class RecDict(dict):
 
     def __eq__(self, other):
         _whole(self)
+        if type(other) is RecDict:
+            _whole(other)  # dict's comparison reads the other table directly
         return dict.__eq__(self, other)
 
     def __ne__(self, other):
         _whole(self)
+        if type(other) is RecDict:
+            _whole(other)
         return dict.__ne__(self, other)
 
     def __repr__(self):

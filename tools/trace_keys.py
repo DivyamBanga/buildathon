@@ -12,6 +12,12 @@ than one key, the table ("whole" notes). Dicts in module namespaces with a
 constant's name are handed out the same way (pair "module:|NAME", the form
 selector/state.py reports module attributes in).
 
+The generators' dispatch tables (follow_dispatch): a generator copies its TRANSFORMS into a
+dict of its own the first time it is made, and reads that dict one class at a time. The copy
+is handed out as a RecDict that stands for the pairs of the table it was made from, and the
+copying is not noted: what a test sees of TRANSFORMS through a generator is the entries it
+looks up, found or not.
+
 A table is replaced only when nothing else holds it (the holder check of
 recdict.wrap; module namespaces are the other holders this tool moves). A table
 that something else holds, or that is handed to exec or eval as a namespace,
@@ -115,8 +121,11 @@ def _holder_reason(group: dict, namespaces: dict, mine: set):
         if isinstance(holder, types.FrameType) and holder.f_code.co_filename in here:
             continue
         if type(holder) is dict and id(holder) in namespaces:
-            if any(v is value and not _CONSTANT.match(k) for k, v in holder.items()):
-                return "also held in a module under a name that is not a constant's"
+            # A plain loop: a generator expression here would close over `value`, and the cell of this
+            # very frame would then be reported as a holder of every table.
+            for name, held in holder.items():
+                if held is value and not _CONSTANT.match(name):
+                    return "also held in a module under a name that is not a constant's"
             continue
         return f"also held by a {type(holder).__name__}"
     return None
@@ -182,6 +191,75 @@ def wrap_attributes() -> dict:
     info["key_pairs"] = sorted(key_pairs)
     info["whole_tables"] = sorted([pair, reason] for pair, reason in whole.items())
     return info
+
+
+# ---- the generators' dispatch tables ---------------------------------------------
+
+# sha1 of the source of sqlglot.generator._build_dispatch at the pinned commit, as reviewed: it reads
+# cls.TRANSFORMS in one place, `dict(cls.TRANSFORMS)`, and the dict it returns holds every entry of
+# that table under the same key, plus one entry per `*_sql` method whose class is not a key of it.
+BUILD_DISPATCH_SOURCE = "44ab0faa0d0e7597"
+
+
+def _source_digest(function) -> str:
+    import inspect
+
+    try:
+        text = inspect.getsource(function)
+    except (OSError, TypeError):
+        return ""
+    return hashlib.sha1(text.replace("\r\n", "\n").encode()).hexdigest()[:16]
+
+
+def followed(original):
+    """`original` (a function that copies cls.TRANSFORMS into a new dict and returns it) with the copy
+    handed out as a RecDict standing for the pairs of the table copied.
+
+    Why the copying needs no note. The dict returned differs between two worlds only under the keys
+    whose entry of TRANSFORMS differs (added, removed or other value: an entry of TRANSFORMS wins
+    over the method of the same class, so even an added or removed one changes that key alone),
+    and in its order. A reader of the copy that looks up one key is noted with that key, hit or
+    miss, as a reader of the table; anything else it does with the copy (iteration, len, a copy,
+    equality) is a whole read of the table, as RecDict notes it. A table that is not a RecDict
+    (left whole by the holder check, or made by a class defined in a test) is not followed.
+    """
+
+    def _build_dispatch(cls):
+        try:
+            table = cls.TRANSFORMS  # the descriptor notes the pair as read
+        except AttributeError:
+            return original(cls)
+        if type(table) is not recdict.RecDict or recdict.MUTED is not None:
+            return original(cls)
+        recdict.MUTED = id(table)
+        try:
+            dispatch = original(cls)
+        finally:
+            recdict.MUTED = None
+        if type(dispatch) is not dict:
+            recdict._whole(table)
+            return dispatch
+        return recdict.RecDict(dispatch, table._br_pairs)
+
+    _build_dispatch._br_original = original
+    return _build_dispatch
+
+
+def follow_dispatch() -> dict:
+    """Put followed() in place of sqlglot.generator._build_dispatch and empty the cache of dispatch
+    tables, so that every test builds the ones it uses. Returns what was done, for pairs.json."""
+    module = sys.modules.get(ta.PACKAGE + ".generator")
+    original = getattr(module, "_build_dispatch", None)
+    cache = getattr(module, "_DISPATCH_CACHE", None)
+    if original is None or not isinstance(cache, dict):
+        return {"followed": False, "why": "no _build_dispatch or no _DISPATCH_CACHE"}
+    digest = _source_digest(original)
+    cached = dict.__len__(cache)
+    cache.clear()
+    if digest != BUILD_DISPATCH_SOURCE:
+        return {"followed": False, "why": f"_build_dispatch is not the reviewed one ({digest})", "cached": cached}
+    module._build_dispatch = followed(original)
+    return {"followed": True, "source": digest, "cached": cached}
 
 
 # ---- turning the notes of a run into names ------------------------------------
@@ -384,6 +462,8 @@ def main() -> None:
     from selector import runner
 
     runner._cap_duckdb_threads()
+    # The runner's own look at the tables a test may leave changed (after every test) is not a read of the test.
+    runner.RESTORED_TABLES = ()
     ids = json.load(open(os.path.join(os.path.dirname(HERE), "maps", "tests.json")))
     ta.preload()
     find_exec_tables()
@@ -394,6 +474,7 @@ def main() -> None:
         info.update({"key_pairs": [], "whole_tables": []})
     else:
         info = wrap_attributes()
+        info["dispatch"] = follow_dispatch()
     # Setting the stand-ins up touched them (hasattr on a descriptor is a "bypass"): not a test's reads.
     ta.READS.clear()
     ta.BYPASS.clear()
