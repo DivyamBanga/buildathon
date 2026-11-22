@@ -228,6 +228,18 @@ the patched code**, and selects the ones that fail.
      readers of the attribute. A difference of order only has no names: only the
      whole readers see it. A table anything else also holds (a default, a
      closure, an instance), or that is handed to exec, stays at the level above.
+     Module-level tables (`EXPR_CLASSES`, `FUNCTION_BY_NAME`, the typing
+     tables) are recorded the same way, from the module's namespace. A
+     generator does not read its `TRANSFORMS` directly: the first time one is
+     made, `_build_dispatch` copies the table into a dispatch table, and the
+     generator looks an expression's class up in that copy. The recorder hands
+     the copy out as a recording dict for the same table and does not count
+     the copying (`tools/trace_keys.py` `follow_dispatch`, only while
+     `_build_dispatch` has the source that was read for this: one read,
+     `dict(cls.TRANSFORMS)`, and an entry of the table wins over the method of
+     the same class). A test is then a reader of the entries it looks up
+     there, found or not, and of the whole table if it does anything else
+     with the copy.
      The runner formats a subtest's message with `str()` and its parameters
      with `repr()` after each subtest, as pytest does when it reports one, so
      that the reads on that path are traced and a message that fails to format
