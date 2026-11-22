@@ -268,4 +268,54 @@ builtins.any = kept
 expect("a builtin replaced for everyone", changed, ["the builtins"])
 expect("and put back", state.outside_state(), before)
 
+# a filter or a handler on the package's logger or on the root: the tests that watch the log see other records
+import logging  # noqa: E402
+
+
+def drop(record):
+    return False
+
+
+for label, target, add, remove in (
+    ("a filter on the package's logger", logging.getLogger(state.PACKAGE), "addFilter", "removeFilter"),
+    ("a filter on the root logger", logging.root, "addFilter", "removeFilter"),
+):
+    getattr(target, add)(drop)
+    changed = [key for key, value in state.outside_state().items() if value != before[key]]
+    getattr(target, remove)(drop)
+    expect(label, changed, ["logging"])
+for label, target in (("a handler on the package's logger", logging.getLogger(state.PACKAGE)), ("a handler on the root logger", logging.root)):
+    handler = logging.NullHandler()
+    target.addHandler(handler)
+    changed = [key for key, value in state.outside_state().items() if value != before[key]]
+    target.removeHandler(handler)
+    expect(label, changed, ["logging"])
+expect("and all put back", state.outside_state(), before)
+
+# the arithmetic context, the warning filters by what they say, the working directory
+import decimal  # noqa: E402
+import warnings  # noqa: E402
+
+context = decimal.getcontext()
+context.prec, kept = context.prec - 1, context.prec
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+context.prec = kept
+expect("the precision of Decimal arithmetic", changed, ["the decimal context"])
+context.rounding, kept = decimal.ROUND_FLOOR if context.rounding != decimal.ROUND_FLOOR else decimal.ROUND_CEILING, context.rounding
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+context.rounding = kept
+expect("its rounding", changed, ["the decimal context"])
+saved = list(warnings.filters)
+warnings.filters[:] = [("error", None, UserWarning, None, 0)] + saved[1:] if saved else [("error", None, UserWarning, None, 0)]
+same_count = len(warnings.filters) == len(saved)
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+warnings.filters[:] = saved
+expect("a warning filter put in the place of another" if same_count else "a warning filter added", changed, ["warning filters"])
+here = os.getcwd()
+os.chdir(os.path.dirname(here) or here)
+changed = [key for key, value in state.outside_state().items() if value != before[key]]
+os.chdir(here)
+expect("the working directory", changed, ["the working directory"] if os.path.dirname(here) not in ("", here) else [])
+expect("and everything put back", state.outside_state(), before)
+
 print(f"{checks} checks passed")

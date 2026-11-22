@@ -96,7 +96,13 @@ the patched code**, and selects the ones that fail.
    tests that reads as a class (`Validator`). A name nothing binds, or a base
    defined further down, fails the whole file when it is imported; a class of
    sqlglot may register the subclass; two bases may have no consistent method
-   resolution order. Otherwise the file
+   resolution order. Inside a test, a helper or `setUp` a class statement is
+   not judged that way (the tests of the pinned commit define their own
+   dialects and expressions there), with one exception: an added class
+   statement anywhere under `tests/` whose name is that of a built-in dialect
+   (a member of the enum `Dialects`, in any case) selects every test, since
+   the metaclass of `Dialect` files a subclass under its name and the new one
+   would stand in for the built-in dialect in every later test. Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
    A new test file must in addition hold no import that is certain to fail,
    or it selects every test: a module of sqlglot or of the tests for which the
@@ -122,6 +128,27 @@ the patched code**, and selects the ones that fail.
    does not have) is not an edit: the rule above judges it, and its own
    `finally` or `tearDown` only undoes what it did itself. Of one that is
    removed as a whole, only the stores still count.
+
+   **A table of the package that a test leaves changed.** sqlglot itself changes
+   one class-level table while it runs and puts it back afterwards without a
+   `finally`: `Parser._parse_connect_with_prior` adds `"PRIOR"` to
+   `NO_PAREN_FUNCTION_PARSERS` for as long as a CONNECT BY condition is parsed.
+   When that parse raises, the entry stays for the rest of the process, in a
+   dict that every dialect parser without a table of its own shares, and every
+   later test of the whole suite parses with it (`PRIOR AS x` in
+   `tests/fixtures/identity.sql` no longer parses). No run of one test can show
+   that. So a child looks after every test whether the tables of a reviewed
+   list (`runner.RESTORED_TABLES`: the store-call-restore spots of the package,
+   one at the pinned commit) still hold what they held, tells the coordinator
+   once, and the commit selects every test.
+
+   **A binary patch to a file that is not code** (`GIT binary patch`, `Binary
+   files differ`) is not applied here, so a child could not be given the new
+   bytes. When neither path names code (`.py`, `.pyi`, `.pyc`, `.so`, `.pth`,
+   an archive, a pytest configuration file, `__pycache__`), the tests that open
+   the file (`opens.json`) and, if it appears, vanishes or moves, those that list
+   its directory or ask for its name are selected unchecked; with no such test
+   the commit selects nothing instead of every test.
 
    **A file that appears or vanishes** changes what its directory lists. Two
    kinds of test can notice (`dirs.json`, from a run of every test alone under

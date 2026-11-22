@@ -230,14 +230,48 @@ def load_world(root: str, names: list[str], first: int, others: tuple = ()) -> t
 _STDLIB_WITH_EFFECTS = frozenset(("this", "antigravity", "readline", "rlcompleter", "site", "sitecustomize", "usercustomize"))
 
 
+def _warning_filters() -> list:
+    """What every warning filter says, in order: a filter put in the place of another keeps the count."""
+    return [
+        (action, getattr(message, "pattern", message), getattr(category, "__name__", str(category)), getattr(module, "pattern", module), line)
+        for action, message, category, module, line in warnings.filters
+    ]
+
+
+def _decimal_context() -> tuple:
+    """The arithmetic context of this thread without its flags (they only say what has been computed so far)."""
+    import decimal
+
+    context = decimal.getcontext()
+    traps = sorted(signal.__name__ for signal, on in context.traps.items() if on)
+    return (context.prec, context.rounding, context.Emin, context.Emax, context.capitals, context.clamp, traps)
+
+
+def _locale() -> str:
+    import locale
+
+    try:
+        return locale.setlocale(locale.LC_ALL)
+    except Exception:
+        return "?"
+
+
 def outside_state() -> dict:
     """State an import can change that is not part of the package itself."""
     logger = logging.getLogger(PACKAGE)
     return {
         "recursion limit": sys.getrecursionlimit(),
         "environment": sorted(os.environ.items()),
-        "warning filters": len(warnings.filters),
-        "logging": (logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate),
+        "warning filters": _warning_filters(),
+        "the decimal context": _decimal_context(),
+        "the locale": _locale(),
+        "the working directory": os.getcwd(),
+        # Also how many filters and handlers the package's logger and the root have: a filter
+        # or a handler added at import decides which records the tests that watch the log get.
+        "logging": (
+            logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate,
+            len(logger.filters), len(logger.handlers), len(logging.root.filters), len(logging.root.handlers),
+        ),
         "switch interval": sys.getswitchinterval(),
         # Every module finds the names it leaves to the builtins here.
         "the builtins": sorted((name, id(value)) for name, value in vars(builtins).items()),

@@ -1,0 +1,20 @@
+diff --git a/tests/dialects/test_custom_dialect3.py b/tests/dialects/test_custom_dialect3.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/dialects/test_custom_dialect3.py
+@@ -0,0 +1,14 @@
++import unittest
++
++from sqlglot import Dialect
++
++
++class TestCustomDialect(unittest.TestCase):
++    def setUp(self):
++        class Snowflake(Dialect):
++            NORMALIZE_FUNCTIONS = False
++
++        self.dialect = Snowflake()
++
++    def test_custom_dialect(self):
++        self.assertTrue(self.dialect)

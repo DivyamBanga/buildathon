@@ -1,0 +1,13 @@
+diff --git a/sqlglot/parser.py b/sqlglot/parser.py
+index 1111111..2222222 100644
+--- a/sqlglot/parser.py
++++ b/sqlglot/parser.py
+@@ -5878,7 +5878,7 @@
+ 
+     def _parse_connect_with_prior(self) -> exp.Expr | None:
+         self.NO_PAREN_FUNCTION_PARSERS["PRIOR"] = lambda self: self.expression(
+-            exp.Prior(this=self._parse_bitwise())
++            exp.Prior(this=self._parse_bitwis())
+         )
+         connect = self._parse_disjunction()
+         self.NO_PAREN_FUNCTION_PARSERS.pop("PRIOR")

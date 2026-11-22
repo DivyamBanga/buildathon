@@ -1477,6 +1477,53 @@ def _patch_test_modules() -> None:
             setattr(module, attribute, _Members(current, name))
 
 
+# ---- class tables that running code changes and puts back ----------------------------------
+#
+# The package changes one class-level table while it runs and puts it back afterwards, with no
+# `finally`: Parser._parse_connect_with_prior adds "PRIOR" to NO_PAREN_FUNCTION_PARSERS for as
+# long as a CONNECT BY condition is parsed. When that parse raises, the entry stays for the
+# rest of the process (in the base Parser's dict, which every dialect parser without a table of
+# its own shares), and in the whole suite every later test parses with it: `PRIOR AS x` of
+# tests/fixtures/identity.sql no longer parses. A test run on its own cannot show that, so a
+# child looks after every test whether such a table still is what it was, and says so once.
+# The reviewed list of these tables: (module, class, attribute, the function that puts an
+# entry in and is meant to take it out again).
+RESTORED_TABLES = (("sqlglot.parser", "Parser", "NO_PAREN_FUNCTION_PARSERS", "_parse_connect_with_prior"),)
+_TABLES_SEEN: dict = {}  # id(table) -> (the table, how many entries it had when first seen here, who holds it)
+_TABLES_AT = [-1]  # len(sys.modules) when the classes were last walked
+
+
+def tables_left_changed() -> list:
+    """The reviewed class tables, of the class itself or of a loaded subclass, that do not
+    hold what they held when this process first looked (call it once before the first test).
+
+    Cheap enough for every test: the classes are walked again only when a module was
+    imported since; otherwise it is one `len` per table.
+    """
+    if len(sys.modules) != _TABLES_AT[0]:
+        _TABLES_AT[0] = len(sys.modules)
+        for module_name, class_name, attribute, inserter in RESTORED_TABLES:
+            module = sys.modules.get(module_name)
+            base = getattr(module, class_name, None)
+            if not isinstance(base, type):
+                continue
+            pending, walked = [base], set()
+            while pending:
+                cls = pending.pop()
+                if cls in walked:
+                    continue
+                walked.add(cls)
+                pending.extend(type.__subclasses__(cls))
+                table = getattr(cls, attribute, None)
+                if type(table) is not dict or id(table) in _TABLES_SEEN:
+                    continue
+                # A table first seen after tests have run (its dialect was loaded by one of
+                # them) may hold a leftover already: an entry made by the inserting function.
+                left = sum(1 for value in table.values() if inserter in getattr(value, "__qualname__", ""))
+                _TABLES_SEEN[id(table)] = (table, len(table) - left, f"{cls.__module__}.{cls.__qualname__}.{attribute}")
+    return [name for table, size, name in _TABLES_SEEN.values() if len(table) != size]
+
+
 class _Result(unittest.TestResult):
     def __init__(self, emit) -> None:
         super().__init__()
@@ -1507,6 +1554,8 @@ class _Result(unittest.TestResult):
 
     def stopTest(self, test) -> None:
         super().stopTest(test)
+        # Before the result: a failing result may be the last line the coordinator reads.
+        _tell_tables(self._emit)
         self._emit(f"R {test._br_index} {1 if self._failed else 0}\n")
 
     def _bad(self, test) -> None:
@@ -1553,7 +1602,27 @@ class _Result(unittest.TestResult):
         pass
 
 
+_TABLES_TOLD: list = []
+
+
+def _tell_tables(emit) -> None:
+    """One line `T <table>` for the coordinator, once, when a reviewed table is not what it was."""
+    if _TABLES_TOLD:
+        return
+    try:
+        left = tables_left_changed()
+    except Exception:
+        left = ["a table that could not be looked at"]
+    if left:
+        _TABLES_TOLD.append(left[0])
+        emit(f"T {left[0]}\n")
+
+
 def run_tests(tests: list[tuple[int, str]], emit) -> None:
+    try:
+        tables_left_changed()  # what the reviewed tables hold before any test has run here
+    except Exception:
+        pass
     groups: list[tuple[str, str, list[tuple[int, str]]]] = []
     for index, test_id in tests:
         path, class_name, method = test_id.split("::")
@@ -1587,6 +1656,7 @@ def run_tests(tests: list[tuple[int, str]], emit) -> None:
         _patch_test_modules()
         result = _Result(emit)
         unittest.TestSuite(cases).run(result)
+        _tell_tables(emit)  # what the class setup or teardown left, when no test of it said so
         started = set(result.started)
         never = [case._br_index for case in cases if case._br_index not in started]
         for index in never:
