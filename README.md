@@ -24,6 +24,14 @@ the patched code**, and selects the ones that fail.
    to see the change. A function that binds other names afterwards (its local,
    cell or free names differ as sets) counts as changed in full, and so does any
    line whose instructions differ although its text does not.
+   When definitions were added, removed, moved or renamed, the code objects of
+   each scope are paired by name inside that scope (the k-th definition of a
+   name with the k-th, only while a name is defined as often as before; lambdas
+   first with an identical one anywhere in the scope) instead of by position,
+   so a def inserted above a function does not make that function count as
+   changed. A function that left its scope or changed its name is a removal and
+   an addition, and the file is then never swapped in memory, only imported
+   afresh.
 
 3. **Name the candidate tests** (`selector/analyze.py`, `selector/covmap.py`).
    `maps/` records, for every test run alone at the pinned commit, each line it

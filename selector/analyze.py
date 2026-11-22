@@ -288,7 +288,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 if span is not None:
                     new_first = patch.new_line(first)
                     new_last = patch.new_line(span[1])
-                    if new_first is not None and new_last is not None and new_last >= new_first:
+                    if (
+                        new_first is not None
+                        and new_last is not None
+                        and new_last >= new_first
+                        and new.co_firstlineno == new_first
+                    ):
                         if pydiff.last_line(new) > new_last or pydiff.last_line(old) > span[1]:
                             # The function goes on past what was its last line: statements
                             # were added at its end (or the recorded span ends early). They
