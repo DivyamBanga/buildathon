@@ -4,9 +4,11 @@
 
 Needs pytest (it runs pytest's own loaders in a separate interpreter), so run it
 in the lab image. The first part uses a small root written here; the second
-applies the seed patches in tools/cfg_seeds/ to the pinned tree when it is found.
+applies the seed patches in tools/cfg_seeds/ to the pinned tree when it is found
+and holds each answer against what real pytest did with the patch (verdicts.json).
 """
 import difflib
+import json
 import os
 import sys
 import tempfile
@@ -150,8 +152,20 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "/sqlglot"
 if not os.path.isdir(os.path.join(ROOT, "sqlglot")):
     print(f"{checks} checks passed; the seed patches were not analysed (no pinned tree at {ROOT})")
     raise SystemExit(0)
-for name in sorted(os.listdir(os.path.join(HERE, "cfg_seeds"))):
-    with open(os.path.join(HERE, "cfg_seeds", name), encoding="utf-8", newline="") as handle:
+# tools/cfg_seeds/verdicts.json says, for every seed, what real pytest did with it (the labeling command on
+# the patched pinned tree, in the lab image) and what the selector must answer: "all" (every test) or
+# "none" (pytest ran the whole suite and no test failed: nothing is selected).
+SEEDS = os.path.join(HERE, "cfg_seeds")
+with open(os.path.join(SEEDS, "verdicts.json"), encoding="utf-8") as handle:
+    verdicts = json.load(handle)
+seeds = sorted(name for name in os.listdir(SEEDS) if name.endswith(".patch"))
+expect("one verdict for every seed, one seed for every verdict", sorted(verdicts), seeds)
+for name in seeds:
+    with open(os.path.join(SEEDS, name), encoding="utf-8", newline="") as handle:
         plan = analyze.analyze(name, handle.read(), covmap, ROOT, frozenset())
-    expect("seed " + name, plan.select_all, True)
+    if plan.select_all:
+        got = "all"
+    else:
+        got = "some" if plan.candidates or plan.unverified or plan.import_check else "none"
+    expect("seed " + name, got, verdicts[name]["select"])
 print(f"{checks} checks passed")
