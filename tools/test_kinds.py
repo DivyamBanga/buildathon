@@ -543,6 +543,12 @@ for name in ("C_setup_module", "C_setup_method"):
     expect("seed " + name + ": the tests of the file, unchecked", seed(name).unverified & TIME_TESTS, TIME_TESTS)
 for hook in ("def teardown_class(cls):", "def teardown_function(f):", "def setup_class(cls):", "def teardown_method(self):", "def setUpModule():"):
     expect("C: " + hook, plan_for(comment_patch("tests/test_time.py", hook)).unverified & TIME_TESTS, TIME_TESTS)
+# pytest_plugins in a test module or in a test package: its hooks reach the tests of every file
+for name in ("C_pytest_plugins_self", "C_pytest_plugins_package"):
+    expect("seed " + name + ": every test", seed(name).select_all, True)
+expect("C: pytest_plugins names a helper", plan_for(comment_patch("tests/test_time.py", "pytest_plugins = ['tests.helpers']")).select_all, True)
+plan = plan_for(comment_patch("sqlglot/helper.py", "# pytest_plugins"))
+expect("C: pytest_plugins outside tests/", (plan.candidates, plan.select_all), (0, False))
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith("E_"):
         plan = seed(name[:-6])
