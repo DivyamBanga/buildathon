@@ -129,6 +129,19 @@ the patched code**, and selects the ones that fail.
    `finally` or `tearDown` only undoes what it did itself. Of one that is
    removed as a whole, only the stores still count.
 
+   **A table of the package that a test leaves changed.** sqlglot itself changes
+   one class-level table while it runs and puts it back afterwards without a
+   `finally`: `Parser._parse_connect_with_prior` adds `"PRIOR"` to
+   `NO_PAREN_FUNCTION_PARSERS` for as long as a CONNECT BY condition is parsed.
+   When that parse raises, the entry stays for the rest of the process, in a
+   dict that every dialect parser without a table of its own shares, and every
+   later test of the whole suite parses with it (`PRIOR AS x` in
+   `tests/fixtures/identity.sql` no longer parses). No run of one test can show
+   that. So a child looks after every test whether the tables of a reviewed
+   list (`runner.RESTORED_TABLES`: the store-call-restore spots of the package,
+   one at the pinned commit) still hold what they held, tells the coordinator
+   once, and the commit selects every test.
+
    **A binary patch to a file that is not code** (`GIT binary patch`, `Binary
    files differ`) is not applied here, so a child could not be given the new
    bytes. When neither path names code (`.py`, `.pyi`, `.pyc`, `.so`, `.pth`,

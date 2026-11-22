@@ -554,6 +554,10 @@ class Coordinator:
         return True
 
     def finish(self, plan: Plan, bits: set[int]) -> None:
+        if plan.select_all:
+            # Found out while its tests ran (a test left a table of the package changed).
+            self.decisions[plan.commit] = list(self.numbers)
+            return
         bits = set(bits).union(self.covmap.bits(plan.unverified))
         numbers = sorted(self.bit_number[bit] for bit in bits if self.bit_number[bit] >= 0)
         if plan.candidates:
@@ -1407,6 +1411,19 @@ class Coordinator:
                     run.state = json.loads(line[2:])
                 except ValueError:
                     run.state = None
+            elif kind == b"T":
+                # A test left a class table of the package other than it found it (the
+                # runner's reviewed list): in the whole suite every test that runs after
+                # it sees that, which no run of one test can show. Every test is selected.
+                job = run.job
+                what = line[2:].decode("utf-8", "replace")
+                if not job.plan.select_all:
+                    job.plan.select_all = True
+                    job.plan.note(f"a test left {what} changed for the tests after it")
+                    log(f"{job.plan.commit}: a test left {what} changed: every test is selected")
+                job.pending = []
+                run.stopped = True
+                return
             elif kind == b"X":
                 run.fatal = line[2:].decode("utf-8", "replace")
             elif kind == b"D":

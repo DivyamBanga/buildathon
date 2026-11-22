@@ -563,6 +563,14 @@ expect("seed M: not 'only new tests'", any("only new tests" in note for note in 
 expect("seed M: the tests of the file run", plan.candidates & covmap.tests_of_file("tests/test_helper.py"), covmap.tests_of_file("tests/test_helper.py"))
 expect("seed M: and nothing is selected unchecked", (plan.select_all, plan.unverified), (False, 0))
 
+# seed S_prior_left_in_table: one token inside the lambda that Parser._parse_connect_with_prior puts into the class
+# table. To the plan it is an ordinary function edit: the three tests that run the lambda. That the entry then stays
+# in the table, and fails a fourth test later in the suite, is for the child to see (runner.RESTORED_TABLES, line
+# kind T, tools/test_leftover.py).
+plan = seed("S_prior_left_in_table")
+expect("seed S: an ordinary function edit", (plan.select_all, plan.candidates.bit_count()), (False, 3))
+expect("seed S: the test that fails later in the suite is no candidate", selected(plan, "tests/test_serde.py::TestSerde::test_serde"), False)
+
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith("B_"):
