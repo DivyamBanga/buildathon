@@ -485,6 +485,26 @@ the patched code**, and selects the ones that fail.
        attributes it reads when planned and executed alone in a fresh
        process). A query that touches nothing changed keeps its recorded
        result; the others are executed.
+     - *Before the optimizer*: most of what a reused result still costs is
+       the optimizer, which runs only to produce the tree the record is
+       looked up by. So the lookup is tried one step earlier, by the tree
+       `execute` hands to `optimize` (`runner.front_key`: the same digests,
+       with all three slots in the key, plus the schema by content, for a
+       call of exactly the shape `execute` makes and a tree without a stale
+       cached hash). `execfrontq.bin` holds, per such key, the digest of the
+       tree the pinned optimizer made of it and the lines the optimizer ran
+       for it, up to the start of the planner (`execfront.json`; the debug
+       line's `sql(pretty=True)` is inside that window, and so is whatever is
+       first built or imported there in a fresh process). When the patch
+       changes none of those lines, the pinned optimizer would build the
+       recorded tree again, so the record of that tree is used at once, under
+       the same conditions as above (tables, lines and reads of planning and
+       execution), and the optimizer is not run. Only lines are recorded for
+       that window, so this is used after a hot swap, and after a clean
+       import only when every difference the comparison finds is a function
+       with other code (the patch's own functions through their changed
+       lines, any other through all its lines); any other difference leaves
+       the lookup where it was, after the optimizer.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
      shared by the children. The rows themselves are parsed when the image is
@@ -544,6 +564,7 @@ tools in `tools/` (they run in the labeling image, `tools/lab.Dockerfile`):
 | `ducksetup.json` | `build_duckdb_setup.py` | the statements each class setup sends to its DuckDB connection |
 | `areaders.bin` | `trace_attrs.py`, `build_areaders.py` | `module:Class\|attribute` → tests that read that class attribute while the test itself runs |
 | `execmemo.bin`, `execphase.json`, `execattrs.json`, `execqueries.bin` | `build_executor_memo.py` | (tables, optimized TPC query) → executor result; the lines that produce it; the class attributes they read; the same two per query |
+| `execfront.json`, `execfrontq.bin` | `build_executor_memo.py` | the lines the optimizer runs inside `execute` (up to the planner); per tree handed to it (with the schema): the digest of the tree it makes and which of those lines it ran |
 | `execnames.json` | `build_execnames.py` | constant names written in the functions those lines belong to |
 | `importrun.json` | `build_importrun.py` | code objects that run while the whole package is imported |
 | `dirs.json` | `trace_all.py`, `build_dirs.py` | directory → tests that listed it (the `D` rows of the traces) |
