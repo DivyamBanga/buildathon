@@ -226,6 +226,10 @@ def load_world(root: str, names: list[str], first: int, others: tuple = ()) -> t
     return modules, failed, heard
 
 
+# Modules of the standard library whose import does something (prints, opens a browser, hooks the terminal, runs site code).
+_STDLIB_WITH_EFFECTS = frozenset(("this", "antigravity", "readline", "rlcompleter", "site", "sitecustomize", "usercustomize"))
+
+
 def outside_state() -> dict:
     """State an import can change that is not part of the package itself."""
     logger = logging.getLogger(PACKAGE)
@@ -428,6 +432,7 @@ class Comparer:
         self.active: dict = {}
         self.low = 1 << 60
         self.keep: list = []
+        self.bound: dict = {}
         self.differences: list = []
         self.changed_functions: dict = {}
         self.stable = STABLE_ORDER
@@ -437,7 +442,9 @@ class Comparer:
 
     # ---- reporting -------------------------------------------------------
 
-    def report(self, owner: tuple, attribute: str, reason: str, function=None, entries=None) -> None:
+    def report(
+        self, owner: tuple, attribute: str, reason: str, function=None, entries=None, shape: str = ""
+    ) -> None:
         kind, module, qualname = owner
         path = ""
         first = 0
@@ -449,7 +456,12 @@ class Comparer:
                 path = code.co_filename[len(self.old_root):]
                 first = code.co_firstlineno
         # `entries`: for a table that differs entry by entry, the names of those entries (see changed_entries).
-        self.differences.append([kind, module, qualname, attribute, reason, owner_path, path, first, entries])
+        # `shape` (an added or removed name only, in the same place): "R" when the value is a class defined
+        # here that could register itself or be found by walking a namespace, or a module
+        # no other namespace binds; "F" when the owner is a class with a base from outside
+        # the package. "" for anything else. CovMap.unobservable reads it.
+        last = shape if reason in ("added", "removed") else entries
+        self.differences.append([kind, module, qualname, attribute, reason, owner_path, path, first, last])
         if self.explain:
             self.differences[-1].append(self.why)
             self.why = ""
@@ -814,12 +826,59 @@ class Comparer:
             return ("value", None)
         return None if self.same(a, b) else ("value", None)
 
-    def _namespace(self, owner: tuple, a: dict, b: dict, module_name: str, prefix: str, noise) -> None:
+    def _bound_modules(self, world: dict) -> set:
+        """ids of the modules some namespace of the package binds to a name."""
+        found = self.bound.get(id(world))
+        if found is None:
+            found = self.bound[id(world)] = {
+                id(value)
+                for module in world.values()
+                for value in list(vars(module).values())
+                if isinstance(value, types.ModuleType)
+            }
+        return found
+
+    def _risky(self, value, module_name: str, other: dict) -> bool:
+        """True for a value whose appearance or disappearance has effects besides its name."""
+        if isinstance(value, type):
+            if value.__module__ != module_name:
+                # A class made elsewhere, only bound to a name here; except a dialect bound in a dialect
+                # module, where Dialect._try_load looks through dir(module) for the dialect's class.
+                return module_name.startswith(module_name.split(".", 1)[0] + ".dialects.") and any(
+                    base.__name__ == "Dialect" for base in value.__mro__
+                )
+            if type(value) is not type:
+                return True  # a metaclass (the dialect registry, enum, abc) acts on creation
+            package = module_name.split(".", 1)[0]
+            return any(base.__module__.split(".", 1)[0] == package for base in value.__mro__[1:])
+        if isinstance(value, types.ModuleType):
+            top = value.__name__.split(".", 1)[0]
+            if top in sys.stdlib_module_names and top not in _STDLIB_WITH_EFFECTS:
+                # Importing it changes nothing a test can see but what outside_state() checks.
+                return False
+            return id(value) not in self._bound_modules(other)
+        return False
+
+    @staticmethod
+    def _foreign(cls: type) -> bool:
+        """True for a class with a base (or a metaclass) from outside the package, other than object or Generic."""
+        package = cls.__module__.split(".", 1)[0]
+        for base in cls.__mro__[1:]:
+            if base is not object and base is not typing.Generic and base.__module__.split(".", 1)[0] != package:
+                return True
+        meta = type(cls)
+        return meta is not type and meta.__module__.split(".", 1)[0] != package
+
+    def _namespace(
+        self, owner: tuple, a: dict, b: dict, module_name: str, prefix: str, noise, foreign: bool = False
+    ) -> None:
         for key in list(a) + [key for key in b if key not in a]:
             if key in noise:
                 continue
             if key not in a or key not in b:
-                self.report(owner, key, "added" if key in b else "removed")
+                added = key in b
+                shape = "R" if self._risky(b[key] if added else a[key], module_name, self.old if added else self.new) else ""
+                self.report(owner, key, "added" if added else "removed", shape=shape + ("F" if foreign else ""))
                 continue
             value_a, value_b = a[key], b[key]
             if value_a is value_b:
@@ -852,7 +911,10 @@ class Comparer:
         noise = _CLASS_NOISE
         if typing.is_typeddict(a) and typing.is_typeddict(b):
             noise = noise | _TYPED_DICT_NOISE
-        self._namespace(owner, dict(vars(a)), dict(vars(b)), module_name, a.__qualname__ + ".", noise)
+        self._namespace(
+            owner, dict(vars(a)), dict(vars(b)), module_name, a.__qualname__ + ".", noise,
+            self._foreign(a) or self._foreign(b),
+        )
 
     def run(self) -> list:
         for name in list(self.old) + [name for name in self.new if name not in self.old]:

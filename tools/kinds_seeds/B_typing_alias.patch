@@ -1,0 +1,12 @@
+diff --git a/sqlglot/typing/duckdb.py b/sqlglot/typing/duckdb.py
+index 46fb61b..ec5d455 100644
+--- a/sqlglot/typing/duckdb.py
++++ b/sqlglot/typing/duckdb.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import typing as t
+ 
+ from sqlglot import exp
++from sqlglot.typing.postgres import EXPRESSION_METADATA as _zz
+ from sqlglot.typing import EXPRESSION_METADATA, annotate_int_as_double
+ 
+ if t.TYPE_CHECKING:

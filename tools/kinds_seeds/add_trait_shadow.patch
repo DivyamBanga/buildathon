@@ -1,0 +1,14 @@
+diff --git a/sqlglot/expressions/core.py b/sqlglot/expressions/core.py
+index 2fc96ad..99f06a1 100644
+--- a/sqlglot/expressions/core.py
++++ b/sqlglot/expressions/core.py
+@@ -1588,6 +1588,9 @@ class Condition(Expr):
+ class Predicate(Condition):
+     """Any condition that evaluates to a boolean, e.g. x = y, x LIKE 'a%', a @> b."""
+ 
++    is_var_len_args = True
++    var_len_arg_key = "expression"
++
+ 
+ class Cache(Expression):
+     arg_types = {
