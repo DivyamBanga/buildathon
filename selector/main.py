@@ -1105,6 +1105,14 @@ class Coordinator:
             bit in self.memo_cost and self.bit_cost[bit] - self.memo_cost[bit] > 4.0 * PROBE_COST
             for bit in job.candidates
         )
+        if plan.narrowed:
+            # Tests were left out as unable to see the change to a class or
+            # module body. That is only true if the module still imports, and
+            # importing it is what the comparison does first. It is asked for
+            # also when the narrowing left no candidate at all: a child would
+            # then import the test files of the tests left out, which does not
+            # import a module they load on demand.
+            return True
         if not plan.import_candidates:
             # Nothing to narrow down. A commit can go the clean way all the same:
             # the changed body of a function that already ran while the tests were
@@ -1114,11 +1122,6 @@ class Coordinator:
             # costs: not when the changed lines themselves are run by (nearly)
             # every recorded query, nor when few fixture cases reach them anyway.
             return for_results and self.results_saving(job) > 2.0 * PROBE_COST
-        if plan.narrowed:
-            # Tests were left out as unable to see the change to a class or
-            # module body. That is only true if the module still imports, and
-            # importing it is what the comparison does first.
-            return True
         if for_results:
             return True
         bits = job.candidates
