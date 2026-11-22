@@ -642,10 +642,7 @@ if covmap._dirs["names"] is not None:  # with the names of the import attempts; 
 # ---- the names half of dirs.json: only the tests that ask for a name or list a directory notice a new file ----
 
 def empty_deleted_patch(path):
-    return f"diff --git a/{path} b/{path}
-deleted file mode 100644
-index e69de29..0000000
-"
+    return f"diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex e69de29..0000000\n"
 
 
 def config_patch(path, text):
@@ -653,30 +650,23 @@ def config_patch(path, text):
 
 
 if covmap._dirs["names"] is not None:
-    plan = plan_for(new_file_patch("sqlglot/zz_unasked.py", "raise RuntimeError
-"))
+    plan = plan_for(new_file_patch("sqlglot/zz_unasked.py", "raise RuntimeError\n"))
     expect("N: a new module that nobody asks for", (plan.candidates, plan.select_all), (0, False))
     for where in ("sqlglot/dialects", "sqlglot/optimizer", "tests", "tests/dialects", ""):
-        plan = plan_for(new_file_patch((where + "/" if where else "") + "zz_unasked.py", "raise RuntimeError
-"))
+        plan = plan_for(new_file_patch((where + "/" if where else "") + "zz_unasked.py", "raise RuntimeError\n"))
         expect("N: a new module that nobody asks for, in '" + where + "'", (plan.candidates, plan.select_all), (0, False))
-    plan = plan_for(new_file_patch("sqlglot/dialects/myqsl.py", "raise RuntimeError
-"))
+    plan = plan_for(new_file_patch("sqlglot/dialects/myqsl.py", "raise RuntimeError\n"))
     expect("N: a dialect name given as a string by one test", (0 < plan.candidates.bit_count() < 10, plan.select_all), (True, False))
-    plan = plan_for(new_file_patch("sqlglot/_version.py", "raise RuntimeError
-"))
+    plan = plan_for(new_file_patch("sqlglot/_version.py", "raise RuntimeError\n"))
     expect("N: a name every importer of sqlglot asks for", plan.candidates.bit_count() >= 1600, True)
-    plan = plan_for(new_file_patch("json.py", "raise RuntimeError
-"))
+    plan = plan_for(new_file_patch("json.py", "raise RuntimeError\n"))
     expect("N: a module that shadows the standard one every test loads", plan.candidates, everything)
     plan = plan_for(empty_deleted_patch("tests/dialects/__init__.py"))
     dialect_test = next(number for number, name in enumerate(covmap.ids) if name.startswith("tests/dialects/"))
     expect("N: the package tests.dialects loses its __init__.py", bool(plan.candidates >> dialect_test & 1), True)
     expect("N: and it is not every test", plan.candidates != everything, True)
     for path in ("pytest.toml", ".pytest.toml", "tests/pytest.toml", "tests/dialects/pytest.ini", "tests/pyproject.toml", "tests/setup.cfg"):
-        plan = plan_for(new_file_patch(path, "[pytest]
-addopts = -x
-"))
+        plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
         expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)
 
 print(f"{checks} checks passed")
