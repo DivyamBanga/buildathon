@@ -748,9 +748,9 @@ for path in ("sqlglot/zz.so", "sqlglot/zz.pyc", "x.pth", "sqlglot/__pycache__/a.
 for name in ("K_dialect_name_in_test", "K_dialect_name_in_setup", "K_dialect_name_in_helper"):
     expect("seed " + name + ": every test", seed(name).select_all, True)
 DIALECT_TEST = "import unittest\nfrom sqlglot import Dialect\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        class {}(Dialect):\n            pass\n\n        self.assertTrue(True)\n"
-for class_name, everything in (("MySQL", True), ("Mysql", True), ("DUCKDB", True), ("Dialect", True), ("Spark2", True), ("MyDialect", False), ("Custom", False), ("TestMySQL", False), ("MySQLish", False)):
+for class_name, selects_all in (("MySQL", True), ("Mysql", True), ("DUCKDB", True), ("Dialect", True), ("Spark2", True), ("MyDialect", False), ("Custom", False), ("TestMySQL", False), ("MySQLish", False)):
     plan = plan_for(new_file_patch("tests/dialects/test_zz_custom.py", DIALECT_TEST.format(class_name)))
-    expect("K: a new test defines class " + class_name, plan.select_all, everything)
+    expect("K: a new test defines class " + class_name, plan.select_all, selects_all)
 plan = plan_for(comment_patch("tests/test_time.py", "class Snowflake: pass"))
 expect("K: the name alone decides, also in an edited file", plan.select_all, True)
 plan = plan_for(comment_patch("sqlglot/helper.py", "class Snowflake: pass"))
