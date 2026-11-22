@@ -648,6 +648,9 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
 
 
 _NEW_CLASS = re.compile(r"[+][ \t]*class[ \t]+([A-Za-z_][A-Za-z_0-9]*)")
+# The same class made by a call: type("MySQL", (Dialect,), {}), types.new_class("MySQL", ...).
+_MADE_CLASS = re.compile(r"""(?:\btype|\bnew_class|_Dialect)\(\s*["']([A-Za-z_][A-Za-z_0-9]*)["']""")
+_GENERATOR_PARTS = "SUPPORTED_JSON_PATH_PARTS"
 _registry_names_of: dict = {}
 
 
@@ -691,13 +694,28 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root
     else:
         rows = [row for hunk in patch.hunks for row in hunk[4]]
     for row in rows:
+        if row[:1] == "+" and _GENERATOR_PARTS in row:
+            # When a dialect class is created, its metaclass takes the JSON path parts that
+            # the dialect's generator class does not support out of that class's TRANSFORMS
+            # (Dialect.__new__: `gen_cls.TRANSFORMS.pop(part, None)`). A generator class
+            # written on the spot has no TRANSFORMS of its own, so the entries go from the
+            # table of the built-in generator it inherits from, and stay gone for every
+            # test that runs later in the suite.
+            plan.select_all = True
+            plan.note(f"{path}: new code names {_GENERATOR_PARTS}, which the dialect metaclass applies to an inherited table")
+            return
         found = _NEW_CLASS.match(row)
-        if found and found.group(1).upper() in registry:
+        names = [found.group(1)] if found else []
+        if row[:1] == "+":
+            names += _MADE_CLASS.findall(row)
+        for name in names:
+            if name.upper() not in registry:
+                continue
             # A subclass of Dialect is filed under its own name when the class statement
             # runs, wherever that is (a test body, setUp, a helper): one named like a
             # built-in dialect takes that dialect's place for every test that runs later.
             plan.select_all = True
-            plan.note(f"{path}: a new class named {found.group(1)}, the name of a built-in dialect in the registry")
+            plan.note(f"{path}: a new class named {name}, the name of a built-in dialect in the registry")
             return
     if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
         # A new or changed statement that stores into a class, a module or a

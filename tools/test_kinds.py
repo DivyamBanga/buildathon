@@ -174,6 +174,11 @@ for label, body in (
     ("self rebound to a class", "import sqlglot\nself = sqlglot.Parser\nself.FUNCTIONS = {}"),
     ("nested def taking self", "import sqlglot\ndef f(self):\n    self.F = {}\nf(sqlglot.Parser)"),
     ("dict of a class", "import sqlglot\nsqlglot.Parser.__dict__"),
+    ("the decimal context replaced", "import decimal\ndecimal.setcontext(decimal.Context(prec=3))"),
+    ("the locale set", "import locale\nlocale.setlocale(locale.LC_ALL, 'C')"),
+    ("a resource limit", "import resource\nresource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))"),
+    ("logging configured", "import logging\nlogging.basicConfig(level=logging.DEBUG)"),
+    ("the limit on digits of an int", "import sys\nsys.set_int_max_str_digits(700)"),
 ):
     text = METHOD.format("\n".join("        " + row for row in body.split("\n")))
     expect("E: " + label, added(text), False)
@@ -570,6 +575,18 @@ expect("seed M: and nothing is selected unchecked", (plan.select_all, plan.unver
 plan = seed("S_prior_left_in_table")
 expect("seed S: an ordinary function edit", (plan.select_all, plan.candidates.bit_count()), (False, 3))
 expect("seed S: the test that fails later in the suite is no candidate", selected(plan, "tests/test_serde.py::TestSerde::test_serde"), False)
+
+# What the metaclass of the dialects does to shared tables when test code creates a dialect class.
+# The seeds K_generator_parts_* (a new test, an edited test, a new test file) give a generator class written in
+# the test its own SUPPORTED_JSON_PATH_PARTS: the metaclass then pops the other parts from the TRANSFORMS that
+# class inherits, i.e. from the built-in generator's table (checked above with the other K_ seeds: every test).
+# K_dialect_name_by_type makes the class named like a built-in dialect with type(...) instead of a class statement.
+# A class made by type() under a name of its own stays an ordinary new test:
+plan = seed("N_type_call_other")
+expect("seed N_type_call_other: an ordinary new test", (plan.select_all, plan.candidates), (False, 0))
+# and the name of the table alone, in a comment of the package, selects nothing by this rule
+plan = plan_for(comment_patch("sqlglot/helper.py", "# SUPPORTED_JSON_PATH_PARTS"))
+expect("the generator-parts rule is for test files", (plan.candidates, plan.select_all), (0, False))
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):

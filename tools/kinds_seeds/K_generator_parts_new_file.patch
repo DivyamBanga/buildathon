@@ -1,0 +1,19 @@
+diff --git a/tests/dialects/test_my_duck.py b/tests/dialects/test_my_duck.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/dialects/test_my_duck.py
+@@ -0,0 +1,13 @@
++import unittest
++
++from sqlglot import exp, parse_one
++from sqlglot.dialects import DuckDB
++
++
++class TestMyDuck(unittest.TestCase):
++    def test_generate(self):
++        class MyDuck(DuckDB):
++            class Generator(DuckDB.Generator):
++                SUPPORTED_JSON_PATH_PARTS = {exp.JSONPathKey, exp.JSONPathRoot}
++
++        self.assertEqual(parse_one("SELECT 1").sql(dialect=MyDuck), "SELECT 1")

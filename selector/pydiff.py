@@ -669,6 +669,9 @@ _MUTATORS = frozenset((
     "unsetenv", "chdir", "chroot", "filterwarnings", "simplefilter", "setrecursionlimit", "settrace", "setprofile",
     "disable", "_exit", "exit", "signal", "set", "setLevel", "addHandler", "addFilter", "monkeypatch",
     "__init_subclass__", "setUpClass", "tearDownClass", "addCleanup", "enterContext",
+    # process-wide settings that no test of the pinned suite calls (so the names cost nothing there)
+    "setlocale", "setcontext", "setrlimit", "alarm", "setitimer", "set_start_method", "set_int_max_str_digits",
+    "umask", "tzset", "basicConfig", "captureWarnings",
 ))
 _ESCAPES = frozenset(("__dict__", "__class__", "__globals__", "__builtins__", "__code__", "__bases__", "__mro__", "__subclasses__"))
 
