@@ -342,7 +342,11 @@ the patched code**, and selects the ones that fail.
        result; the others are executed.
    - The executor tests' class setup parses every TPC table from CSV. For a
      patch that touches nothing that setup runs, the tables are built once and
-     shared by the children. A child that imports the patched tree afresh
+     shared by the children. The rows themselves are parsed when the image is
+     built, by that same setup (`selector/prebuild.py`, a `RUN` step of the
+     Dockerfile), and kept with a digest of what they were parsed from (the
+     setup's code, the two schemas, the bytes of every fixture file); a batch
+     takes them from there while the digest matches and parses otherwise. A child that imports the patched tree afresh
      cannot take the tables (their class may have changed), but for a patch
      that touches no file outside `sqlglot/` the rows are what they were:
      the files and the test code that parses them are untouched. Such a child

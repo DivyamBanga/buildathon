@@ -12,6 +12,11 @@ RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.
 
 COPY selector /app/selector
 COPY maps /app/maps
+# The rows the executor tests' class setup parses from the TPC fixtures, kept once
+# here so that a batch does not parse them again (selector/prebuild.py).
+# If this step fails the image is still complete: a batch then parses them itself.
+RUN PYTHONPATH=/app SKIP_INTEGRATION=0 python -m selector.prebuild /app/maps/exectables.bin \
+    || (rm -f /app/maps/exectables.bin; echo "rows not kept: a batch will parse them")
 # The run has a read-only disk and runs as `nobody`: compile now, readable by all.
 RUN python -m compileall -q /sqlglot /app && chmod -R a+rX /sqlglot /app
 
