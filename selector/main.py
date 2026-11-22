@@ -960,7 +960,7 @@ class Coordinator:
             if self.record_failed:
                 return False
             try:
-                runner.build_executor_tables()
+                runner.build_executor_tables(os.path.join(MAPS, "exectables.bin"))
                 runner.load_duckdb_answers(os.path.join(MAPS, "duckdb.bin"))
                 runner.load_executor_memo(os.path.join(MAPS, "execmemo.bin"))
                 runner.EXECUTOR_QUERIES = runner.read_executor_queries(os.path.join(MAPS, "execqueries.bin"))
@@ -1189,10 +1189,19 @@ class Coordinator:
             why = run.fatal or (result or {}).get("inconclusive") or "no narrower set"
             plan.note(f"import state: {why}")
             broken = (result or {}).get("failed") or []
-            if result is None or run.fatal is not None or broken or result.get("widen") or plan.redefined:
+            if (
+                result is None
+                or run.fatal is not None
+                or broken
+                or result.get("widen")
+                or plan.redefined
+                or plan.narrowed
+            ):
                 # The patched package does not import as before (or that could
                 # not be found out): every test that imports a changed or a
-                # broken module is a candidate again.
+                # broken module is a candidate again. The same when tests had
+                # been left out on the static reading of the patch and the
+                # comparison, which alone confirms that reading, gave no answer.
                 wide = plan.candidates | plan.import_wide
                 for path in broken:
                     wide |= self.covmap.file_any(path)
