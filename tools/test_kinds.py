@@ -104,6 +104,66 @@ expect("E: harmless new module with a store", pydiff.harmless_new_test_module(
 expect("E: harmless new module", pydiff.harmless_new_test_module(
     "import os\n\n\ndef test_a():\n    x = os.sep\n    assert x\n"), True)
 
+# module-level constants of a new test file: values built without calling anything, and re.compile of a constant
+NEW_FILE = "import re\nimport unittest\n\n{}\n\n\nclass TestZ(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n"
+for label, constant, want in (
+    ("a number", "LIMIT = 3", True),
+    ("a negative number", "LIMIT = -3", True),
+    ("a string", "SQL = 'SELECT 1'", True),
+    ("None", "CACHE = None", True),
+    ("two names", "A = B = 'x'", True),
+    ("a tuple of constants", "CASES = ('a', 1, (2.5, None))", True),
+    ("a list of tuples", "CASES = [('a', 'b'), ('c', 'd')]", True),
+    ("a dict of lists", "TABLE = {'a': [1, 2], ('b', 1): {'c': None}}", True),
+    ("a set", "NAMES = {'a', 'b'}", True),
+    ("a compiled pattern", "ATOM = re.compile(r'%(?:[mdHIMS]strict|[-:].|[\\w%])')", True),
+    ("a compiled pattern with flags", "ATOM = re.compile('a', re.I | re.M)", True),
+    ("a compiled pattern with a flags keyword", "ATOM = re.compile('a', flags=re.DOTALL)", True),
+    ("a call", "VALUE = sorted([2, 1])", False),
+    ("a call inside a list", "VALUE = [len('a')]", False),
+    ("a name", "VALUE = unittest", False),
+    ("an attribute", "VALUE = unittest.TestCase", False),
+    ("a binary operation", "VALUE = 'a' * 3", False),
+    ("an f-string", "VALUE = f'{unittest}'", False),
+    ("unpacking in a list", "VALUE = [*'ab']", False),
+    ("unpacking in a dict", "VALUE = {**{}}", False),
+    ("an unhashable key", "VALUE = {[1]: 2}", False),
+    ("an unhashable member", "VALUE = {[1]}", False),
+    ("a comprehension", "VALUE = [i for i in (1, 2)]", False),
+    ("a lambda", "VALUE = lambda: 1", False),
+    ("a pattern from a name", "ATOM = re.compile(unittest.__name__)", False),
+    ("a pattern with a called flag", "ATOM = re.compile('a', int('2'))", False),
+    ("another function of re", "ATOM = re.sub('a', 'b', 'c')", False),
+    ("an attribute target", "unittest.TestCase.maxDiff = None", False),
+    ("a subscript target", "re.__dict__['x'] = 1", False),
+    ("a tuple target", "A, B = 1, 2", False),
+    ("an annotated constant", "LIMIT: int = 3", False),
+    ("an augmented assignment", "LIMIT = 1\nLIMIT += 1", False),
+    ("a name pytest reads", "pytest_plugins = ['tests.helpers']", False),
+    ("pytestmark", "pytestmark = 'slow'", False),
+    ("a dunder", "__test__ = False", False),
+    ("a hook name", "setup_module = None", False),
+    ("collect_ignore", "collect_ignore = ['x.py']", False),
+    ("load_tests", "load_tests = None", False),
+):
+    expect(f"E: new test file with {label}", pydiff.harmless_new_test_module(NEW_FILE.format(constant)), want)
+    # the stores rule still flags a store outside the module's own names, and a `compile` call that is not the exempted form
+    flagged = label in ("an attribute target", "a subscript target", "a pattern from a name", "a pattern with a called flag")
+    expect(f"E: new test file with {label}: stores rule", pydiff.new_global_effects("", NEW_FILE.format(constant)), flagged)
+# `re` must be the standard module, bound by `import re` and nothing else
+for label, text, want in (
+    ("re imported from elsewhere", "from tests import helpers as re\n\nATOM = re.compile('a')\n", False),
+    ("re rebound", "import re\n\nATOM = re.compile('a')\nre = None\n", False),
+    ("re as a parameter", "import re\n\nATOM = re.compile('a')\n\n\ndef helper(re):\n    return re\n", False),
+    ("re under another name", "import re as regex\n\nATOM = regex.compile('a')\n", False),
+    ("no import of re", "ATOM = re.compile('a')\n", False),
+    ("plain", "import re\n\nATOM = re.compile('a')\n", True),
+):
+    expect(f"E: new test file, {label}", pydiff.harmless_new_test_module(text), want)
+    expect(f"E: new test file, {label}: stores rule", pydiff.new_global_effects("", text), not want)
+# inside a function the stores rule is as strict as before
+expect("E: re.compile inside a new test", effects(TESTS + METHOD.format("        import re\n        x = re.compile('a')")), True)
+
 # calls and tricks that change shared state without a store statement
 for label, body in (
     ("clear on a class table", "import sqlglot\nsqlglot.Parser.FUNCTIONS.clear()"),
@@ -584,5 +644,48 @@ if covmap._dirs["names"] is not None:  # with the names of the import attempts; 
     expect("B: a file nobody lists, and nobody imports", (plan.candidates, plan.select_all), (0, False))
     plan = plan_for(new_file_patch("docs/zz_note.txt", "x" + chr(10)))
     expect("B: a note in a new directory", (plan.candidates, plan.select_all), (0, False))
+
+# ---- the names half of dirs.json: only the tests that ask for a name or list a directory notice a new file ----
+
+def empty_deleted_patch(path):
+    return f"diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex e69de29..0000000\n"
+
+
+def config_patch(path, text):
+    return new_file_patch(path, text)
+
+
+if covmap._dirs["names"] is not None:
+    plan = plan_for(new_file_patch("sqlglot/zz_unasked.py", "raise RuntimeError\n"))
+    expect("N: a new module that nobody asks for", (plan.candidates, plan.select_all), (0, False))
+    for where in ("sqlglot/dialects", "sqlglot/optimizer", "tests", "tests/dialects", ""):
+        plan = plan_for(new_file_patch((where + "/" if where else "") + "zz_unasked.py", "raise RuntimeError\n"))
+        expect("N: a new module that nobody asks for, in '" + where + "'", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(new_file_patch("sqlglot/dialects/myqsl.py", "raise RuntimeError\n"))
+    expect("N: a dialect name given as a string by one test", (0 < plan.candidates.bit_count() < 10, plan.select_all), (True, False))
+    plan = plan_for(new_file_patch("sqlglot/_version.py", "raise RuntimeError\n"))
+    expect("N: a name every importer of sqlglot asks for", plan.candidates.bit_count() >= 1600, True)
+    plan = plan_for(new_file_patch("json.py", "raise RuntimeError\n"))
+    expect("N: a module that shadows the standard one every test loads", plan.candidates, everything)
+    # a package marker that vanishes is a name pytest reads for itself: the rule for those files answers first
+    plan = plan_for(empty_deleted_patch("tests/dialects/__init__.py"))
+    expect("N: the package tests.dialects loses its __init__.py", plan.select_all, True)
+    # names the map cannot hold: what pytest's own import hook asks for, and what an existing or installed module answers to
+    for path in ("tests/test_parser.so", "tests/dialects/test_dialect.cpython-313-x86_64-linux-gnu.so", "sqlglot/parser.pyd",
+                 "sqlglot/helper/__init__.py", "sqlglot/tokens/extra.py", "xdist.py", "pytest_timeout.py", "duckdb.py",
+                 "typing.py", "json/__init__.py", "pandas/core.py"):
+        plan = plan_for(new_file_patch(path, "X = 1\n"))
+        expect("N: a new entry that shadows a module: " + path, plan.select_all or plan.candidates == everything, True)
+    for path in ("zz_notes.py", "zz_dir/mod.py", "sqlglot/zz_pkg_data/mod.py", "tests/zz_helper.py", "sqlglot/zz.txt", "docs/json.md"):
+        plan = plan_for(new_file_patch(path, "X = 1\n"))
+        expect("N: a new entry that shadows nothing: " + path, (plan.candidates, plan.select_all), (0, False))
+    for path in ("tests/test_notes.txt", "tests/fixtures/test_cases.txt", "tests/dialects/test_a.txt"):
+        plan = plan_for(new_file_patch(path, ">>> 1 + 1\n2\n"))
+        expect("N: a text file pytest takes for doctests: " + path, plan.select_all, True)
+    plan = plan_for(new_file_patch("tests/fixtures/notes.txt", "x\n"))
+    expect("N: any other text file", (plan.candidates, plan.select_all), (0, False))
+    for path in ("pytest.toml", ".pytest.toml", "tests/pytest.toml", "tests/dialects/pytest.ini", "tests/pyproject.toml", "tests/setup.cfg"):
+        plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
+        expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)
 
 print(f"{checks} checks passed")

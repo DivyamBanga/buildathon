@@ -1,7 +1,7 @@
 """Run tests alone under tools/trace_names and keep what each one listed and tried to import.
 
 Usage (inside the lab image): python trace_names_run.py /data/tests.json /out first last [seconds]
-Writes /out/<number>.txt (de-duplicated rows). Tests with a file already are skipped, so the
+Writes /out/<number>.txt (de-duplicated rows, and "R <pytest exit code> <seconds>"). Tests with a file already are skipped, so the
 job can be run again; it stops starting new tests after `seconds` (default 1500).
 """
 import json
@@ -31,9 +31,13 @@ for test in tests[first:last]:
     os.makedirs(work)
     env = dict(os.environ, BR_TRACE_DIR=work, SKIP_INTEGRATION="0",
                PYTHONPATH="/sqlglot:" + os.path.join(HERE, "trace_names"))
-    subprocess.run([sys.executable, "-m", "pytest", test["id"], "-q", "-p", "no:cacheprovider", "-x"],
-                   cwd="/sqlglot", env=env, capture_output=True, text=True)
-    rows = set()
+    began = time.time()
+    try:
+        status = str(subprocess.run([sys.executable, "-m", "pytest", test["id"], "-q", "-p", "no:cacheprovider", "-x"],
+                                    cwd="/sqlglot", env=env, capture_output=True, text=True, timeout=900).returncode)
+    except subprocess.TimeoutExpired:
+        status = "timeout"
+    rows = {f"R {status} {time.time() - began:.1f}"}
     for name in os.listdir(work):
         with open(os.path.join(work, name), encoding="utf-8") as handle:
             rows.update(handle.read().splitlines())
