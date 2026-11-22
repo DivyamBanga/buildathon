@@ -125,6 +125,243 @@ expect("E: a store to self in a new class", added("\n\nclass B:\n    def setUp(s
 expect("E: a class whose setUp clears a table", added(
     "\n\nclass B:\n    def setUp(self):\n        import sqlglot\n        sqlglot.Parser.FUNCTIONS.clear()\n"), False)
 
+# ---- K: an ordinary new test costs nothing; one that changes shared state selects everything ----
+#
+# The rule looks for stores and for calls on a list of names, nothing more. An allowlist of
+# calls (anything not on it selects everything) was tried on a branch and not taken: it turned
+# down a quarter of the suite's own tests. These checks hold both ends in place.
+
+K_OLD = textwrap.dedent('''\
+    import unittest
+    from unittest import mock
+    from sqlglot import exp, parse_one
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.tokens import Tokenizer
+
+
+    def helper(x):
+        return x
+
+
+    class TestA(unittest.TestCase):
+        def test_one(self):
+            self.assertEqual(helper(1), 1)
+''')
+
+
+def k_new(body, text=K_OLD):
+    """(accepted as only new tests?, stores outside its locals?) for one new test method with this body."""
+    new = text + METHOD.format("\n".join("        " + row for row in body.split("\n")))
+    return pydiff.only_new_definitions(text, new, {"TestA::test_one"}), pydiff.new_global_effects(text, new)
+
+
+def k_file(text):
+    return pydiff.harmless_new_test_module(text), pydiff.new_global_effects("", text)
+
+
+for label, body in (
+    ("assertion", "self.assertEqual(helper(1), 1)"),
+    ("module function and a local", "x = helper(2)\nself.assertTrue(x)"),
+    ("method on a result", "self.assertEqual(str(helper(1)).lower(), '1')"),
+    ("builtins", "self.assertEqual(len(sorted([2, 1])), 2)"),
+    ("assertRaises", "with self.assertRaises(ValueError):\n    helper(1)"),
+    ("subTest in a loop", "for sql in ('a', 'b'):\n    with self.subTest(sql):\n        self.assertEqual(parse_one(sql).sql(), sql)"),
+    ("validate_identity and validate_all", "self.validate_identity('SELECT 1')\nself.validate_all('SELECT 1', write={'duckdb': 'SELECT 1'})"),
+    ("a class method of sqlglot", "self.assertEqual(exp.Literal.number(1).sql(), '1')"),
+    ("a method of a new instance", "tokens = Tokenizer().tokenize('SELECT 1')\nself.assertEqual(len(tokens), 2)"),
+    ("mock.patch.object as a context manager", "with mock.patch.object(Dialect, 'get', return_value=None):\n    self.assertIsNone(Dialect.get('x'))"),
+    ("find on a parsed tree", "self.assertIsNotNone(parse_one('select 1').find(exp.Select))"),
+    ("locals and a loop", "total = 0\nfor i in range(3):\n    total += i\nself.assertEqual(total, 3)"),
+    ("transform with a lambda", "tree = parse_one('select a').transform(lambda node: node)\nself.assertEqual(tree.sql(), 'SELECT a')"),
+    ("assertLogs", "with self.assertLogs('sqlglot') as logs:\n    helper(1)\nself.assertTrue(logs)"),
+    ("try and finally with no store", "handle = helper(1)\ntry:\n    self.assertTrue(handle)\nfinally:\n    handle.close()"),
+):
+    expect("K: an ordinary new test, " + label, k_new(body), (True, False))
+for label, body in (
+    ("logging.disable", "import logging\n\nlogging.disable(logging.CRITICAL)"),
+    ("a store into os.environ", "import os\n\nos.environ['SQLGLOT_X'] = '1'"),
+    ("a logger's level", "import sqlglot.generator as g\n\ng.logger.setLevel(60)"),
+    ("setattr on a class", "setattr(Dialect, 'LIMIT_FETCH', 'FETCH')"),
+    ("a class table cleared", "Dialect.TRANSFORMS.clear()"),
+    ("a store through the patched object", "with mock.patch.object(Dialect, 'get') as get:\n    get.return_value = None"),
+):
+    expect("K: a new test that changes shared state, " + label, k_new(body), (False, True))
+K_HEAD = "import unittest\nimport logging\nfrom sqlglot import exp, parse_one\n"
+expect("K: new file, plain tests", k_file(K_HEAD + "\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(exp.column('a').sql(), 'a')\n        self.assertIsNotNone(parse_one('select 1').find(exp.Select))\n"), (True, False))
+expect("K: new file, a helper that a test calls", k_file(K_HEAD + "\n\ndef build(sql):\n    return parse_one(sql)\n\n\ndef test_a():\n    assert build('select 1').sql() == 'SELECT 1'\n"), (True, False))
+expect("K: new file, the logging level", k_file(K_HEAD + "\n\ndef test_a():\n    logging.disable(50)\n"), (False, True))
+expect("K: new file, a helper that clears a class table", k_file(K_HEAD + "\n\ndef reset():\n    exp.Expr.arg_types.clear()\n\n\ndef test_a():\n    reset()\n"), (False, True))
+
+# ---- L: an edited test that leaves state behind --------------------------------
+
+L_OLD = textwrap.dedent('''\
+    import unittest
+    from sqlglot import Parser
+
+    ORIGINAL = Parser.FUNCTIONS
+
+
+    class TestA(unittest.TestCase):
+        def setUp(self):
+            self.n = 1
+
+        def tearDown(self):
+            self.n = 0
+
+        def test_one(self):
+            d = {}
+            d["a"] = 1
+            self.n = 2
+            try:
+                Parser.FUNCTIONS = {}
+                self.assertEqual(self.n, 2)
+            finally:
+                Parser.FUNCTIONS = ORIGINAL
+
+        def test_two(self):
+            cls = Parser
+            cls.X = 1
+            self.addCleanup(print, 1)
+
+        def test_three(self):
+            def restore():
+                print(1)
+            self.addCleanup(restore)
+            self.assertEqual(1, 1)
+
+        def test_four(self):
+            handle = open("f")
+            try:
+                self.assertTrue(handle)
+            finally:
+                handle.close()
+
+        def test_five(self):
+            first, second = Parser.FUNCTIONS, {}
+            first["A"] = 1
+            either = second or Parser.FUNCTIONS
+            either["B"] = 2
+
+
+    class TestB(unittest.TestCase):
+        def tearDown(self):
+            print("done")
+
+        def test_six(self):
+            try:
+                self.assertEqual(1, 1)
+            finally:
+                print("six")
+''')
+
+
+def edited(old, new, text=L_OLD):
+    if text.count(old) != 1:
+        raise SystemExit(f"FAIL the edit {old!r} must match once, matches {text.count(old)} times")
+    return pydiff.edit_leaves_state(text, text.replace(old, new))
+
+
+for label, old, new, want in (
+    ("value of a store in finally", "Parser.FUNCTIONS = ORIGINAL", "Parser.FUNCTIONS = {}", True),
+    ("removed store in finally", "Parser.FUNCTIONS = ORIGINAL", "pass", True),
+    ("value of a store in a test body", "Parser.FUNCTIONS = {}", "Parser.FUNCTIONS = {1: 2}", True),
+    ("a store to self", "self.n = 2", "self.n = 3", False),
+    ("a store to a fresh local", 'd["a"] = 1', 'd["a"] = 2', False),
+    ("a removed store to a fresh local", '        d["a"] = 1\n', "", False),
+    ("an alias of a class", "cls.X = 1", "cls.X = 2", True),
+    ("a removed store through an alias", "        cls.X = 1\n", "", True),
+    ("an unpacked value is an alias", '        first["A"] = 1\n', "", True),
+    ("the result of `or` is an alias", '        either["B"] = 2\n', "", True),
+    ("an assertion", "self.assertEqual(self.n, 2)", "self.assertEqual(self.n, 3)", False),
+    ("tearDown", "self.n = 0", "self.n = 5", True),
+    ("addCleanup call", "self.addCleanup(print, 1)", "self.addCleanup(print, 2)", True),
+    ("a removed addCleanup call", "        self.addCleanup(print, 1)\n", "", True),
+    ("addCleanup callback", "print(1)\n        self.addCleanup(restore)", "print(2)\n        self.addCleanup(restore)", True),
+    ("a comment", "self.n = 2", "self.n = 2  # same", False),
+    ("a new store in the body", "self.assertEqual(1, 1)\n\n    def test_four", "Parser.Z = 1\n\n    def test_four", True),
+    ("setUp, self only", "self.n = 1", "self.n = 4", False),
+    ("a call in finally that stores nothing, changed", "handle.close()", "handle.flush()", True),
+    ("a call in finally that stores nothing, removed", "handle.close()", "pass", True),
+    ("a line added to a finally block", "            handle.close()\n", "            handle.close()\n            print(2)\n", True),
+    ("the try block of a finally, not the finally", "self.assertTrue(handle)", "self.assertFalse(handle)", False),
+    ("a tearDown that stores nothing, changed", 'print("done")', 'print("over")', True),
+    ("a tearDown taken out of a class that stays", '    def tearDown(self):\n        print("done")\n\n', "", True),
+):
+    expect("L: " + label, edited(old, new), want)
+expect("L: text that does not parse", pydiff.edit_leaves_state(L_OLD, "def (:\n"), False)
+expect("L: a new helper at the end", pydiff.edit_leaves_state(L_OLD, L_OLD + "\n\ndef helper(x):\n    return x\n"), False)
+# What is new as a whole is rule K's, and what is gone as a whole keeps only its stores.
+NEW_TEST = "\n    def test_new(self):\n        handle = open('g')\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()\n"
+expect("L: a new test with a finally of its own", pydiff.edit_leaves_state(L_OLD, L_OLD + NEW_TEST), False)
+expect("L: and rule K accepts it", pydiff.only_new_definitions(L_OLD, L_OLD + NEW_TEST, set()), True)
+NEW_CLASS = "\n\nclass TestC(unittest.TestCase):\n    def setUp(self):\n        self.handle = open('g')\n\n    def tearDown(self):\n        self.handle.close()\n\n    def test_c(self):\n        self.assertTrue(self.handle)\n"
+expect("L: a new class with a tearDown of its own", pydiff.edit_leaves_state(L_OLD, L_OLD + NEW_CLASS), False)
+expect("L: a tearDown added to a class that was there", edited("    def test_two(self):", "    def tearDownClass(cls):\n        pass\n\n    def test_two(self):"), True)
+expect("L: a test with a finally, removed whole", edited(
+    "    def test_four(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()\n\n", ""), False)
+expect("L: a class with a tearDown, removed whole", pydiff.edit_leaves_state(L_OLD, L_OLD[:L_OLD.index("class TestB")].rstrip("\n") + "\n"), False)
+expect("L: a test that stored into a class, removed whole", edited(
+    "    def test_two(self):\n        cls = Parser\n        cls.X = 1\n        self.addCleanup(print, 1)\n\n", ""), True)
+expect("L: a renamed test whose finally also changed", edited(
+    "def test_four(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            handle.close()",
+    "def test_fourth(self):\n        handle = open(\"f\")\n        try:\n            self.assertTrue(handle)\n        finally:\n            pass"), True)
+expect("L: a form feed in a line does not shift the line numbers", pydiff.edit_leaves_state(
+    L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n"),
+    L_OLD.replace("import unittest\n", "import unittest\nFF = '\x0c'\n").replace("Parser.FUNCTIONS = ORIGINAL", "pass")), True)
+
+# ---- M: a new definition that fails when the module is imported ---------------
+
+M_BASE = "import unittest\nfrom unittest import mock\nfrom sqlglot.dialects.dialect import Dialect\nfrom tests.helpers import Validator, load\n\n\nclass Base(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+
+
+def m_added(text, base=M_BASE):
+    return pydiff.only_new_definitions(base, base + text, {"Base::test_a"})
+
+
+CLASS = "\n\nclass T({}):\n    def test_b(self):\n        pass\n"
+for label, bases, want in (
+    ("no base", "", True),
+    ("object", "object", True),
+    ("a class of the module", "Base", True),
+    ("unittest.TestCase", "unittest.TestCase", True),
+    ("a class imported from the tests", "Validator", True),
+    ("a name nothing binds", "NoSuchBase", False),
+    ("an imported module", "mock", False),
+    ("an imported function", "load", False),
+    ("a class of sqlglot, whose metaclass acts", "Dialect", False),
+    ("an attribute of another module", "mock.Mock", False),
+    ("two bases may have no consistent order", "unittest.TestCase, Base", False),
+    ("a repeated base", "Base, Base", False),
+    ("a call", "type('B', (), {})", False),
+):
+    expect("M: new class, " + label, m_added(CLASS.format(bases).replace("T()", "T")), want)
+expect("M: a base defined further down does not exist yet", pydiff.only_new_definitions(
+    M_BASE, M_BASE.replace("\n\nclass Base", "\n\nclass T(Base):\n    def test_b(self):\n        pass\n\n\nclass Base"), {"Base::test_a"}), False)
+expect("M: a base of the module that is itself plain", m_added(CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base):\n    pass\n"), True)
+expect("M: a base of the module with two bases", m_added(CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base, object):\n    pass\n"), False)
+expect("M: a base of the module with a subclass hook", m_added(
+    CLASS.format("Mid"), M_BASE + "\n\nclass Mid(Base):\n    def __init_subclass__(cls):\n        raise TypeError\n"), False)
+expect("M: a base rebound after its class statement", m_added(CLASS.format("Base"), M_BASE + "\nBase = None\n"), False)
+expect("M: unittest bound to something else", m_added(CLASS.format("unittest.TestCase"), M_BASE + "\nunittest = None\n"), False)
+expect("M: after a star import any name may be another thing", m_added(CLASS.format("Base"), M_BASE + "\nfrom os import *\n"), False)
+expect("M: a decorator on a new def", m_added("\n\n@mock.patch('x')\ndef helper(a):\n    return a\n"), False)
+expect("M: a default that runs", m_added("\n\ndef helper(a=load('x')):\n    return a\n"), False)
+expect("M: a keyword on a class", m_added("\n\nclass T(Base, metaclass=type):\n    pass\n"), False)
+NEW_FILE = "import unittest\nfrom sqlglot import {}\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n"
+RESOLVES = {("unittest", None), ("sqlglot", ("exp",))}
+
+
+def resolves(module, names):
+    return (module, tuple(names) if names else None) in RESOLVES
+
+
+expect("M: new file, imports that can succeed", pydiff.harmless_new_test_module(NEW_FILE.format("exp"), resolves), True)
+expect("M: new file, an import that cannot", pydiff.harmless_new_test_module(NEW_FILE.format("nothing"), resolves), False)
+expect("M: new file, nobody asked", pydiff.harmless_new_test_module(NEW_FILE.format("nothing")), True)
+expect("M: new file, a base nothing binds", pydiff.harmless_new_test_module(NEW_FILE.format("exp").replace("unittest.TestCase", "Missing")), False)
+expect("M: new file, a base imported from the tests", pydiff.harmless_new_test_module(
+    "from tests.dialects.test_dialect import Validator\n\n\nclass T(Validator):\n    def test_a(self):\n        self.validate_identity('SELECT 1')\n"), True)
+
 # ---- F: a new name must not change what existing code finds ---------------
 
 expect("F: new global is a builtin", added("\n\ndef set(*args):\n    return {'x'}\n"), False)
@@ -246,11 +483,25 @@ for name in ("C_setup_module", "C_setup_method"):
     expect("seed " + name + ": the tests of the file, unchecked", seed(name).unverified & TIME_TESTS, TIME_TESTS)
 for hook in ("def teardown_class(cls):", "def teardown_function(f):", "def setup_class(cls):", "def teardown_method(self):", "def setUpModule():"):
     expect("C: " + hook, plan_for(comment_patch("tests/test_time.py", hook)).unverified & TIME_TESTS, TIME_TESTS)
+# pytest_plugins in a test module or in a test package: its hooks reach the tests of every file
+for name in ("C_pytest_plugins_self", "C_pytest_plugins_package"):
+    expect("seed " + name + ": every test", seed(name).select_all, True)
+expect("C: pytest_plugins names a helper", plan_for(comment_patch("tests/test_time.py", "pytest_plugins = ['tests.helpers']")).select_all, True)
+plan = plan_for(comment_patch("sqlglot/helper.py", "# pytest_plugins"))
+expect("C: pytest_plugins outside tests/", (plan.candidates, plan.select_all), (0, False))
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith("E_"):
         plan = seed(name[:-6])
         expect("seed " + name[:-6] + ": not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
         expect("seed " + name[:-6] + ": selected", plan.select_all or plan.candidates != 0, True)
+
+for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
+    if name.startswith(("K_", "L_")):
+        expect("seed " + name[:-6], seed(name[:-6]).select_all, True)
+plan = seed("M_undefined_base")
+expect("seed M: not 'only new tests'", any("only new tests" in note for note in plan.notes), False)
+expect("seed M: the tests of the file run", plan.candidates & covmap.tests_of_file("tests/test_helper.py"), covmap.tests_of_file("tests/test_helper.py"))
+expect("seed M: and nothing is selected unchecked", (plan.select_all, plan.unverified), (False, 0))
 
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
@@ -272,6 +523,47 @@ def deleted_file_patch(path):
     return (f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n--- a/{path}\n+++ /dev/null\n"
             f"@@ -1,{len(lines)} +0,0 @@\n" + body)
 
+
+NEW_TEST_FILE = "import unittest\n{}\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n"
+for line in (
+    "from sqlglot import nothing",
+    "import sqlglot.nothing",
+    "from sqlglot.nothing import exp",
+    "from tests.helpers import nothing",
+    "from tests.dialects.test_dialect import Validator, Nothing",
+):
+    plan = plan_for(new_file_patch("tests/test_new_import.py", NEW_TEST_FILE.format(line)))
+    expect("M: a new test file with an import that cannot succeed, " + line, plan.select_all, True)
+for line in (
+    "from sqlglot import exp, parse_one\nfrom tests.helpers import assert_logger_contains",
+    "from sqlglot.dialects import BigQuery, Hive",  # handed out by the module's __getattr__
+    "from sqlglot.optimizer import optimize\nfrom sqlglot.optimizer.qualify import qualify",
+    "from sqlglot.expressions import Column, convert",  # bound by star imports
+    "import sqlglot.expressions.core as core\nimport sqlglot.dialects",
+    "from tests.dialects.test_dialect import Validator",
+    "from sqlglot import optimizer",  # a submodule
+    "from decimal import Decimal\nfrom unittest import mock\nimport pandas as pd",
+):
+    plan = plan_for(new_file_patch("tests/test_new_import.py", NEW_TEST_FILE.format(line)))
+    expect("M: a new test file whose imports can succeed, " + line.split("\n")[0], (plan.select_all, plan.candidates), (False, 0))
+
+
+def appended(path, addition):
+    """A patch that adds text at the end of a file of the pinned tree."""
+    import difflib
+
+    with open(os.path.join(ROOT, path), encoding="utf-8", newline="") as handle:
+        old = handle.read().splitlines(keepends=True)
+    body = "".join(difflib.unified_diff(old, old + addition.splitlines(keepends=True), "a/" + path, "b/" + path, n=3))
+    return f"diff --git a/{path} b/{path}\n" + body
+
+
+both = appended("sqlglot/time.py", "\n\ndef zz_new_helper():\n    return 1\n") + new_file_patch(
+    "tests/test_new_import.py", NEW_TEST_FILE.format("from sqlglot.time import zz_new_helper"))
+expect("M: a name the same patch adds is not judged", plan_for(both).select_all, False)
+both = new_file_patch("sqlglot/zz_new_module.py", "VALUE = 1\n") + new_file_patch(
+    "tests/test_new_import.py", NEW_TEST_FILE.format("from sqlglot.zz_new_module import VALUE"))
+expect("M: a module the same patch adds is not judged", any("does more than define tests" in note for note in plan_for(both).notes), False)
 
 everything = covmap.all
 plan = plan_for(new_file_patch("tests/test_new_ok.py", "import unittest\n\n\nclass TestNew(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n"))

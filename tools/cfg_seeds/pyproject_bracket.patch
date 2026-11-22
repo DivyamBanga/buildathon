@@ -1,0 +1,13 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 949ece8..daa8a09 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -23,7 +23,7 @@ Repository = "https://github.com/tobymao/sqlglot"
+ Issues = "https://github.com/tobymao/sqlglot/issues"
+ 
+ [build-system]
+-requires = ["setuptools >= 61.0", "setuptools_scm >= 10.2"]
++requires = ["setuptools >= 61.0", "setuptools_scm >= 10.2"
+ build-backend = "setuptools.build_meta"
+ 
+ [tool.setuptools]

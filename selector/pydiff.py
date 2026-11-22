@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import re
 import dis
 import types
@@ -325,6 +326,92 @@ class CodeDiff:
         self.isomorphic = True
 
 
+_ANONYMOUS = ("<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>")
+
+
+def _children(code: CODE) -> list:
+    return [const for const in code.co_consts if isinstance(const, CODE)]
+
+
+def _deep_key(code: CODE):
+    """Everything that decides what a code object and all code inside it do, or
+    None when that cannot be worked out. Two code objects with the same key can
+    be exchanged for each other."""
+    try:
+        body = _normal_form(code)
+    except Exception:
+        return None
+    children = _children(code)
+    kids = []
+    for child in children:
+        key = _deep_key(child)
+        if key is None:
+            return None
+        kids.append(key)
+    # Which child each instruction that loads one refers to.
+    slot = {id(child): index for index, child in enumerate(children)}
+    loads = tuple(
+        slot[id(code.co_consts[instruction.arg])]
+        for instruction in dis.get_instructions(code)
+        if instruction.opcode == _LOAD_CONST and isinstance(code.co_consts[instruction.arg], CODE)
+    )
+    return (_shape(code), body, tuple(kids), loads)
+
+
+def _pair_children(old_children: list, new_children: list):
+    """Pair the code objects of two scopes whose children do not line up by position.
+
+    Returns (pairs, old children without a partner). A child pairs only within
+    its own scope, by name and kind (`def` or class body): a function that moved
+    to another scope or was renamed is a removal and an addition. A new child
+    with no partner needs no entry, the scope that creates it is reported
+    changed. Rules:
+
+    - A name defined once on each side pairs with itself, wherever it stands.
+    - A name defined several times (overloads, a property's getter and setter,
+      conditional definitions) pairs the k-th with the k-th only when it is
+      defined as often as before; otherwise every old definition is changed.
+    - Anonymous code (lambdas, generator expressions) first pairs with an
+      identical one anywhere in the scope (the same instructions, names and
+      code inside), in order; what is left pairs by position when as many are
+      left on each side, else the old ones are changed.
+    """
+    groups: dict = {}
+    for side, children in ((0, old_children), (1, new_children)):
+        for child in children:
+            groups.setdefault((child.co_name, is_function_like(child)), ([], []))[side].append(child)
+    pairs: list = []
+    lost: list = []
+    for (name, _), (olds, news) in groups.items():
+        if name in _ANONYMOUS:
+            waiting: dict = {}
+            for child in news:
+                key = _deep_key(child)
+                if key is not None:
+                    waiting.setdefault(key, []).append(child)
+            taken = set()
+            left_old = []
+            for child in olds:
+                key = _deep_key(child)
+                partners = waiting.get(key) if key is not None else None
+                if partners:
+                    partner = partners.pop(0)
+                    taken.add(id(partner))
+                    pairs.append((child, partner))
+                else:
+                    left_old.append(child)
+            left_new = [child for child in news if id(child) not in taken]
+            if len(left_old) == len(left_new):
+                pairs.extend(zip(left_old, left_new))
+            else:
+                lost.extend(left_old)
+        elif len(olds) == len(news):
+            pairs.extend(zip(olds, news))
+        else:
+            lost.extend(olds)
+    return pairs, lost
+
+
 def diff_code(old: CODE, new: CODE) -> CodeDiff:
     result = CodeDiff()
     stack = [(old, new)]
@@ -344,9 +431,18 @@ def diff_code(old: CODE, new: CODE) -> CodeDiff:
         if same_shape:
             stack.extend(zip(old_children, new_children))
         else:
-            # Children cannot be paired, so every old child counts as changed.
+            # Definitions were added, removed, moved or renamed here. Children
+            # are paired by name (see _pair_children); an old child with no
+            # partner is changed, together with everything inside it. When the
+            # code itself is unchanged yet its children do not line up, nothing
+            # is trusted.
             result.isomorphic = False
-            pending = list(old_children)
+            if same_behaviour(old_code, new_code):
+                matched, lost = [], list(old_children)
+            else:
+                matched, lost = _pair_children(old_children, new_children)
+            stack.extend(matched)
+            pending = lost
             while pending:
                 child = pending.pop()
                 result.changed.append((child, None))
@@ -634,6 +730,17 @@ def _global_effects(tree, scope: str = "", method_ok: bool = False, statement=No
     return found
 
 
+@functools.lru_cache(maxsize=2)
+def _parse(text: str):
+    """The tree of a source text. The rules for test files each need the trees of the same two
+    texts and only read them; `analyze` drops them when it is done with a commit."""
+    return ast.parse(text)
+
+
+def forget_trees() -> None:
+    _parse.cache_clear()
+
+
 def new_global_effects(old_text: str, new_text: str) -> bool:
     """True when the new text has a statement that stores outside the local scope
     (see `_global_effects`) which the old text did not have in that place.
@@ -643,8 +750,8 @@ def new_global_effects(old_text: str, new_text: str) -> bool:
     store into a class, a module or a registry reaches tests of other files.
     """
     try:
-        new_tree = ast.parse(new_text)
-        old_tree = ast.parse(old_text) if old_text else None
+        new_tree = _parse(new_text)
+        old_tree = _parse(old_text) if old_text else None
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     old_found = Counter(_global_effects(old_tree)) if old_tree is not None else Counter()
@@ -652,7 +759,299 @@ def new_global_effects(old_text: str, new_text: str) -> bool:
     return any(count > old_found[signature] for signature, count in new_found.items())
 
 
-def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple) -> bool:
+# ---- an edited test that leaves something behind ---------------------------------------
+#
+# `new_global_effects` looks at the statements the new text has and the old one had not. It
+# sees neither a restore that was removed nor a changed line of a cleanup that stores nothing
+# itself. These work from the changed lines instead, on both sides of the edit.
+
+_CLEANUP_DEFS = frozenset(("teardown", "teardownclass", "teardownmodule", "docleanups", "doclasscleanups", "domodulecleanups"))
+_CLEANUP_CALLS = frozenset(("addCleanup", "addClassCleanup", "addModuleCleanup", "enterContext", "enterClassContext", "callback", "push"))
+# What a name is bound to when it holds something made on the spot. A name, an attribute, a
+# subscript, a conditional or an `or` hands on a thing that exists elsewhere.
+_FRESH_VALUES = (
+    ast.Constant, ast.JoinedStr, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp,
+    ast.GeneratorExp, ast.Call, ast.BinOp, ast.Compare, ast.UnaryOp,
+)
+_TRY = (ast.Try, getattr(ast, "TryStar", ast.Try))
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _source_lines(text: str) -> list:
+    """The lines of a source text as the compiler numbers them (a form feed does not end one)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _changed_lines(old_text: str, new_text: str) -> tuple:
+    """(1-based lines of the old text that were removed or changed, the same for the new text)."""
+    import difflib
+
+    old_lines = _source_lines(old_text)
+    new_lines = _source_lines(new_text)
+    # What the two share at both ends needs no matching: an edit is a few lines of a long file.
+    limit = min(len(old_lines), len(new_lines))
+    head = 0
+    while head < limit and old_lines[head] == new_lines[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and old_lines[-1 - tail] == new_lines[-1 - tail]:
+        tail += 1
+    removed: set = set()
+    added: set = set()
+    matcher = difflib.SequenceMatcher(None, old_lines[head:len(old_lines) - tail], new_lines[head:len(new_lines) - tail])
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "equal":
+            removed.update(range(head + i1 + 1, head + i2 + 1))
+            added.update(range(head + j1 + 1, head + j2 + 1))
+    return removed, added
+
+
+def _aliasing_names(func) -> set:
+    """Names bound in the def other than by giving them a value made on the spot: parameters, loop
+    and with targets, imports, unpacked values, and `x = y.z` style names for something that exists elsewhere."""
+    names: set = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            names |= {n.id for n in ast.walk(node.target) if isinstance(n, ast.Name)}
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    names |= {n.id for n in ast.walk(item.optional_vars) if isinstance(n, ast.Name)}
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(node.value, _FRESH_VALUES):
+                    # also the name stored into: `d[k] = shared` makes `d` hold something shared
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+                elif not isinstance(target, ast.Name):
+                    # `a, b = shared, {}`: a tuple made on the spot hands on what it was made of
+                    names |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            if node.value is not None and not isinstance(node.value, _FRESH_VALUES) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, ast.NamedExpr):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= {(alias.asname or alias.name).split(".")[0] for alias in node.names}
+        elif isinstance(node, _DEFS):
+            if node is not func:
+                names.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+    return names
+
+
+def _def_paths(tree) -> set:
+    """The dotted path of every def and class in the tree, nested ones included."""
+    found: set = set()
+
+    def walk(node, path: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEFS):
+                found.add(path + "." + child.name)
+                walk(child, path + "." + child.name)
+            elif isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                walk(child, path)
+
+    walk(tree, "")
+    return found
+
+
+def _stores_state_in(tree, lines: set, other_tree, added: bool) -> bool:
+    """True when one of `lines` of this text touches what outlasts the test (see `edit_leaves_state`).
+
+    `other_tree` is the other side of the edit and `added` says that this is the new side. A def or
+    class that the other side does not have, and every line of which is among `lines`, is new (or
+    gone) as a whole and not an edit: on the new side rule K judges it, on the old side only the
+    stores it made still count.
+    """
+    if not lines:
+        return False
+    first, last = min(lines), max(lines)
+    other_paths: list = []
+
+    def touched(node) -> bool:
+        start = getattr(node, "lineno", None)
+        if start is None:
+            return True  # no position of its own (arguments, a comprehension clause): look inside
+        end = getattr(node, "end_lineno", None) or start
+        if end < first or start > last:
+            return False
+        return any(line in lines for line in range(start, end + 1))
+
+    def whole(node, path: str) -> bool:
+        if not all(line in lines for line in range(node.lineno, (node.end_lineno or node.lineno) + 1)):
+            return False
+        if not other_paths:
+            other_paths.append(_def_paths(other_tree))
+        return path not in other_paths[0]
+
+    def visit(node, fresh, self_ok, cleanup: bool, path: str, entire: bool) -> bool:
+        """fresh: the fresh locals of the enclosing def (None outside any def); self_ok: "class"
+        directly in a class body, else whether `self` is the enclosing method's own instance;
+        entire: an enclosing def or class is new or gone as a whole."""
+        if not touched(node):
+            return False
+        if isinstance(node, _DEFS + (ast.Lambda,)):
+            name = getattr(node, "name", "<lambda>")
+            here = path + "." + name
+            is_class = isinstance(node, ast.ClassDef)
+            inside_cleanup = cleanup or (not is_class and name.lower() in _CLEANUP_DEFS)
+            if inside_cleanup and not is_class and not entire:
+                # tearDown and its like, in a class (or module) that was there before: also when
+                # the def itself is new or gone, since it then replaces or uncovers an inherited one.
+                return True
+            entire_here = entire or (not isinstance(node, ast.Lambda) and whole(node, here))
+            if entire_here and added:
+                return False
+            if is_class:
+                return any(visit(child, None, "class", cleanup, here, entire_here) for child in ast.iter_child_nodes(node))
+            if isinstance(node, ast.Lambda):
+                local_names: set = set()
+            else:
+                local_names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                local_names -= _aliasing_names(node)
+            own = not isinstance(node, ast.Lambda) and self_ok == "class" and _own_self(node)
+            for child in ast.iter_child_nodes(node):
+                if visit(child, local_names, own, inside_cleanup, here, entire_here):
+                    return True
+            if not entire_here:
+                # a def handed to addCleanup and the like runs after the test, wherever it stands
+                callbacks = {
+                    call.args[0].id
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and getattr(call.func, "attr", getattr(call.func, "id", "")) in _CLEANUP_CALLS
+                    and call.args and isinstance(call.args[0], ast.Name)
+                }
+                for inner in ast.walk(node):
+                    if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)) and inner.name in callbacks and touched(inner):
+                        return True
+            return False
+        if not entire:
+            if isinstance(node, _TRY) and any(touched(statement) for statement in node.finalbody):
+                return True
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) in _CLEANUP_CALLS:
+                return True
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if not isinstance(root, ast.Name):
+                return True
+            if root.id == "self":
+                if not (self_ok is True and isinstance(node, ast.Attribute) and node.value is root):
+                    return True
+            elif fresh is None or root.id not in fresh or node.value is not root:
+                # not a fresh local, or a store one level further down, into what it holds
+                return True
+        return any(visit(child, fresh, self_ok, cleanup, path, entire) for child in ast.iter_child_nodes(node))
+
+    return visit(tree, None, None, False, "", False)
+
+
+def edit_leaves_state(old_text: str, new_text: str) -> bool:
+    """True when an edit to a test file touches what outlasts the test it is in.
+
+    pytest runs every test in one process, so a test that no longer puts back what it changed
+    fails tests of other files, and a child that runs one test sees nothing of it. Looked for
+    on the lines the edit removed or changed (old side) and on those it added (new side):
+
+    - a store to (or `del` of) an attribute or subscript of anything but `self` in its own
+      method and the fresh locals of its def (a parameter, a loop or `with` target, an
+      unpacked value and `x = y.z` count as the thing they name);
+    - a call that registers a cleanup (`addCleanup`, `enterContext`, `callback`, ...), and a
+      def handed to one;
+    - any line of `tearDown`, `tearDownClass`, `tearDownModule` and the like;
+    - any statement of a `finally` block.
+
+    A test, helper or class that is new as a whole is not an edit: rule K
+    (`new_global_effects`, `only_new_definitions`) judges it, and its own `finally` or
+    `tearDown` only undoes what it did itself. Of one that is gone as a whole, only the
+    stores still count (a later test may have relied on what they left).
+    """
+    try:
+        old_tree = _parse(old_text)
+        new_tree = _parse(new_text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    removed, added = _changed_lines(old_text, new_text)
+    return _stores_state_in(old_tree, removed, new_tree, False) or _stores_state_in(new_tree, added, old_tree, True)
+
+
+_TEST_PACKAGES = ("unittest", "tests")
+
+
+def _plain_base(base, kinds: dict) -> bool:
+    """A base that exists when the class statement runs and does nothing when it is subclassed:
+    `object`, `unittest.TestCase`, a plain class the module defined further up, or a name
+    imported from unittest or the tests that reads as a class (`TestCase`, `Validator`; not
+    `mock`, not `load`). `kinds` says what each name is bound to at that point of the module."""
+    if isinstance(base, ast.Name):
+        kind = kinds.get(base.id)
+        if kind is None:
+            return base.id == "object"
+        return kind == "class" or (kind == "imported" and base.id[:1].isupper() and not base.id.isupper())
+    return (
+        isinstance(base, ast.Attribute)
+        and base.attr == "TestCase"
+        and isinstance(base.value, ast.Name)
+        and base.value.id == "unittest"
+        and kinds.get("unittest") == "unittest"
+    )
+
+
+def _importable_bases(module_body: list, statement) -> bool:
+    """Can this new class statement run where it stands in the module?
+
+    A name nothing binds is a NameError and a module or a function as a base a TypeError,
+    for the whole file, when the module is imported; two bases may have no consistent
+    method resolution order. So: at most one base, and one that `_plain_base` accepts with
+    what the statements above it bind (a base defined further down does not exist yet).
+    """
+    if len(statement.bases) > 1:
+        return False
+    if not statement.bases:
+        return True
+    kinds: dict = {}
+    for node in module_body:
+        if node is statement:
+            return _plain_base(statement.bases[0], kinds)
+        if isinstance(node, ast.ClassDef):
+            plain = (
+                not node.keywords
+                and not node.decorator_list
+                and len(node.bases) <= 1
+                and all(_plain_base(base, kinds) for base in node.bases)
+                and not any(getattr(member, "name", "") == "__init_subclass__" for member in node.body)
+            )
+            kinds[node.name] = "class" if plain else "other"
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kinds[node.name] = "other"
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == "*" for alias in node.names):
+                return False  # it may rebind any name
+            first_party = not node.level and (node.module or "").split(".", 1)[0] in _TEST_PACKAGES
+            for alias in node.names:
+                kinds[alias.asname or alias.name] = "imported" if first_party else "other"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                plain = alias.asname is None and bound == "unittest"
+                kinds[bound] = "unittest" if plain else "other"
+        else:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and isinstance(inner.ctx, (ast.Store, ast.Del)):
+                    kinds[inner.id] = "other"
+                elif isinstance(inner, ast.alias):
+                    kinds[(inner.asname or inner.name).split(".", 1)[0]] = "other"
+                elif isinstance(inner, _DEFS):
+                    kinds[inner.name] = "other"
+    return False  # not a statement of the module itself
+
+
+def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple, module=None) -> bool:
+    """`module`: the whole body of the new module when `new_body` leaves part of it out."""
     import unittest
 
     old_names = _bound_names(old_body)
@@ -691,6 +1090,8 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
         elif isinstance(statement, ast.ClassDef):
             if statement.decorator_list or statement.keywords or name in module_taken:
                 return False
+            if not _importable_bases(new_body if module is None else module, statement):
+                return False
             for member in statement.body:
                 simple = isinstance(member, ast.Pass) or _is_docstring(member) or _plain_function(member, True)
                 if isinstance(member, ast.Assign) and isinstance(member.value, ast.Constant):
@@ -708,7 +1109,7 @@ def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: st
 _KNOWN_PACKAGES = ("sqlglot", "tests", "pytest", "unittest", "duckdb", "pandas", "numpy")
 
 
-def harmless_new_test_module(text: str) -> bool:
+def harmless_new_test_module(text: str, import_ok=None) -> bool:
     """True when a brand-new test file can only add tests of its own.
 
     pytest imports every test file it finds, so a new one runs at collection.
@@ -717,12 +1118,14 @@ def harmless_new_test_module(text: str) -> bool:
     and functions. Importing those modules does nothing a test file of the
     pinned commit does not already do, and defining classes and functions does
     nothing at all. Anything else at module level could change what the
-    existing tests see.
+    existing tests see. `import_ok(module, names)` (names None for `import
+    module`) is asked about every import and says False for one that is certain
+    to fail: a file that cannot be imported is not one that only adds tests.
     """
     import sys
 
     try:
-        tree = ast.parse(text)
+        tree = _parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     body = []
@@ -734,15 +1137,19 @@ def harmless_new_test_module(text: str) -> bool:
                 if statement.level or not statement.module:
                     return False
                 modules = [statement.module]
+                names = [alias.name for alias in statement.names]
             else:
                 modules = [alias.name for alias in statement.names]
+                names = None
             for module in modules:
                 top = module.split(".", 1)[0]
                 if top not in _KNOWN_PACKAGES and top not in sys.stdlib_module_names:
                     return False
+                if import_ok is not None and not import_ok(module, names):
+                    return False
             continue
         body.append(statement)
-    return _only_new_definitions([], body, set(), "", (frozenset(), frozenset()))
+    return _only_new_definitions([], body, set(), "", (frozenset(), frozenset()), tree.body)
 
 
 def coding_cookie(text: str) -> str:
@@ -776,8 +1183,8 @@ def only_new_definitions(old_text: str, new_text: str, known: set, reserved=()) 
     behaves differently, so no test needs to run.
     """
     try:
-        old_tree = ast.parse(old_text)
-        new_tree = ast.parse(new_text)
+        old_tree = _parse(old_text)
+        new_tree = _parse(new_text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     return _only_new_definitions(old_tree.body, new_tree.body, known, "", _taken_names(old_tree, reserved))

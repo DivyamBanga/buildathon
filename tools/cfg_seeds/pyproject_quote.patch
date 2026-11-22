@@ -1,0 +1,13 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 949ece8..aed3df3 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -2,7 +2,7 @@
+ name = "sqlglot"
+ dynamic = ["version", "optional-dependencies"]
+ description = "An easily customizable SQL parser and transpiler"
+-readme = "README.md"
++readme = "README.md
+ authors = [{ name = "Toby Mao", email = "toby.mao@gmail.com" }]
+ license = "MIT"
+ license-files = ["LICENSE"]

@@ -24,6 +24,14 @@ the patched code**, and selects the ones that fail.
    to see the change. A function that binds other names afterwards (its local,
    cell or free names differ as sets) counts as changed in full, and so does any
    line whose instructions differ although its text does not.
+   When definitions were added, removed, moved or renamed, the code objects of
+   each scope are paired by name inside that scope (the k-th definition of a
+   name with the k-th, only while a name is defined as often as before; lambdas
+   first with an identical one anywhere in the scope) instead of by position,
+   so a def inserted above a function does not make that function count as
+   changed. A function that left its scope or changed its name is a removal and
+   an addition, and the file is then never swapped in memory, only imported
+   afresh.
 
 3. **Name the candidate tests** (`selector/analyze.py`, `selector/covmap.py`).
    `maps/` records, for every test run alone at the pinned commit, each line it
@@ -55,8 +63,15 @@ the patched code**, and selects the ones that fail.
    twins), select every test of that file unchecked, and every test that
    imports it when it is a helper module. Added and removed lines count. The
    runner uses unittest, which ignores all of these, so running the test says
-   nothing. (A new or changed `conftest.py` and the pytest configuration files
-   select everything, as before.)
+   nothing. A changed line that names `pytest_plugins` selects every test:
+   pytest registers what it names (the file itself, if it names itself) as
+   plugins when it imports the file as a test module or as a test package, and
+   their hooks then act on the whole run. (A new or changed `conftest.py` and
+   the pytest configuration files
+   select everything, as before. So does a `pyproject.toml` or `setup.cfg`, at the
+   root or under `tests/`, that appears, vanishes, moves, or is edited so that
+   pytest's own loader raises on it or finds pytest settings in either text;
+   a valid edit with no pytest settings selects nothing.)
 
    **New tests and helpers in a test file.** A file that only gained whole new
    tests, test classes or helper functions selects nothing, but only if what
@@ -74,8 +89,39 @@ the patched code**, and selects the ones that fail.
    module-level name must not be a builtin or a name the old module loads
    anywhere (existing code would find the new one); a new method must not be a
    name `unittest.TestCase` has, one the old module reads as an attribute or
-   defines elsewhere, or the name of any test in the suite. Otherwise the file
+   defines elsewhere, or the name of any test in the suite. A new class has at
+   most one base, and one that exists when the class statement runs and does
+   nothing when it is subclassed: `object`, `unittest.TestCase`, a plain class
+   the module defines further up, or a name imported from unittest or the
+   tests that reads as a class (`Validator`). A name nothing binds, or a base
+   defined further down, fails the whole file when it is imported; a class of
+   sqlglot may register the subclass; two bases may have no consistent method
+   resolution order. Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
+   A new test file must in addition hold no import that is certain to fail,
+   or it selects every test: a module of sqlglot or of the tests for which the
+   pinned tree has no file, or a name that the module's source does not bind
+   and nothing else can supply (no submodule of that name, no star import, no
+   module-level `__getattr__`, no code that writes into a namespace). What the
+   patch itself touches is not judged, nor is any other package.
+
+   **An edited test that leaves state behind.** The rule above compares the
+   statements of the new text with those of the old one, so it sees neither a
+   restore that was removed nor a changed line of a cleanup that stores
+   nothing itself (`finally: BigQuery.NORMALIZATION_STRATEGY = ...` replaced
+   by `pass`: the edited test passes, and in the whole suite 26 tests of
+   seven files fail). For an edited test file, the lines that changed, on the old
+   side and on the new side, select every test when one of them stores to an
+   attribute or subscript of anything but `self` and the fresh locals of its
+   def (a local that holds a parameter, a loop or `with` target, an unpacked
+   value or `x = y.z` counts as the thing it names, and so does a store one
+   level further down), registers a cleanup (`addCleanup`, `enterContext`,
+   `callback`), or sits in `tearDown`, `tearDownClass`, `tearDownModule`, a
+   `finally` block or a function handed to `addCleanup`. A test, helper or
+   class that is new as a whole (every line added, under a name the old file
+   does not have) is not an edit: the rule above judges it, and its own
+   `finally` or `tearDown` only undoes what it did itself. Of one that is
+   removed as a whole, only the stores still count.
 
    **A file that appears or vanishes** changes what its directory lists. The
    tests that listed that directory in their own run (`dirs.json`, from the

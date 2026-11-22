@@ -1,0 +1,20 @@
+diff --git a/tests/helpers.py b/tests/helpers.py
+index 4d4a5b1..dbf9f9a 100644
+--- a/tests/helpers.py
++++ b/tests/helpers.py
+@@ -2,6 +2,15 @@
+ 
+ FILE_DIR = os.path.dirname(__file__)
+ FIXTURES_DIR = os.path.join(FILE_DIR, "fixtures")
++
++
++def _zz_poke():
++    from sqlglot.generators.duckdb import DuckDBGenerator
++
++    DuckDBGenerator.TRANSFORMS.clear()
++
++
++_zz_poke()
+ 
+ 
+ def is_compiled(module):

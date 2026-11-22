@@ -8,18 +8,22 @@ this module never decides that a test fails or passes.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import marshal
 import os
 import re
 import posixpath
+import subprocess
+import sys
+import tempfile
 
 from . import patchlib, pydiff
 from .covmap import CovMap
 
 # Files that configure pytest itself. The runner executes tests with unittest,
 # so a change to how pytest is configured cannot be reproduced by running.
-_PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py")
+_PYTEST_CONFIG = ("pytest.ini", "tox.ini", ".pytest.ini", "conftest.py", "pytest.toml", ".pytest.toml")
 _MAYBE_PYTEST_CONFIG = ("pyproject.toml", "setup.cfg")
 # What only pytest honours in a unittest-based test file: its name, the xunit hooks (the runner calls
 # setUpModule and setUp, never these), marks, fixtures, collection switches.
@@ -139,7 +143,7 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
             plan.note(f"new {path}")
         elif path.startswith("tests/") and (name.startswith("test_") or name.endswith("_test.py")):
             # pytest collects it, so it is imported next to the existing tests.
-            if not pydiff.harmless_new_test_module(patch.new_text or ""):
+            if not pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan)):
                 plan.select_all = True
                 plan.note(f"new test file {path} does more than define tests")
         return
@@ -285,7 +289,12 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 if span is not None:
                     new_first = patch.new_line(first)
                     new_last = patch.new_line(span[1])
-                    if new_first is not None and new_last is not None and new_last >= new_first:
+                    if (
+                        new_first is not None
+                        and new_last is not None
+                        and new_last >= new_first
+                        and new.co_firstlineno == new_first
+                    ):
                         if pydiff.last_line(new) > new_last or pydiff.last_line(old) > span[1]:
                             # The function goes on past what was its last line: statements
                             # were added at its end (or the recorded span ends early). They
@@ -359,23 +368,112 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
         plan.needs_clean = True
 
 
+def _searched(path: str) -> bool:
+    """Is this a directory pytest looks in for its settings?
+
+    It starts at the directory of its arguments (a test file's directory, or the
+    root) and goes up: the root and every directory under tests/ qualify, so
+    does nothing else in the checkout (sqlglotc/, sqlglot/).
+    """
+    return "/" not in path or path.startswith("tests/")
+
+
+# Run in a separate interpreter: importing pytest here would change what sqlglot
+# decides at import (it looks for unittest and pytest in sys.modules).
+_CFG_PROBE = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "try:\n"
+    "    from _pytest.config.findpaths import CONFIG_LOADERS_BY_NAME as L\n"
+    "    out = ['none' if L[n](Path(p)) is None else 'config' for n, p in zip(sys.argv[1::2], sys.argv[2::2])]\n"
+    "except BaseException:\n"
+    "    out = ['error']\n"
+    "print(' '.join(out))\n"
+)
+
+
+def _config_may_break(patch: patchlib.FilePatch, path: str, old_path: str) -> bool:
+    """Must a change to pyproject.toml or setup.cfg select every test?
+
+    pytest parses every such file it meets while it looks for its settings, with
+    its own loader (_pytest.config.findpaths); a file that does not parse stops
+    it before any test runs. Everything is selected unless the file is edited in
+    place and pytest's loader finds no configuration in either text, and raises on
+    neither. Any doubt selects everything.
+    """
+    if patch.old_text is None or patch.new_text is None or path != old_path:
+        return True  # appears, vanishes or moves: what pytest finds there changes
+    name = os.path.basename(path)
+    try:
+        with tempfile.TemporaryDirectory(prefix="brcfg") as scratch:
+            args = []
+            for label, text in (("old", patch.old_text), ("new", patch.new_text)):
+                os.mkdir(os.path.join(scratch, label))
+                target = os.path.join(scratch, label, name)
+                with open(target, "wb") as handle:
+                    handle.write(text.encode("utf-8"))
+                args += [name, target]
+            done = subprocess.run(
+                [sys.executable, "-I", "-c", _CFG_PROBE, *args],
+                capture_output=True, text=True, timeout=30, cwd=scratch,
+            )
+        return done.returncode != 0 or done.stdout.split() != ["none", "none"]
+    except Exception:
+        return True
+
+
+_PYTEST_FILES = _PYTEST_CONFIG + ("__init__.py", "sitecustomize.py", "usercustomize.py")
+
+
+def _pytest_file_moves(plan: Plan, patch: patchlib.FilePatch, path: str, old_path: str, root: str) -> str | None:
+    """A file pytest reads for itself that appears, vanishes or moves, by whatever route.
+
+    The rules for new files and for edits in place do not see a rename onto one of
+    these names (or away from one), and the runner, which uses unittest, cannot
+    reproduce what pytest does with them. A file renamed into the test tree under a
+    test name is collected: it must be one that only defines tests.
+    """
+    arrives = patch.new_text is not None and (patch.new_file or old_path != path)
+    leaves = patch.new_text is None or old_path != path
+    if arrives:
+        name = os.path.basename(path)
+        if name in _PYTEST_FILES or (name in _MAYBE_PYTEST_CONFIG and _searched(path)):
+            return f"{path} appears under a name pytest reads"
+        if (
+            old_path != path
+            and path.startswith("tests/")
+            and (name.startswith("test_") or name.endswith("_test.py"))
+            and not pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan))
+        ):
+            return f"{path}: a file moved into the tests is collected and does more than define tests"
+    if leaves:
+        name = os.path.basename(old_path)
+        if name in _PYTEST_FILES or (name in _MAYBE_PYTEST_CONFIG and _searched(old_path)):
+            return f"{old_path} vanishes or moves away: a name pytest reads"
+    return None
+
+
 def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     path = patch.path
     old_path = patch.old_path or path
     name = os.path.basename(path)
-    if name in _PYTEST_CONFIG:
+    if name in _PYTEST_CONFIG or os.path.basename(old_path) in _PYTEST_CONFIG:
         plan.select_all = True
         plan.note(f"pytest config {path}")
         return
-    if name in _MAYBE_PYTEST_CONFIG and "/" not in path:
+    maybe = [p for p in {path, old_path} if os.path.basename(p) in _MAYBE_PYTEST_CONFIG and _searched(p)]
+    if maybe:
         touched = "".join(
             row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-"
         ).lower()
         if "pytest" in touched or "unittest" in touched:
             plan.select_all = True
             plan.note(f"pytest config in {path}")
+        elif _config_may_break(patch, path, old_path):
+            plan.select_all = True
+            plan.note(f"{path}: pytest may not start, or may find configuration, with this file")
         else:
-            plan.note(f"{path}: packaging config, no test reads it")
+            plan.note(f"{path}: packaging config, pytest parses it and finds nothing")
         return
     if patch.old_text is None and patch.new_file:
         plan.needs_clean = True
@@ -398,6 +496,64 @@ def _analyze_data(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: s
         plan.redirects[os.path.join(root, path)] = patch.new_text
 
 
+# Text that can put a name into a module which no statement of it binds.
+_DYNAMIC_NAMES = ("import *", "__getattr__", "globals()", "locals()", "vars(", "setattr(", "__dict__", "exec(", "sys.modules")
+
+
+def _import_checker(root: str, plan: Plan):
+    """`import_ok(module, names)` for a new test file: False when the import is certain to fail.
+
+    pytest imports a new test file when it collects, and a file that cannot be imported is
+    an error before any test runs. Only what is certain is turned down, read off the
+    pinned tree: a module of sqlglot or of the tests for which there is no file, directory
+    or compiled module, and a name that the module's own source does not bind, when
+    nothing else could supply it (a submodule of that name, a star import, a module-level
+    `__getattr__` as in sqlglot.dialects and sqlglot.optimizer, code that writes into a
+    namespace). Whatever the patch itself touches is not judged, and neither is any other
+    package: nothing is imported here to find out.
+    """
+    touched = {name for patch in plan.files for name in (patch.old_path, patch.new_path) if name}
+
+    def supplied(base: str) -> bool:
+        """Something in the tree, or in the patch, can be the module at this path (no suffix)."""
+        absolute = os.path.join(root, base)
+        if os.path.isfile(absolute + ".py") or os.path.isdir(absolute):
+            return True
+        try:
+            entries = os.listdir(os.path.dirname(absolute))
+        except OSError:
+            entries = []
+        name = os.path.basename(base)
+        return any(entry.startswith(name + ".") for entry in entries) or any(
+            other.startswith((base + ".", base + "/")) for other in touched
+        )
+
+    def check(module: str, names) -> bool:
+        parts = module.split(".")
+        if parts[0] not in ("sqlglot", "tests"):
+            return True
+        if not all(supplied("/".join(parts[:depth])) for depth in range(1, len(parts) + 1)):
+            return False
+        if names is None:
+            return True
+        base = "/".join(parts)
+        source = base + "/__init__.py"
+        if not os.path.isfile(os.path.join(root, source)):
+            source = base + ".py"
+        if any(other.startswith((base + ".", base + "/")) for other in touched):
+            return True
+        text = _read(os.path.join(root, source))
+        if text is None or any(marker in text for marker in _DYNAMIC_NAMES):
+            return True
+        try:
+            bound = pydiff._bound_names(ast.parse(text).body)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return True
+        return all(name == "*" or name in bound or supplied(base + "/" + name) for name in names)
+
+    return check
+
+
 def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """A file that appears or vanishes changes what its directory lists.
 
@@ -414,7 +570,7 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
         and old_path == path
         and path.startswith("tests/")
         and (name.startswith("test_") or name.endswith("_test.py"))
-        and pydiff.harmless_new_test_module(patch.new_text or "")
+        and pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan))
     ):
         # pytest lists the directory but keeps only what its arguments name, and
         # nothing asks the import system for the new module: only this rule's
@@ -453,7 +609,21 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
         return
     if patch.old_text is None:
         return
+    if pydiff.edit_leaves_state(patch.old_text, patch.new_text or ""):
+        # The edit touches a store outside the locals, or code that runs as cleanup
+        # (tearDown, finally, addCleanup): what the test leaves behind, or no longer
+        # puts back, reaches the tests that run after it in the whole suite.
+        plan.select_all = True
+        plan.note(f"{path}: an edited line stores outside its locals or runs as cleanup")
+        return
     touched = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-")
+    if "pytest_plugins" in touched:
+        # pytest registers what this names as plugins when it imports the file as a
+        # test module or as a test package (the file itself, when it names itself):
+        # from then on their hooks and fixtures act on every test of the run.
+        plan.select_all = True
+        plan.note(f"{path}: pytest_plugins changed, what it names acts on every test")
+        return
     if _PYTEST_ONLY.search(touched):
         # Added or removed lines that speak to pytest (marks, skips, fixtures, the
         # hooks only it calls): only pytest sees them, so the tests of the file, or those that import it
@@ -528,6 +698,11 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.note(f"{path}: unchanged")
             continue
         try:
+            moved = _pytest_file_moves(plan, patch, path, old_path, root)
+            if moved:
+                plan.select_all = True
+                plan.note(moved)
+                continue
             _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
                 _test_file_rules(plan, patch, covmap)
@@ -537,4 +712,5 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
         except Exception as error:
             plan.select_all = True
             plan.note(f"{path}: analysis raised {error!r}")
+    pydiff.forget_trees()
     return plan

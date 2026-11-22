@@ -1,0 +1,12 @@
+diff --git a/tests/dialects/test_bigquery.py b/tests/dialects/test_bigquery.py
+--- a/tests/dialects/test_bigquery.py
++++ b/tests/dialects/test_bigquery.py
+@@ -3750,7 +3750,7 @@
+             qualified = qualify(ast.copy(), dialect="bigquery,normalization_strategy=uppercase")
+             self.assertEqual(qualified.sql("bigquery"), "SELECT * FROM `P`.`D`.`T` AS `T`")
+         finally:
+-            BigQuery.NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_INSENSITIVE_EXCEPT_TABLES
++            pass
+ 
+     def test_array(self):
+         for sql in (
