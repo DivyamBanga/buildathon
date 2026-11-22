@@ -1,0 +1,15 @@
+diff --git a/tests/dialects/test_dialect.py b/tests/dialects/test_dialect.py
+index 1111111..2222222 100644
+--- a/tests/dialects/test_dialect.py
++++ b/tests/dialects/test_dialect.py
+@@ -6133,6 +6133,10 @@
+         self.assertIsInstance(result.expressions[0], exp.Mul)
+         self.assertEqual(result.sql(), "SELECT 2 * 5")
+ 
++    def test_dialect_made_by_type(self):
++        made = type("MySQL", (Dialect,), {})
++        self.assertEqual(parse_one("SELECT 1").sql(dialect=made), "SELECT 1")
++
+     def test_agg(self):
+         expression = self.validate_identity("SELECT AGG(m), AGG(m) AS x, AGG(t.m) FROM t")
+         self.assertIsInstance(expression.selects[0], exp.Agg)
