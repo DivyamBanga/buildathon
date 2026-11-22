@@ -229,4 +229,28 @@ builtins.any = kept
 expect("a builtin replaced for everyone", changed, ["the builtins"])
 expect("and put back", state.outside_state(), before)
 
+# a filter or a handler on the package's logger or on the root: the tests that watch the log see other records
+import logging  # noqa: E402
+
+
+def drop(record):
+    return False
+
+
+for label, target, add, remove in (
+    ("a filter on the package's logger", logging.getLogger(state.PACKAGE), "addFilter", "removeFilter"),
+    ("a filter on the root logger", logging.root, "addFilter", "removeFilter"),
+):
+    getattr(target, add)(drop)
+    changed = [key for key, value in state.outside_state().items() if value != before[key]]
+    getattr(target, remove)(drop)
+    expect(label, changed, ["logging"])
+for label, target in (("a handler on the package's logger", logging.getLogger(state.PACKAGE)), ("a handler on the root logger", logging.root)):
+    handler = logging.NullHandler()
+    target.addHandler(handler)
+    changed = [key for key, value in state.outside_state().items() if value != before[key]]
+    target.removeHandler(handler)
+    expect(label, changed, ["logging"])
+expect("and all put back", state.outside_state(), before)
+
 print(f"{checks} checks passed")

@@ -233,7 +233,12 @@ def outside_state() -> dict:
         "recursion limit": sys.getrecursionlimit(),
         "environment": sorted(os.environ.items()),
         "warning filters": len(warnings.filters),
-        "logging": (logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate),
+        # Also how many filters and handlers the package's logger and the root have: a filter
+        # or a handler added at import decides which records the tests that watch the log get.
+        "logging": (
+            logging.root.level, logging.root.manager.disable, logger.level, logger.disabled, logger.propagate,
+            len(logger.filters), len(logger.handlers), len(logging.root.filters), len(logging.root.handlers),
+        ),
         "switch interval": sys.getswitchinterval(),
         # Every module finds the names it leaves to the builtins here.
         "the builtins": sorted((name, id(value)) for name, value in vars(builtins).items()),
