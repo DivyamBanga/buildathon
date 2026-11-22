@@ -85,6 +85,8 @@ ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 # state is still compared), run none of it, and say in the commit's notes how
 # it would be checked. Everything that would be run is selected.
 PLAN_ONLY = os.environ.get("BR_PLAN_ONLY", "") != ""
+# For experiments only: BR_FRONT=0 never takes a recorded result by the tree the optimizer is handed.
+FRONT_KEY = os.environ.get("BR_FRONT", "1") != "0"
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 # The lines of the executor phase that look a name up by a computed text or walk
@@ -817,7 +819,7 @@ class Coordinator:
                 if block is not None and (not any(block) or self.exec_queries):
                     job.memo_ok = True
                     job.memo_block = block
-                    job.front_block = front
+                    job.front_block = front if FRONT_KEY else None
         return job.memo_ok
 
     def memo_share(self, job: Job, bit: int) -> float:

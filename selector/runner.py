@@ -1459,8 +1459,11 @@ def install_executor_memo() -> None:
             return real_optimize(*args, **kwargs)
         if MEMO_PHASE is not None:
             MEMO_PHASE("L")
-        # The key is ours: worked out before the optimizer's window opens.
-        front = front_key(scope, args, kwargs)
+        # The key is ours: worked out before the optimizer's window opens, and
+        # only where it has a use (a record to find, or one to make).
+        front = None
+        if MEMO_RECORD is not None or (FRONT_BLOCK is not None and EXECUTOR_FRONT):
+            front = front_key(scope, args, kwargs)
         _FRONT_CALL["key"] = front
         if front is not None:
             try:
