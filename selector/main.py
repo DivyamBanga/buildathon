@@ -817,14 +817,20 @@ class Coordinator:
                     if block is None:
                         job.memo_why = "the patch touches what the class setup runs or reads"
                     # The optimizer too runs pinned code on pinned state wherever it runs no
-                    # changed line; not said for a module that is first imported in the child.
-                    front = None if block is None or job.plan.lazy else self.front_lines(job.plan.units)
+                    # changed line (a module imported on demand included: see lazy_ok).
+                    front = None if block is None else self.front_lines(job.plan.units)
                 else:
                     block, front = self.import_seen_by_executor(job)
                 if block is not None and (not any(block) or self.exec_queries):
                     job.memo_ok = True
                     job.memo_block = block
                     job.front_block = front if FRONT_KEY else None
+                if TRACE:
+                    log(
+                        f"    {job.plan.commit}: records {'on' if job.memo_ok else 'off'} ({job.mode}), "
+                        f"key before the optimizer {'off' if job.front_block is None else f'on, {job.front_block.bit_count()} of its lines changed'}"
+                        + (" (a module is imported on demand)" if job.plan.lazy else "")
+                    )
         return job.memo_ok
 
     def memo_share(self, job: Job, bit: int) -> float:
