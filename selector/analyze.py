@@ -645,7 +645,34 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
             plan.note(f"{entry}: appears in or vanishes from its directory, {found.bit_count()} tests list it or ask for its name")
 
 
-def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> None:
+_NEW_CLASS = re.compile(r"[+][ \t]*class[ \t]+([A-Za-z_][A-Za-z_0-9]*)")
+_registry_names_of: dict = {}
+
+
+def _registry_names(root: str) -> frozenset:
+    """The names under which the metaclass of Dialect files a class of the pinned tree, upper-cased:
+    the members of the enum `Dialects` and their values (`_Dialect.__new__` takes the member named
+    like the class in capitals, and its value as the key of the registry)."""
+    found = _registry_names_of.get(root)
+    if found is None:
+        names = set()
+        try:
+            with open(os.path.join(root, "sqlglot", "dialects", "dialect.py"), "rb") as handle:
+                tree = ast.parse(handle.read())
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == "Dialects":
+                    for statement in node.body:
+                        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Constant):
+                            names |= {target.id.upper() for target in statement.targets if isinstance(target, ast.Name)}
+                            if isinstance(statement.value.value, str):
+                                names.add(statement.value.value.upper())
+        except (OSError, SyntaxError, ValueError):
+            names = set()
+        found = _registry_names_of[root] = frozenset(names)
+    return found
+
+
+def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """Rules for a Python file under tests/ that no run of one test can settle.
 
     The runner executes tests with unittest in one forked child each, while the
@@ -655,6 +682,21 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
     old_path = patch.old_path or path
     if not (path.startswith("tests/") or old_path.startswith("tests/")):
         return
+    registry = _registry_names(root)
+    if patch.old_text is None or old_path != path:
+        # The file arrives (new or moved in): every line of it is new here.
+        rows = ["+" + line for line in (patch.new_text or "").splitlines()]
+    else:
+        rows = [row for hunk in patch.hunks for row in hunk[4]]
+    for row in rows:
+        found = _NEW_CLASS.match(row)
+        if found and found.group(1).upper() in registry:
+            # A subclass of Dialect is filed under its own name when the class statement
+            # runs, wherever that is (a test body, setUp, a helper): one named like a
+            # built-in dialect takes that dialect's place for every test that runs later.
+            plan.select_all = True
+            plan.note(f"{path}: a new class named {found.group(1)}, the name of a built-in dialect in the registry")
+            return
     if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
         # A new or changed statement that stores into a class, a module or a
         # registry: in the whole suite it reaches tests of other files.
@@ -762,7 +804,7 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
                 continue
             _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
-                _test_file_rules(plan, patch, covmap)
+                _test_file_rules(plan, patch, covmap, root)
                 _analyze_python(plan, patch, covmap, root, loaded)
             else:
                 _analyze_data(plan, patch, covmap, root)

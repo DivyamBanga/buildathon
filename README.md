@@ -96,7 +96,13 @@ the patched code**, and selects the ones that fail.
    tests that reads as a class (`Validator`). A name nothing binds, or a base
    defined further down, fails the whole file when it is imported; a class of
    sqlglot may register the subclass; two bases may have no consistent method
-   resolution order. Otherwise the file
+   resolution order. Inside a test, a helper or `setUp` a class statement is
+   not judged that way (the tests of the pinned commit define their own
+   dialects and expressions there), with one exception: an added class
+   statement anywhere under `tests/` whose name is that of a built-in dialect
+   (a member of the enum `Dialects`, in any case) selects every test, since
+   the metaclass of `Dialect` files a subclass under its name and the new one
+   would stand in for the built-in dialect in every later test. Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
    A new test file must in addition hold no import that is certain to fail,
    or it selects every test: a module of sqlglot or of the tests for which the
