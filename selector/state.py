@@ -19,6 +19,7 @@ how to compare are reported as a difference.
 from __future__ import annotations
 
 import builtins
+import collections
 import enum
 import functools
 import importlib
@@ -73,6 +74,11 @@ _TYPED_DICT_NOISE = frozenset(
     ("__total__", "__required_keys__", "__optional_keys__", "__readonly_keys__", "__mutable_keys__")
 )
 _PLAIN = (int, float, complex, str, bytes, bool, type(None), type(Ellipsis), type(NotImplemented))
+# Values that are changed in place: two names that hold ONE such object see each other's changes, two
+# names that hold equal copies do not (Comparer.sharing).
+_CHANGED_IN_PLACE = frozenset(
+    {dict, list, set, bytearray, collections.OrderedDict, collections.defaultdict, collections.Counter, collections.deque}
+)
 _BUILTIN_CALLABLES = (
     types.BuiltinFunctionType,
     types.MethodDescriptorType,
@@ -468,6 +474,15 @@ class Comparer:
         self.strict = False  # inside an attribute whose tables have a fixed order
         self.explain = False  # offline: remember where two values first differed
         self.why = ""
+        # Which object of the patched package stands where which object of the pinned one stands (sharing):
+        # id of the pinned one -> id of the patched one, and the other way round. The objects are parts of
+        # the two packages, which outlive the comparison, so an id keeps its meaning.
+        self.shared_old: dict = {}
+        self.shared_new: dict = {}
+        self.named_old: dict = {}  # id of a table that a module or class holds under a name -> that place
+        self.named_new: dict = {}
+        self.unshared = ""  # the first two places found to share differently
+        self.place = None  # the name being compared: (owner, attribute)
 
     # ---- reporting -------------------------------------------------------
 
@@ -544,6 +559,8 @@ class Comparer:
 
     def same(self, a, b) -> bool:
         if a is b:
+            if type(a) in _CHANGED_IN_PLACE:
+                self._pair(a, b)
             return True
         ta, tb = type(a), type(b)
         if ta is not tb and not self.same(ta, tb):
@@ -580,6 +597,8 @@ class Comparer:
             self.memo[key] = result
             self.keep.append((a, b))
         self.low = min(outer, self.low)
+        if result and ta in _CHANGED_IN_PLACE:
+            self._pair(a, b)
         return result
 
     def _pairs(self, items_a, items_b) -> bool:
@@ -910,6 +929,11 @@ class Comparer:
                 self.report(owner, key, "added" if added else "removed", shape=shape + ("F" if foreign else ""))
                 continue
             value_a, value_b = a[key], b[key]
+            self.place = (owner, key)
+            if type(value_a) in _CHANGED_IN_PLACE and type(value_b) in _CHANGED_IN_PLACE:
+                self.named_old.setdefault(id(value_a), self.place)
+                self.named_new.setdefault(id(value_b), self.place)
+                self._pair(value_a, value_b)  # under a name: whatever the two contain
             if value_a is value_b:
                 continue
             if (
@@ -944,6 +968,43 @@ class Comparer:
             owner, dict(vars(a)), dict(vars(b)), module_name, a.__qualname__ + ".", noise,
             self._foreign(a) or self._foreign(b),
         )
+
+    def _pair(self, a, b) -> None:
+        """Note that the patched package has `b` where the pinned one has `a` (both can be changed in place)."""
+        old, new = id(a), id(b)
+        there = self.shared_old.setdefault(old, new)
+        back = self.shared_new.setdefault(new, old)
+        if (there != new or back != old) and not self.unshared:
+            places = {
+                self.place,
+                self.named_old.get(old),
+                self.named_new.get(new),
+                self.named_new.get(there),
+                self.named_old.get(back),
+            }
+            # as module:Class.attribute
+            names = sorted(f"{owner[1]}:{owner[2]}.{key}" for owner, key in (place for place in places if place))
+            self.unshared = " / ".join(names[:2]) or "?"
+
+    def sharing(self) -> str:
+        """"" when the two packages share their tables alike, else two places where they do not.
+
+        The comparison is by content, and a table that one module copies (`ENV = dict(ENV)`) has the
+        content of the one it copied. But a change made in place through one name (mock.patch.dict, an
+        entry set and deleted again, an entry a parser adds while it runs) is seen through every other
+        name of the same object and through no name of a copy. So the dicts, lists, sets and bytearrays
+        of the two packages are paired off as the comparison meets them, and one object of the pinned
+        package must stand where exactly one object of the patched package stands, and the other way
+        round.
+
+        What a module or a class holds under a name is paired whatever it contains: an equal copy under
+        one name and a changed table under another are a difference of sharing as well, and the row of
+        the changed table names the readers of its changed entries only. Containers inside values (a
+        default, a closure, a table in a table) are paired where they were found equal, which is as far
+        as the comparison walks. An object that both packages hold (it is not of the package) pairs
+        with itself. Call after run().
+        """
+        return self.unshared
 
     def run(self) -> list:
         for name in list(self.old) + [name for name in self.new if name not in self.old]:
@@ -1157,6 +1218,12 @@ def compare_trees(old_root: str, new_root: str, loaded: list[str]) -> dict:
     if len(result["differences"]) > MAX_DIFFERENCES:
         result["inconclusive"] = f"{len(result['differences'])} differences"
         result["differences"] = []
+    if not result["inconclusive"]:
+        places = comparer.sharing()
+        if places:
+            # Equal content says nothing about who sees a change made in place.
+            result["inconclusive"] = f"tables are shared differently ({places})"
+            result["differences"] = []
     clock.append(time.process_time())
     result["cpu"] = [round(later - earlier, 2) for earlier, later in zip(clock, clock[1:])]
     return result

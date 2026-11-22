@@ -188,6 +188,16 @@ the patched code**, and selects the ones that fail.
    closures; tables entry by entry; classes attribute by attribute). What comes
    out is the list of (module or class, attribute) pairs that differ, including
    whatever sqlglot itself derived from the changed value while importing.
+   Equal content is not everything two states can differ in: a table that
+   one module copies (`ENV = dict(ENV)`) has the content of the table it
+   copied, but a test that changes the table in place through one name is
+   no longer seen through the other. So the dicts, lists and sets of the two
+   packages are also paired off as they are met (always for what a module
+   or class holds under a name, and where they compare equal inside
+   defaults, closures and other tables): one object of the pinned package
+   must stand where exactly one of the patched package stands, and the other
+   way round. If not, the comparison is inconclusive and the commit keeps
+   the candidates of its plan (`Comparer.sharing`).
    The comparison is also run for a commit that needs a fresh import and has
    an executor test with recorded results (step 5) among its candidates: for
    instance an edit to the body of a parse function that sqlglot itself calls
