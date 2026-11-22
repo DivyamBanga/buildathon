@@ -87,6 +87,8 @@ ALWAYS_CHECK = os.environ.get("BR_ALWAYS_CHECK", "") != ""
 PLAN_ONLY = os.environ.get("BR_PLAN_ONLY", "") != ""
 # For experiments only: BR_FRONT=0 never takes a recorded result by the tree the optimizer is handed.
 FRONT_KEY = os.environ.get("BR_FRONT", "1") != "0"
+# For experiments only: BR_ONLY=text leaves only the candidates whose id holds that text (the rest count as not there).
+ONLY = os.environ.get("BR_ONLY", "")
 TRACE = os.environ.get("BR_TRACE", "") != ""
 FIXTURES = "tests/fixtures/"
 # The lines of the executor phase that look a name up by a computed text or walk
@@ -462,6 +464,9 @@ class Coordinator:
             for bit in self.covmap.bits(plan.import_check & ~plan.candidates)
             if self.bit_number[bit] >= 0
         ]
+        if ONLY:
+            bits = [bit for bit in bits if ONLY in self.covmap.ids[bit]]
+            importers = []
         if not bits and not importers:
             self.finish(plan, set())
             return
@@ -1280,6 +1285,8 @@ class Coordinator:
             for bit in self.covmap.bits(plan.candidates & ~plan.unverified)
             if self.bit_number[bit] >= 0
         ]
+        if ONLY:
+            bits = [bit for bit in bits if ONLY in self.covmap.ids[bit]]
         if not bits and not job.import_files:
             self.finish(plan, set())
             return
