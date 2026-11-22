@@ -559,16 +559,24 @@ def _import_checker(root: str, plan: Plan):
 _CODE_SUFFIXES = (".py", ".pyi", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".pth", ".zip", ".whl", ".egg")
 
 
+_DISTRIBUTION_SUFFIXES = (".dist-info", ".egg-info", ".egg-link", ".egg")
+
+
 def _inert_binary(path: str) -> bool:
     name = os.path.basename(path)
+    parts = path.split("/")
     return (
         not name.endswith(_CODE_SUFFIXES)
         and ".so." not in name
         and name not in _PYTEST_CONFIG
         and name not in _MAYBE_PYTEST_CONFIG
-        and "__pycache__" not in path.split("/")
+        and "__pycache__" not in parts
+        # nothing inside the package: what ships with it may be loaded in ways no map records
+        and parts[0] != "sqlglot"
+        # a distribution's metadata is read by importlib.metadata for every test
+        and not any(part.lower().endswith(_DISTRIBUTION_SUFFIXES) for part in parts)
         # pytest collects tests/**/test*.txt as doctest files and stops on one it cannot read
-        and not (path.startswith("tests/") and fnmatch.fnmatch(name, "test*.txt"))
+        and not (parts[0] == "tests" and fnmatch.fnmatch(name, "test*.txt"))
     )
 
 

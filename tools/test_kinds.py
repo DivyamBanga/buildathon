@@ -697,11 +697,29 @@ def binary_patch(path, new=True):
 
 plan = plan_for(binary_patch("tests/fixtures/zz_logo.png"))
 expect("P: a new image nobody lists", (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
-for path in ("docs/logo.png", "sqlglot.png", "posts/zz.jpg", "tests/fixtures/notes.bin", "sqlglot/zz.dat"):
+for path in ("docs/logo.png", "sqlglot.png", "posts/zz.jpg", "tests/fixtures/notes.bin"):
     plan = plan_for(binary_patch(path))
     expect("P: a new binary file that is not code: " + path, (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
-plan = plan_for(binary_patch("zz.dist-info/RECORD"))
-expect("P: a binary file in a new dist-info at the root counts like a text one", plan.candidates, covmap.all)
+for path in ("sqlglot/zz.dat", "sqlglot/dialects/zz.png", "zz.dist-info/RECORD", "tests/zz.egg-info/PKG-INFO", "docs/zz.egg"):
+    plan = plan_for(binary_patch(path))
+    expect("P: a binary file in the package or of a distribution: " + path, plan.select_all, True)
+# the main session's seeds, made with `git diff --binary` against the pinned tree
+EXECUTOR = covmap.tests_of_file("tests/test_executor.py")
+for name, want in (("P_bin_new", 0), ("P_bin_edit", 0), ("P_bin_mixed", 0), ("P_bin_gz", EXECUTOR), ("P_bin_gz_same", EXECUTOR)):
+    plan = seed(name)
+    expect("seed " + name, (plan.select_all, plan.candidates, plan.unverified), (False, want, want))
+gone = (
+    "diff --git a/posts/onboarding_images/lineage_img.png b/posts/onboarding_images/lineage_img.png\n"
+    "deleted file mode 100644\nindex 1234567..0000000\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n"
+)
+plan = plan_for(gone)
+expect("P: an image deleted", (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+# every table file of the two TPC directories is read by the class setup of the executor tests (DuckDB reads it
+# itself, which no audit hook sees): the map must name every test of that class for each of them
+for directory in ("tests/fixtures/optimizer/tpc-h", "tests/fixtures/optimizer/tpc-ds"):
+    for file_name in sorted(os.listdir(os.path.join(ROOT, directory))):
+        if file_name.endswith(".csv.gz"):
+            expect("P: readers of " + directory + "/" + file_name, (covmap.opened(directory + "/" + file_name) or 0) & EXECUTOR, EXECUTOR)
 opened_paths = sorted(p for p in covmap._opens if not p.endswith((".py", ".pyc", ".so")) and "__pycache__" not in p)
 if opened_paths:
     path = opened_paths[0]
