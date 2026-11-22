@@ -1,0 +1,104 @@
+{
+ "conftest_rename_badimport.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ImportError while loading conftest '/tmp/gt-work/tests/conftest.py'. tests/conftest.py:1: in <module> import no_such_module_for_conftest E ModuleNotFoundError: No module named 'no_such_module_for_conftest'"
+ },
+ "conftest_rename_fixture.patch": {
+  "select": "all",
+  "exit": 1,
+  "failing": 1616,
+  "pytest": "1617 errors in 22.66s; every collected test fails in setup (RuntimeError from the autouse fixture), one of them the test the labeling environment skips, which has no number"
+ },
+ "conftest_rename_hook.patch": {
+  "select": "all",
+  "exit": 1,
+  "failing": 1616,
+  "pytest": "27046 failed, 1 skipped in 160.76s (0:02:40); every numbered test fails (the hook of the new conftest.py)"
+ },
+ "conftest_rename_plain.patch": {
+  "select": "all",
+  "exit": 0,
+  "failing": 0,
+  "pytest": "1616 passed, 1 skipped, 25430 subtests passed in 272.60s (0:04:32); no test fails, the four tests of tests/test_helper.py are no longer collected"
+ },
+ "conftest_rename_reverse.patch": {
+  "select": "all",
+  "exit": 1,
+  "failing": 2,
+  "pytest": "4 failed, 1615 passed, 1 skipped, 25427 subtests passed in 137.92s (0:02:17); the hook reverses the order of the tests and two of them depend on it (TestDialect::test_enum, TestStarrocks::test_time_slice_origin_roundtrip)"
+ },
+ "ok_pyproject_version.patch": {
+  "select": "none",
+  "exit": 0,
+  "failing": 0,
+  "pytest": "1620 passed, 1 skipped, 25440 subtests passed in 635.13s (0:10:35)"
+ },
+ "ok_setupcfg_header_continuation.patch": {
+  "select": "none",
+  "exit": 0,
+  "failing": 0,
+  "pytest": "1620 passed, 1 skipped, 25440 subtests passed in 137.19s (0:02:17)"
+ },
+ "ok_setupcfg_mypy.patch": {
+  "select": "none",
+  "exit": 0,
+  "failing": 0,
+  "pytest": "1620 passed, 1 skipped, 25440 subtests passed in 138.14s (0:02:18)"
+ },
+ "pyproject_badquote.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Illegal character '\\n' (at line 7, column 16)"
+ },
+ "pyproject_bracket.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Unclosed array (at line 27, column 1)"
+ },
+ "pyproject_broken.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Expected ']' at the end of a table declaration (at line 1, column 9)"
+ },
+ "pyproject_dupkey.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Cannot overwrite a value (at line 3, column 17)"
+ },
+ "pyproject_duptable.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Cannot declare ('project',) twice (at line 19, column 9)"
+ },
+ "pyproject_quote.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/pyproject.toml: Illegal character '\\n' (at line 5, column 20)"
+ },
+ "setupcfg_broken.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/setup.cfg:3: unexpected line: 'no_implicit_optional'"
+ },
+ "setupcfg_header.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/setup.cfg:1: unexpected value continuation"
+ },
+ "setupcfg_header_dup.patch": {
+  "select": "all",
+  "exit": 4,
+  "failing": null,
+  "pytest": "nothing ran: ERROR: /tmp/gt-work/setup.cfg:12: duplicate name 'ignore_errors'"
+ }
+}

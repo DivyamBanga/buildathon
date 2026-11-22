@@ -1,0 +1,10 @@
+diff --git a/tests/dialects/__init__.py b/tests/dialects/__init__.py
+index e69de29..58dd816 100644
+--- a/tests/dialects/__init__.py
++++ b/tests/dialects/__init__.py
+@@ -0,0 +1,5 @@
++pytest_plugins = ["tests.dialects"]
++
++
++def pytest_runtest_setup(item):
++    raise RuntimeError("hook of a test package that names itself in pytest_plugins")

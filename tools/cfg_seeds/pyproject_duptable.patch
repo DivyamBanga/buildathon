@@ -1,0 +1,13 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 949ece8..353ee4a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -16,7 +16,7 @@ classifiers = [
+     "Programming Language :: Python :: 3 :: Only",
+ ]
+ 
+-[project.urls]
++[project]
+ Homepage = "https://sqlglot.com/"
+ Documentation = "https://sqlglot.com/sqlglot.html"
+ Repository = "https://github.com/tobymao/sqlglot"

@@ -627,6 +627,13 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
         plan.note(f"{path}: an edited line stores outside its locals or runs as cleanup")
         return
     touched = "".join(row for hunk in patch.hunks for row in hunk[4] if row[:1] in "+-")
+    if "pytest_plugins" in touched:
+        # pytest registers what this names as plugins when it imports the file as a
+        # test module or as a test package (the file itself, when it names itself):
+        # from then on their hooks and fixtures act on every test of the run.
+        plan.select_all = True
+        plan.note(f"{path}: pytest_plugins changed, what it names acts on every test")
+        return
     if _PYTEST_ONLY.search(touched):
         # Added or removed lines that speak to pytest (marks, skips, fixtures, the
         # hooks only it calls): only pytest sees them, so the tests of the file, or those that import it
