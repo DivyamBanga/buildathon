@@ -755,7 +755,11 @@ def new_global_effects(old_text: str, new_text: str) -> bool:
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     old_found = Counter(_global_effects(old_tree)) if old_tree is not None else Counter()
-    new_found = Counter(_global_effects(new_tree))
+    # A module-level `NAME = re.compile("...")` is named like the builtin that runs
+    # text, but it only builds a pattern (see _harmless_constant).
+    regex = _binds_re_module(new_tree)
+    kept = [s for s in new_tree.body if not (isinstance(s, ast.Assign) and _harmless_constant(s, regex))]
+    new_found = Counter(_global_effects(ast.Module(body=kept, type_ignores=[])))
     return any(count > old_found[signature] for signature, count in new_found.items())
 
 
@@ -1050,6 +1054,112 @@ def _importable_bases(module_body: list, statement) -> bool:
     return False  # not a statement of the module itself
 
 
+def _hashable_literal(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = getattr(node.operand, "value", None)
+        return isinstance(node.operand, ast.Constant) and isinstance(value, (int, float, complex)) and not isinstance(value, bool)
+    if isinstance(node, ast.Tuple):
+        return all(_hashable_literal(item) for item in node.elts)
+    return False
+
+
+def _literal(node) -> bool:
+    """A value that is built without calling anything: a constant, or a tuple,
+    list, set or dict of such (set members and dict keys hashable, no unpacking)."""
+    if _hashable_literal(node):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return all(_literal(item) for item in node.elts)
+    if isinstance(node, ast.Set):
+        return all(_hashable_literal(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and _hashable_literal(key) for key in node.keys) and all(
+            _literal(value) for value in node.values
+        )
+    return False
+
+
+def _regex_flags(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, int) and not isinstance(node.value, bool)
+    if isinstance(node, ast.Attribute):
+        return isinstance(node.value, ast.Name) and node.value.id == "re" and node.attr.isupper()
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _regex_flags(node.left) and _regex_flags(node.right)
+    return False
+
+
+def _regex_literal(node) -> bool:
+    """`re.compile` of a constant pattern, with constant flags at most."""
+    if not isinstance(node, ast.Call):
+        return False
+    callee = node.func
+    if not (
+        isinstance(callee, ast.Attribute)
+        and callee.attr == "compile"
+        and isinstance(callee.value, ast.Name)
+        and callee.value.id == "re"
+    ):
+        return False
+    if not 1 <= len(node.args) <= 2 or any(keyword.arg != "flags" for keyword in node.keywords):
+        return False
+    pattern = node.args[0]
+    if not isinstance(pattern, ast.Constant) or not isinstance(pattern.value, (str, bytes)):
+        return False
+    flags = list(node.args[1:]) + [keyword.value for keyword in node.keywords]
+    return len(flags) <= 1 and all(_regex_flags(flag) for flag in flags)
+
+
+def _binds_re_module(tree) -> bool:
+    """True when the name `re` is bound in the module by `import re` and by nothing else."""
+    imported = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "re" and alias.asname in (None, "re"):
+                    imported = True
+                elif (alias.asname or alias.name.split(".")[0]) == "re":
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if any((alias.asname or alias.name) in ("re", "*") for alias in node.names):
+                return False
+        elif isinstance(node, ast.Name) and node.id == "re" and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return False
+        elif isinstance(node, ast.arg) and node.arg == "re":
+            return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "re":
+            return False
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and "re" in node.names:
+            return False
+        elif isinstance(node, ast.ExceptHandler) and node.name == "re":
+            return False
+    return imported
+
+
+# Names a test module must not gain as plain constants: pytest and unittest read them.
+_MODULE_READ_BY_RUNNERS = _MODULE_HOOKS + ("pytest", "collect", "load_tests")
+
+
+def _harmless_constant(statement, regex: bool) -> bool:
+    """`NAME = value` at the top of a test module, where building the value can
+    do nothing but give a value: a constant, a tuple, list, set or dict of
+    constants, or (when `regex`: the module's `re` is the standard one)
+    `re.compile` of a constant pattern. At worst it raises, and then only this
+    file cannot be imported. Not under a name pytest or unittest reads from a
+    module, nor a dunder."""
+    if not isinstance(statement, ast.Assign):
+        return False
+    for target in statement.targets:
+        if not isinstance(target, ast.Name):
+            return False
+        name = target.id
+        if name.startswith("__") or name.lower().startswith(_MODULE_READ_BY_RUNNERS):
+            return False
+    return _literal(statement.value) or (regex and _regex_literal(statement.value))
+
+
 def _only_new_definitions(old_body: list, new_body: list, known: set, prefix: str, taken: tuple, module=None) -> bool:
     """`module`: the whole body of the new module when `new_body` leaves part of it out."""
     import unittest
@@ -1115,12 +1225,15 @@ def harmless_new_test_module(text: str, import_ok=None) -> bool:
     pytest imports every test file it finds, so a new one runs at collection.
     This accepts a file made of imports of the standard library, of sqlglot,
     of the existing tests or of the installed test tools, plus plain classes
-    and functions. Importing those modules does nothing a test file of the
-    pinned commit does not already do, and defining classes and functions does
-    nothing at all. Anything else at module level could change what the
-    existing tests see. `import_ok(module, names)` (names None for `import
-    module`) is asked about every import and says False for one that is certain
-    to fail: a file that cannot be imported is not one that only adds tests.
+    and functions, and module-level constants (`NAME = value` with a value
+    built without calling anything, or `re.compile` of a constant pattern:
+    see _harmless_constant). Importing those modules does nothing a test file
+    of the pinned commit does not already do, and defining classes, functions
+    and constants does nothing to anything else. Anything else at module level
+    could change what the existing tests see. `import_ok(module, names)` (names
+    None for `import module`) is asked about every import and says False for one
+    that is certain to fail: a file that cannot be imported is not one that only
+    adds tests.
     """
     import sys
 
@@ -1128,9 +1241,12 @@ def harmless_new_test_module(text: str, import_ok=None) -> bool:
         tree = _parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
+    regex = _binds_re_module(tree)
     body = []
     for statement in tree.body:
         if _is_docstring(statement) or isinstance(statement, ast.Pass):
+            continue
+        if _harmless_constant(statement, regex):
             continue
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             if isinstance(statement, ast.ImportFrom):

@@ -104,6 +104,66 @@ expect("E: harmless new module with a store", pydiff.harmless_new_test_module(
 expect("E: harmless new module", pydiff.harmless_new_test_module(
     "import os\n\n\ndef test_a():\n    x = os.sep\n    assert x\n"), True)
 
+# module-level constants of a new test file: values built without calling anything, and re.compile of a constant
+NEW_FILE = "import re\nimport unittest\n\n{}\n\n\nclass TestZ(unittest.TestCase):\n    def test_a(self):\n        self.assertTrue(True)\n"
+for label, constant, want in (
+    ("a number", "LIMIT = 3", True),
+    ("a negative number", "LIMIT = -3", True),
+    ("a string", "SQL = 'SELECT 1'", True),
+    ("None", "CACHE = None", True),
+    ("two names", "A = B = 'x'", True),
+    ("a tuple of constants", "CASES = ('a', 1, (2.5, None))", True),
+    ("a list of tuples", "CASES = [('a', 'b'), ('c', 'd')]", True),
+    ("a dict of lists", "TABLE = {'a': [1, 2], ('b', 1): {'c': None}}", True),
+    ("a set", "NAMES = {'a', 'b'}", True),
+    ("a compiled pattern", "ATOM = re.compile(r'%(?:[mdHIMS]strict|[-:].|[\\w%])')", True),
+    ("a compiled pattern with flags", "ATOM = re.compile('a', re.I | re.M)", True),
+    ("a compiled pattern with a flags keyword", "ATOM = re.compile('a', flags=re.DOTALL)", True),
+    ("a call", "VALUE = sorted([2, 1])", False),
+    ("a call inside a list", "VALUE = [len('a')]", False),
+    ("a name", "VALUE = unittest", False),
+    ("an attribute", "VALUE = unittest.TestCase", False),
+    ("a binary operation", "VALUE = 'a' * 3", False),
+    ("an f-string", "VALUE = f'{unittest}'", False),
+    ("unpacking in a list", "VALUE = [*'ab']", False),
+    ("unpacking in a dict", "VALUE = {**{}}", False),
+    ("an unhashable key", "VALUE = {[1]: 2}", False),
+    ("an unhashable member", "VALUE = {[1]}", False),
+    ("a comprehension", "VALUE = [i for i in (1, 2)]", False),
+    ("a lambda", "VALUE = lambda: 1", False),
+    ("a pattern from a name", "ATOM = re.compile(unittest.__name__)", False),
+    ("a pattern with a called flag", "ATOM = re.compile('a', int('2'))", False),
+    ("another function of re", "ATOM = re.sub('a', 'b', 'c')", False),
+    ("an attribute target", "unittest.TestCase.maxDiff = None", False),
+    ("a subscript target", "re.__dict__['x'] = 1", False),
+    ("a tuple target", "A, B = 1, 2", False),
+    ("an annotated constant", "LIMIT: int = 3", False),
+    ("an augmented assignment", "LIMIT = 1\nLIMIT += 1", False),
+    ("a name pytest reads", "pytest_plugins = ['tests.helpers']", False),
+    ("pytestmark", "pytestmark = 'slow'", False),
+    ("a dunder", "__test__ = False", False),
+    ("a hook name", "setup_module = None", False),
+    ("collect_ignore", "collect_ignore = ['x.py']", False),
+    ("load_tests", "load_tests = None", False),
+):
+    expect(f"E: new test file with {label}", pydiff.harmless_new_test_module(NEW_FILE.format(constant)), want)
+    # the stores rule still flags a store outside the module's own names, and a `compile` call that is not the exempted form
+    flagged = label in ("an attribute target", "a subscript target", "a pattern from a name", "a pattern with a called flag")
+    expect(f"E: new test file with {label}: stores rule", pydiff.new_global_effects("", NEW_FILE.format(constant)), flagged)
+# `re` must be the standard module, bound by `import re` and nothing else
+for label, text, want in (
+    ("re imported from elsewhere", "from tests import helpers as re\n\nATOM = re.compile('a')\n", False),
+    ("re rebound", "import re\n\nATOM = re.compile('a')\nre = None\n", False),
+    ("re as a parameter", "import re\n\nATOM = re.compile('a')\n\n\ndef helper(re):\n    return re\n", False),
+    ("re under another name", "import re as regex\n\nATOM = regex.compile('a')\n", False),
+    ("no import of re", "ATOM = re.compile('a')\n", False),
+    ("plain", "import re\n\nATOM = re.compile('a')\n", True),
+):
+    expect(f"E: new test file, {label}", pydiff.harmless_new_test_module(text), want)
+    expect(f"E: new test file, {label}: stores rule", pydiff.new_global_effects("", text), not want)
+# inside a function the stores rule is as strict as before
+expect("E: re.compile inside a new test", effects(TESTS + METHOD.format("        import re\n        x = re.compile('a')")), True)
+
 # calls and tricks that change shared state without a store statement
 for label, body in (
     ("clear on a class table", "import sqlglot\nsqlglot.Parser.FUNCTIONS.clear()"),
