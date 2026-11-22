@@ -98,11 +98,23 @@ the patched code**, and selects the ones that fail.
    sqlglot may register the subclass; two bases may have no consistent method
    resolution order. Inside a test, a helper or `setUp` a class statement is
    not judged that way (the tests of the pinned commit define their own
-   dialects and expressions there), with one exception: an added class
-   statement anywhere under `tests/` whose name is that of a built-in dialect
-   (a member of the enum `Dialects`, in any case) selects every test, since
-   the metaclass of `Dialect` files a subclass under its name and the new one
-   would stand in for the built-in dialect in every later test. Otherwise the file
+   dialects and expressions there), with one exception, the dialect registry.
+   The metaclass of `Dialect` files every subclass in a registry the whole
+   process shares, under the member of the enum `Dialects` named like the
+   class or else under the class name in lower case, when the class is made.
+   Whoever asks for that name later in the suite gets the new class: the tests
+   of a built-in dialect (also one that is no member of the enum:
+   `SingleStore`), a test that expects a name to be unknown. So a class that
+   new test code makes, anywhere under `tests/`, selects every test unless its
+   bases rule the metaclass out (`pydiff.filed_class`): no bases,
+   `TestCase`, `Validator`, an expression class of the package, a class of
+   the same file of which that holds; a base that nothing binds is the rule
+   above. A class made by a call counts the same (`type(name, bases, ns)`
+   under any name, `types.new_class`, the metaclass called through a class),
+   judged by its bases when they are written out. A class statement named like
+   a built-in dialect selects every test whatever its bases. A review found
+   the two shapes this replaced a narrower rule for (seeds
+   `K_dialect_class_*`). Otherwise the file
    counts as changed, and its own tests run as for any edited test file.
    A new test file must in addition hold no import that is certain to fail,
    or it selects every test: a module of sqlglot or of the tests for which the
@@ -367,7 +379,15 @@ the patched code**, and selects the ones that fail.
 
    A test that opens the changed file as text (`maps/sources.json`: the one
    that parses the `sqlglot/typing` modules) sees an added import or
-   definition whether or not anything reads the name. Such tests are
+   definition whether or not anything reads the name. The same test compares
+   the code objects of the annotators of every typing module with those of
+   the module it inherits from (`__code__`: instructions, names, constants),
+   without running them, so a one-token edit inside a lambda of
+   `sqlglot/typing/__init__.py` can fail it although it never executes that
+   lambda (found by a review: one argument removed from the base `Lag`
+   annotator makes MySQL's entry a duplicate). That module is the one the
+   test does not open, so the map lists the test for it by a reviewed entry
+   (`tools/build_sources.py` `CODE_READERS`; no other test reads `__code__`). Such tests are
    candidates of every change to the file's text and are never among what the
    comparison narrows (`Plan.rest_candidates`); `state_candidates` names them
    again for a difference it drops as unread. Seed: `B_typing_alias` (an

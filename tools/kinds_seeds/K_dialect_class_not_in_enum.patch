@@ -1,0 +1,18 @@
+diff --git a/tests/dialects/test_redshift.py b/tests/dialects/test_redshift.py
+--- a/tests/dialects/test_redshift.py
++++ b/tests/dialects/test_redshift.py
+@@ -6,6 +6,14 @@
+ 
+ class TestRedshift(Validator):
+     dialect = "redshift"
++
++    def test_custom_dialect_registration(self):
++        from sqlglot.dialects.dialect import Dialect
++
++        class SingleStore(Dialect):
++            pass
++
++        self.assertIs(Dialect.get("singlestore"), SingleStore)
+ 
+     def test_star_except(self):
+         expression = parse_one("SELECT * EXCEPT (a) FROM t", read="bigquery")

@@ -766,6 +766,179 @@ def new_global_effects(old_text: str, new_text: str) -> bool:
     return any(count > old_found[signature] for signature, count in new_found.items())
 
 
+# Bases that cannot put a class of a test file under the metaclass of Dialect: unittest's
+# TestCase and the tests' own Validator (tests/dialects/test_dialect.py), which derives from it.
+_PLAIN_BASES = frozenset(("TestCase", "IsolatedAsyncioTestCase", "Validator", "object"))
+
+
+def filed_class(old_text: str | None, new_text: str, expressions: frozenset) -> str:
+    """A class that the new text of a test file makes and the old one did not (a class statement
+    in that place with those bases, or a call that makes a class) and that may get the metaclass
+    of Dialect: "Name(base)" or the call, for the first one; "" when there is none.
+
+    The metaclass files every subclass of Dialect in a registry that the whole process shares,
+    under the value of the member of `Dialects` named like the class or else under the class
+    name in lower case, when the class is made (a test body, setUp, a helper, the module).
+    Whoever asks the registry for that name later gets the new class: every test of a built-in
+    dialect that is no member of the enum (SingleStore), a test that expects a name to be
+    unknown. A new class is therefore harmless only when its bases rule the metaclass out: no
+    bases, unittest's TestCase, the tests' Validator, an expression class of the package
+    (`expressions`, their names: none is the name of a dialect, tools/test_kinds.py), or a
+    class of the same file of which that holds. Any other base (Dialect, a dialect, a parser
+    class, a name bound some other way, a call) and any keyword (metaclass=) may file it.
+
+    A class is also made by a call: `type(name, bases, namespace)` under any name, computed or
+    not, `types.new_class`, the metaclass reached through a class (`type(Dialect)(...)`,
+    `X.__class__(...)`, `__new__` or `__call__` with a name, bases and a namespace) or by its
+    own name. Such a call that is new is harmless when its bases are written out as a tuple of
+    harmless bases, and may file a class otherwise.
+    """
+    try:
+        new_tree = _parse(new_text)
+        old_tree = _parse(old_text) if old_text else None
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return ""
+
+    def making(call) -> bool:
+        """True for a call that can make a class."""
+        func = call.func
+        spread = any(isinstance(arg, ast.Starred) for arg in call.args) or any(k.arg is None for k in call.keywords)
+        if isinstance(func, ast.Name) and func.id == "type":
+            return len(call.args) >= 3 or spread
+        if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "type":
+            return True  # type(X)(...): the metaclass of X
+        name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+        if name in ("new_class", "_Dialect"):
+            return True
+        if name in ("__class__", "__call__"):
+            return len(call.args) >= 3 or spread
+        if name == "__new__":
+            return len(call.args) >= 4 or spread
+        return False
+
+    def made(tree) -> tuple:
+        classes, calls = [], []
+
+        def walk(node, path: tuple) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    shape = tuple(ast.dump(base) for base in child.bases) + tuple(
+                        (keyword.arg, ast.dump(keyword.value)) for keyword in child.keywords
+                    )
+                    classes.append(((path + (child.name,), shape), child))
+                    walk(child, path + (child.name,))
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    walk(child, path + (child.name,))
+                else:
+                    if isinstance(child, ast.Call) and making(child):
+                        calls.append(((path, ast.dump(child)), child))
+                    walk(child, path)
+
+        walk(tree, ())
+        return classes, calls
+
+    old_classes, old_calls = made(old_tree) if old_tree is not None else ([], [])
+    now, now_calls = made(new_tree)
+    had = Counter(key for key, _ in old_classes)
+    had_calls = Counter(key for key, _ in old_calls)
+    new_classes, new_calls = [], []
+    for key, node in now:
+        if had[key] > 0:
+            had[key] -= 1
+        else:
+            new_classes.append(node)
+    for key, call in now_calls:
+        if had_calls[key] > 0:
+            had_calls[key] -= 1
+        else:
+            new_calls.append(call)
+    if not new_classes and not new_calls:
+        return ""
+    aliases = {}
+    for node in ast.walk(new_tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name.rsplit(".", 1)[-1]
+    local: dict = {}
+    for _, node in now:
+        local.setdefault(node.name, []).append(node)
+    # Every name the file binds anywhere (None: a star import may bind any). A base that nothing binds
+    # is a NameError where the class statement runs: no class is made, and what that does to the
+    # file's own tests is another rule's business (`_importable_bases`).
+    bound: set | None = set(dir(builtins))
+    for node in ast.walk(new_tree):
+        if bound is None:
+            break
+        if isinstance(node, ast.alias):
+            if node.name == "*":
+                bound = None
+            else:
+                bound.add((node.asname or node.name).split(".", 1)[0])
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, _DEFS):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+
+    def filing(base, seen: frozenset) -> str:
+        """What a base may be that gives a class the metaclass, "" when it cannot."""
+        if isinstance(base, ast.Name):
+            if base.id in local and base.id not in aliases:
+                # A class of this file: as harmless as its own bases.
+                if base.id in seen or any(filing_base(other, seen | {base.id}) for other in local[base.id]):
+                    return base.id
+                return ""
+            name = aliases.get(base.id, base.id)
+            if name in _PLAIN_BASES or name in expressions:
+                return ""
+            if bound is not None and base.id not in bound:
+                return ""
+            return name
+        if isinstance(base, ast.Attribute) and (base.attr in _PLAIN_BASES or base.attr in expressions):
+            return ""
+        return ast.unparse(base)[:40]
+
+    def filing_base(node, seen: frozenset) -> str:
+        """The base (or keyword) that may give the class the metaclass, "" when none can."""
+        if node.keywords:
+            return f"{node.keywords[0].arg or '**'}="
+        for base in node.bases:
+            found = filing(base, seen)
+            if found:
+                return found
+        return ""
+
+    def plain_call(call) -> bool:
+        """type(name, (bases...), namespace) or new_class(name, (bases...)) with harmless bases written out."""
+        func = call.func
+        name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+        if name not in ("type", "new_class") or call.keywords or any(isinstance(arg, ast.Starred) for arg in call.args):
+            return False
+        if len(call.args) != (3 if name == "type" else 2):
+            return False
+        bases = call.args[1]
+        return isinstance(bases, ast.Tuple) and not any(filing(base, frozenset()) for base in bases.elts)
+
+    for node in new_classes:
+        base = filing_base(node, frozenset((node.name,)))
+        if base:
+            return f"{node.name}({base})"
+    for call in new_calls:
+        if not plain_call(call):
+            return ast.unparse(call)[:60]
+    return ""
+
+
 # ---- an edited test that leaves something behind ---------------------------------------
 #
 # `new_global_effects` looks at the statements the new text has and the old one had not. It

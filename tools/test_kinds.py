@@ -581,9 +581,10 @@ expect("seed S: the test that fails later in the suite is no candidate", selecte
 # the test its own SUPPORTED_JSON_PATH_PARTS: the metaclass then pops the other parts from the TRANSFORMS that
 # class inherits, i.e. from the built-in generator's table (checked above with the other K_ seeds: every test).
 # K_dialect_name_by_type makes the class named like a built-in dialect with type(...) instead of a class statement.
-# A class made by type() under a name of its own stays an ordinary new test:
+# A class made by type() under a name of its own is filed too, under that name (a later test may ask the registry
+# for it, or expect it to be unknown): every test, as for a class statement (pydiff.filed_class).
 plan = seed("N_type_call_other")
-expect("seed N_type_call_other: an ordinary new test", (plan.select_all, plan.candidates), (False, 0))
+expect("seed N_type_call_other: a dialect class under any name is filed", plan.select_all, True)
 # and the name of the table alone, in a comment of the package, selects nothing by this rule
 plan = plan_for(comment_patch("sqlglot/helper.py", "# SUPPORTED_JSON_PATH_PARTS"))
 expect("the generator-parts rule is for test files", (plan.candidates, plan.select_all), (0, False))
@@ -605,6 +606,26 @@ expect("seed B_typing_alias: the comparison leaves the test that reads the file"
 expect("seed B_typing_alias: the plan keeps it apart from the importers", plan.rest_candidates, 1 << ID[TYPING])
 expect("seed B_typing_alias: the importers are import-time candidates", plan.import_candidates & ~plan.rest_candidates != 0, True)
 expect("seed B_typing_alias: candidates after the comparison", plan.rest_candidates | left, 1 << ID[TYPING])
+
+# seed B_typing_root_lambda takes one argument out of the base Lag annotator (sqlglot/typing/__init__.py, a
+# lambda). The test compares the code of that lambda with MySQL's and never runs it: MySQL's entry becomes a
+# duplicate and the test fails (pytest on the patched tree). The root module is the one typing module the test
+# does not open, so the map lists it by a reviewed entry (tools/build_sources.py CODE_READERS).
+plan = seed("B_typing_root_lambda")
+expect("seed B_typing_root_lambda: a change of a function body, checked by running", (plan.select_all, plan.needs_clean, plan.unverified), (False, False, 0))
+expect("seed B_typing_root_lambda: the test that compares the annotators is a candidate", bool(plan.candidates >> ID[TYPING] & 1), True)
+expect("seed B_typing_root_lambda: besides the tests that run the lambda", plan.candidates & ~(1 << ID[TYPING]) != 0, True)
+expect("the map lists that test for every typing module", {path for path in covmap._sources if covmap.source_readers(path) >> ID[TYPING] & 1},
+       {"sqlglot/typing/" + name for name in os.listdir(os.path.join(ROOT, "sqlglot", "typing")) if name.endswith(".py")})
+# and it is the only test file that reads the code of a function instead of running it
+code_readers = []
+for directory, _, names in os.walk(os.path.join(ROOT, "tests")):
+    for file_name in sorted(names):
+        if file_name.endswith(".py"):
+            with open(os.path.join(directory, file_name), encoding="utf-8", newline="") as handle:
+                if "__code__" in handle.read():
+                    code_readers.append(file_name)
+expect("no other test file reads __code__", code_readers, ["test_typing.py"])
 
 
 def new_file_patch(path, text):
@@ -773,9 +794,89 @@ for path in ("sqlglot/zz.so", "sqlglot/zz.pyc", "x.pth", "sqlglot/__pycache__/a.
 for name in ("K_dialect_name_in_test", "K_dialect_name_in_setup", "K_dialect_name_in_helper"):
     expect("seed " + name + ": every test", seed(name).select_all, True)
 DIALECT_TEST = "import unittest\nfrom sqlglot import Dialect\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        class {}(Dialect):\n            pass\n\n        self.assertTrue(True)\n"
-for class_name, selects_all in (("MySQL", True), ("Mysql", True), ("DUCKDB", True), ("Dialect", True), ("Spark2", True), ("MyDialect", False), ("Custom", False), ("TestMySQL", False), ("MySQLish", False)):
+# A subclass of Dialect under ANY name is filed, under that name: whoever asks the registry for it later gets
+# the new class (a review found two patches with pytest verdicts: SingleStore, a built-in dialect that is no
+# member of the enum, and Myqsl, the name tests/dialects/test_dialect.py expects to be unknown).
+for class_name in ("MySQL", "Mysql", "DUCKDB", "Dialect", "Spark2", "SingleStore", "Myqsl", "MyDialect", "Custom", "TestMySQL", "MySQLish"):
     plan = plan_for(new_file_patch("tests/dialects/test_zz_custom.py", DIALECT_TEST.format(class_name)))
-    expect("K: a new test defines class " + class_name, plan.select_all, selects_all)
+    expect("K: a new test defines a dialect class " + class_name, plan.select_all, True)
+expect("K: SingleStore is a name of the registry though no member of the enum", "SINGLESTORE" in analyze._registry_names(ROOT), True)
+expect("K: a class named like it, whatever its bases", plan_for(comment_patch("tests/test_time.py", "class SingleStore: pass")).select_all, True)
+# Only bases that rule the metaclass of Dialect out leave a new class of a test file harmless.
+NAMES = covmap.expression_names()
+expect("K: the map names the expression classes", {"Expression", "Func", "Select"} <= NAMES, True)
+HEAD = "import unittest\nfrom sqlglot import exp, Dialect\nfrom sqlglot.dialects.dialect import Dialect as DialectBase\nfrom sqlglot.expressions import Expression, Func\nfrom tests.dialects.test_dialect import Validator\n\n\n"
+for label, body, filed in (
+    ("no bases", "class Helper:\n    pass\n", ""),
+    ("TestCase", "class TestNew(unittest.TestCase):\n    def test_a(self):\n        pass\n", ""),
+    ("Validator", "class TestNew(Validator):\n    dialect = 'duckdb'\n", ""),
+    ("an expression class", "class Zfill(exp.Func):\n    pass\n", ""),
+    ("two expression classes", "class Zfill(Expression, Func):\n    pass\n", ""),
+    ("a class of the file that is plain", "class Base(unittest.TestCase):\n    pass\n\n\nclass TestNew(Base):\n    pass\n", ""),
+    ("Dialect", "class Mine(Dialect):\n    pass\n", "Mine(Dialect)"),
+    ("Dialect under another name", "class Mine(DialectBase):\n    pass\n", "Mine(Dialect)"),
+    ("Dialect by attribute", "import sqlglot\n\n\nclass Mine(sqlglot.Dialect):\n    pass\n", "Mine(sqlglot.Dialect)"),
+    ("a dialect", "from sqlglot.dialects import Snowflake\n\n\nclass Mine(Snowflake):\n    pass\n", "Mine(Snowflake)"),
+    ("a name bound by assignment", "Base = Dialect\n\n\nclass Mine(Base):\n    pass\n", "Mine(Base)"),
+    ("a class of the file that is a dialect", "class Base(Dialect):\n    pass\n\n\nclass Mine(Base):\n    pass\n", "Base(Dialect)"),
+    ("a call", "class Mine(type('B', (), {})):\n    pass\n", "Mine(type('B', (), {}))"),
+    ("a metaclass", "class Mine(metaclass=type(Dialect)):\n    pass\n", "Mine(metaclass=)"),
+    ("inside a test", "class TestNew(unittest.TestCase):\n    def test_a(self):\n        class Mine(Dialect):\n            pass\n", "Mine(Dialect)"),
+    ("a class that is its own base by name", "class Loop(Loop):\n    pass\n", "Loop(Loop)"),
+    ("a base that nothing binds (a NameError: no class is made)", "class TestZ(NoSuchBase):\n    pass\n", ""),
+    ("a base that a star import may bind", "from tests.helpers import *\n\n\nclass TestZ(NoSuchBase):\n    pass\n", "TestZ(NoSuchBase)"),
+    ("a base bound as a parameter", "def make(Base):\n    class Mine(Base):\n        pass\n\n    return Mine\n", "Mine(Base)"),
+):
+    expect("K: a new class with " + label, pydiff.filed_class(None, HEAD + body, NAMES), filed)
+# A class is also made by a call (buildathon-ad's seeds K_dialect_class_by_call_*: type(...) under a name outside
+# the registry, under a computed name, over two lines, and the metaclass called through the class).
+INSIDE = HEAD + "class TestNew(unittest.TestCase):\n    def test_a(self):\n"
+for label, body, filed in (
+    ("type() with a dialect base", '        made = type("Myqsl", (Dialect,), {})\n', "type('Myqsl', (Dialect,), {})"),
+    ("type() with a computed name", '        name = "Single" + "Store"\n        made = type(name, (Dialect,), {})\n', "type(name, (Dialect,), {})"),
+    ("type() over several lines", '        made = type(\n            "SingleStore",\n            (Dialect,),\n            {},\n        )\n', "type('SingleStore', (Dialect,), {})"),
+    ("the metaclass through the class", '        made = type(Dialect)("Myqsl", (Dialect,), {})\n', "type(Dialect)('Myqsl', (Dialect,), {})"),
+    ("the metaclass through __class__", '        made = Dialect.__class__("X", (Dialect,), {})\n', "Dialect.__class__('X', (Dialect,), {})"),
+    ("the metaclass's __new__", '        made = type.__new__(type(Dialect), "X", (Dialect,), {})\n', "type.__new__(type(Dialect), 'X', (Dialect,), {})"),
+    ("types.new_class", '        import types\n        made = types.new_class("X", (Dialect,))\n', "types.new_class('X', (Dialect,))"),
+    ("type() with its arguments spread", '        args = ("X", (Dialect,), {})\n        made = type(*args)\n', "type(*args)"),
+    ("type() with bases held in a name", '        bases = (Dialect,)\n        made = type("X", bases, {})\n', "type('X', bases, {})"),
+    ("type() with no bases", '        made = type("Plain", (), {})\n', ""),
+    ("type() with an expression base", '        made = type("F", (exp.Func,), {"arg_types": {}})\n', ""),
+    ("new_class with a plain base", '        import types\n        made = types.new_class("X", (unittest.TestCase,))\n', ""),
+    ("type() of one argument", "        kind = type(self)\n        self.assertIs(type(1), int)\n", ""),
+    ("an instance made through __class__ or __new__", '        made = object.__new__(TestNew)\n        other = self.__class__("test_a")\n', ""),
+):
+    expect("K: a new call, " + label, pydiff.filed_class(None, INSIDE + body, NAMES), filed)
+CALL = INSIDE + '        made = type("X", (Dialect,), {})\n'
+expect("K: a call the file already had is not new", pydiff.filed_class(CALL, CALL + "        self.assertTrue(made)\n", NAMES), "")
+expect("K: the same call with another name is", pydiff.filed_class(CALL, CALL.replace('"X"', '"Y"'), NAMES), "type('Y', (Dialect,), {})")
+OLD = HEAD + "class TestOld(unittest.TestCase):\n    def test_a(self):\n        class Mine(Dialect):\n            pass\n\n        self.assertEqual(1, 1)\n"
+expect("K: a dialect class the file already had is not new", pydiff.filed_class(OLD, OLD.replace("assertEqual(1, 1)", "assertEqual(2, 2)"), NAMES), "")
+expect("K: the same class under another test is", pydiff.filed_class(OLD, OLD.replace("test_a", "test_b"), NAMES), "Mine(Dialect)")
+expect("K: so is one with other bases", pydiff.filed_class(OLD, OLD.replace("Mine(Dialect)", "Mine(DialectBase)"), NAMES), "Mine(Dialect)")
+expect("K: and a second one in the same place", pydiff.filed_class(OLD, OLD + "        class Mine(Dialect):\n            pass\n", NAMES), "Mine(Dialect)")
+expect("K: text that does not parse is left to the rule for that", pydiff.filed_class(None, "class (:\n", NAMES), "")
+expect("K: without the map of classes an expression class is not known to be plain", pydiff.filed_class(None, HEAD + "class Zfill(exp.Func):\n    pass\n", frozenset()), "Zfill(exp.Func)")
+plan = plan_for(new_file_patch("tests/dialects/test_zz_plain.py", HEAD + "class TestNew(Validator):\n    dialect = 'duckdb'\n\n    def test_a(self):\n        self.validate_identity('SELECT 1')\n"))
+expect("K: a new test file with a plain test class stays harmless", (plan.candidates, plan.select_all), (0, False))
+# No expression class is named like a dialect class (an expression base could otherwise hide one).
+DIALECT_CLASSES = {name for path, classes in covmap._classes.items() if path.startswith("sqlglot/dialects/") for name in classes if "." not in name}
+expect("K: the dialect classes are known", {"Dialect", "MySQL", "SingleStore"} <= DIALECT_CLASSES, True)
+expect("K: no expression class is named like a class of sqlglot/dialects or like the executor's dialect", NAMES & (DIALECT_CLASSES | {"Python"}), frozenset())
+# The class statements of the pinned tests that would be judged "may be filed" if a patch added them (an
+# edit elsewhere in their files does not look at them): the three dialect classes and three classes
+# with a parser or schema base.
+would = []
+for directory, _, names in os.walk(os.path.join(ROOT, "tests")):
+    for file_name in sorted(names):
+        if file_name.endswith(".py"):
+            with open(os.path.join(directory, file_name), encoding="utf-8", newline="") as handle:
+                text = handle.read()
+            expect("K: an unchanged file has no new class: " + file_name, pydiff.filed_class(text, text, NAMES), "")
+            if pydiff.filed_class(None, text, NAMES):
+                would.append(file_name)
+expect("K: the pinned test files with such a class", sorted(would), ["test_dialect.py", "test_dialect_entry_points.py"])
 plan = plan_for(comment_patch("tests/test_time.py", "class Snowflake: pass"))
 expect("K: the name alone decides, also in an edited file", plan.select_all, True)
 plan = plan_for(comment_patch("sqlglot/helper.py", "class Snowflake: pass"))

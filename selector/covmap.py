@@ -107,6 +107,18 @@ class CovMap:
         """The last part of every test id: names a new test must not take."""
         return frozenset(test_id.split("::")[-1].split("[")[0] for test_id in self.ids)
 
+    def expression_names(self) -> frozenset:
+        """The names of the package's expression classes (maps/classes.json); empty without the map."""
+        if self._classes is None:
+            self._classes = self._optional_json("classes.json") or {}
+            self._families = self._optional_json("families.json") or {}
+        return frozenset(
+            name.rsplit(".", 1)[-1]
+            for classes in self._classes.values()
+            for name, kind in classes.items()
+            if kind == "expr"
+        )
+
     def code_any(self, path: str, first: int) -> int:
         result = 0
         for bitmap in self.file(path).get(first, {}).values():

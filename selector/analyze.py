@@ -657,7 +657,9 @@ _registry_names_of: dict = {}
 def _registry_names(root: str) -> frozenset:
     """The names under which the metaclass of Dialect files a class of the pinned tree, upper-cased:
     the members of the enum `Dialects` and their values (`_Dialect.__new__` takes the member named
-    like the class in capitals, and its value as the key of the registry)."""
+    like the class in capitals, and its value as the key of the registry), and the names of the
+    built-in dialect classes (`DIALECTS` in sqlglot/dialects/__init__.py): one that is no member of
+    the enum (SingleStore) is filed under its own name in lower case."""
     found = _registry_names_of.get(root)
     if found is None:
         names = set()
@@ -671,6 +673,19 @@ def _registry_names(root: str) -> frozenset:
                             names |= {target.id.upper() for target in statement.targets if isinstance(target, ast.Name)}
                             if isinstance(statement.value.value, str):
                                 names.add(statement.value.value.upper())
+            with open(os.path.join(root, "sqlglot", "dialects", "__init__.py"), "rb") as handle:
+                tree = ast.parse(handle.read())
+            for node in tree.body:
+                if (
+                    isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "DIALECTS" for target in node.targets)
+                    and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))
+                ):
+                    names |= {
+                        item.value.upper()
+                        for item in node.value.elts
+                        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    }
         except (OSError, SyntaxError, ValueError):
             names = set()
         found = _registry_names_of[root] = frozenset(names)
@@ -717,6 +732,16 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root
             plan.select_all = True
             plan.note(f"{path}: a new class named {name}, the name of a built-in dialect in the registry")
             return
+    filed = pydiff.filed_class(
+        patch.old_text if old_path == path else None, patch.new_text or "", covmap.expression_names()
+    )
+    if filed:
+        # Any other subclass of Dialect is filed too, under its own name: a test that asks the
+        # registry for that name later in the suite (a dialect by its name, a name it expects to
+        # be unknown) meets the new class. Only bases that rule the metaclass out are harmless.
+        plan.select_all = True
+        plan.note(f"{path}: a new class that the dialect registry may file, {filed}")
+        return
     if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
         # A new or changed statement that stores into a class, a module or a
         # registry: in the whole suite it reaches tests of other files.

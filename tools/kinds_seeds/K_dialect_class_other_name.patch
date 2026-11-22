@@ -1,0 +1,18 @@
+diff --git a/tests/dialects/test_athena.py b/tests/dialects/test_athena.py
+--- a/tests/dialects/test_athena.py
++++ b/tests/dialects/test_athena.py
+@@ -10,6 +10,14 @@
+ class TestAthena(Validator):
+     dialect = "athena"
+     maxDiff = None
++
++    def test_custom_dialect_name(self):
++        from sqlglot.dialects.dialect import Dialect
++
++        class Myqsl(Dialect):
++            pass
++
++        self.assertIsInstance(Dialect.get_or_raise("myqsl"), Myqsl)
+ 
+     def test_athena(self):
+         self.validate_identity(r"SELECT '\d+'")

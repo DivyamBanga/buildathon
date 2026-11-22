@@ -60,6 +60,21 @@ for test in suspects:
                 readers.setdefault(path, set()).add(test["number"])
     shutil.rmtree(work, ignore_errors=True)
 
+# Tests that read the code objects of a module's functions without running them (`__code__`: the
+# instructions, names and constants). A change inside such a function is to them what a change of
+# the text is to a test that parses the file, whichever of its lines they ever execute. Read at the
+# pinned commit (the only reads of `__code__` under tests/): tests/test_typing.py compares the
+# annotators of every sqlglot.typing module with those of the module it inherits from. It opens the
+# modules that inherit (found above) and never the root of them all, whose annotators it compares
+# all the same.
+CODE_READERS = {
+    "sqlglot/typing/__init__.py": ("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",),
+}
+for path, ids in CODE_READERS.items():
+    for test in tests:
+        if test["id"] in ids:
+            readers.setdefault(path, set()).add(test["number"])
+
 os.makedirs(out_dir, exist_ok=True)
 json.dump({path: sorted(numbers) for path, numbers in sorted(readers.items())},
           open(os.path.join(out_dir, "sources.json"), "w"), separators=(",", ":"))
