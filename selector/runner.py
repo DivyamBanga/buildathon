@@ -574,12 +574,68 @@ def _install_duck_probe(roots, changed) -> None:
     duckdb.connect = probing_connect
 
 
-def build_executor_tables() -> None:
+def _setup_inputs_digest(module) -> str:
+    """Digest of everything the pinned class setup of the executor tests turns into rows:
+    its own code, the test module's `open_file`, the two schemas and the bytes of every fixture file it reads."""
+    import hashlib
+    import marshal
+
+    digest = hashlib.sha1()
+    for function in (module.TestExecutor.__dict__["setUpClass"].__func__, module.open_file):
+        digest.update(marshal.dumps(function.__code__))
+    for directory, schema in ((module.DIR_TPCH, module.TPCH_SCHEMA), (module.DIR_TPCDS, module.TPCDS_SCHEMA)):
+        for table, columns in schema.items():
+            digest.update(repr((table, columns)).encode())
+            with open(f"{directory}{table}.csv.gz", "rb") as handle:
+                digest.update(hashlib.sha1(handle.read()).digest())
+    return digest.hexdigest()
+
+
+def save_executor_rows(path: str) -> int:
+    """Write the rows of the tables built by build_executor_tables, with the digest of what
+    they were parsed from (selector/prebuild.py, while the image is built). Returns the file's size."""
+    import pickle
+
+    data = {
+        "digest": _setup_inputs_digest(sys.modules["tests.test_executor"]),
+        "tables": [
+            {name: (tuple(table.columns), table.rows) for name, table in group.items()} for group in EXECUTOR_TABLES
+        ],
+    }
+    with open(path, "wb") as handle:
+        pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return os.path.getsize(path)
+
+
+def _prebuilt_tables(path: str, module):
+    """The tables the pinned class setup builds, made from the rows kept when the image was built,
+    or None when there is no such file or it was parsed from anything else than what is here now."""
+    import pickle
+
+    try:
+        with open(path, "rb") as handle:
+            data = pickle.load(handle)
+        if data["digest"] != _setup_inputs_digest(module):
+            return None
+        return tuple(
+            {name: module.Table(columns=columns, rows=rows) for name, (columns, rows) in group.items()}
+            for group in data["tables"]
+        )
+    except Exception:
+        return None
+
+
+def build_executor_tables(prebuilt: str | None = None) -> None:
     """Run the executor tests' class setup once, without DuckDB, and keep its tables.
 
     Parsing the CSVs costs more than most executor tests. A child reuses these
     tables only for a patch that touches nothing the setup executes or reads
     (maps/setup.json), so they are exactly what its own setup would have built.
+
+    `prebuilt` names the file in which the image kept the rows of that very
+    setup when it was built (selector/prebuild.py). When what it was parsed
+    from is what is here now, the tables are made from those rows and the
+    parsing, about two CPU seconds a batch, is left out.
     """
     global EXECUTOR_TABLES
     import duckdb
@@ -595,17 +651,20 @@ def build_executor_tables() -> None:
         module.ast.literal_eval,
         module.open_file,
     )
-    real_connect = duckdb.connect
-    duckdb.connect = lambda *args, **kwargs: _NoConnection()
-    try:
-        test_class.setUpClass()
-    finally:
-        duckdb.connect = real_connect
-    EXECUTOR_TABLES = (test_class.tpch_tables, test_class.tpcds_tables)
+    tables = _prebuilt_tables(prebuilt, module) if prebuilt else None
+    if tables is None:
+        real_connect = duckdb.connect
+        duckdb.connect = lambda *args, **kwargs: _NoConnection()
+        try:
+            test_class.setUpClass()
+        finally:
+            duckdb.connect = real_connect
+        tables = (test_class.tpch_tables, test_class.tpcds_tables)
+        for name in ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"):
+            if name in test_class.__dict__:
+                delattr(test_class, name)
+    EXECUTOR_TABLES = tables
     _snapshot_pinned()
-    for name in ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "cache", "tpch_sqls", "tpcds_sqls"):
-        if name in test_class.__dict__:
-            delattr(test_class, name)
 
 
 def _use_executor_tables() -> None:
