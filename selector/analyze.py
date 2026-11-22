@@ -290,6 +290,8 @@ def _analyze_python(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root:
                 if span is not None:
                     new_first = patch.new_line(first)
                     new_last = patch.new_line(span[1])
+                    # Where the old lines moved to must be where the paired function is
+                    # (definitions may have been added above it).
                     if (
                         new_first is not None
                         and new_last is not None
