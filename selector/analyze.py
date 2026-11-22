@@ -557,6 +557,52 @@ def _import_checker(root: str, plan: Plan):
     return check
 
 
+# What a binary patch may not touch: code, in any form Python or the loader runs.
+_CODE_SUFFIXES = (".py", ".pyi", ".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib", ".pth", ".zip", ".whl", ".egg")
+
+
+_DISTRIBUTION_SUFFIXES = (".dist-info", ".egg-info", ".egg-link", ".egg")
+
+
+def _inert_binary(path: str) -> bool:
+    name = os.path.basename(path)
+    parts = path.split("/")
+    return (
+        not name.endswith(_CODE_SUFFIXES)
+        and ".so." not in name
+        and name not in _PYTEST_CONFIG
+        and name not in _MAYBE_PYTEST_CONFIG
+        and "__pycache__" not in parts
+        # nothing inside the package: what ships with it may be loaded in ways no map records
+        and parts[0] != "sqlglot"
+        # a distribution's metadata is read by importlib.metadata for every test
+        and not any(part.lower().endswith(_DISTRIBUTION_SUFFIXES) for part in parts)
+        # pytest collects tests/**/test*.txt as doctest files and stops on one it cannot read
+        and not (parts[0] == "tests" and fnmatch.fnmatch(name, "test*.txt"))
+    )
+
+
+def _binary_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
+    """A binary patch to a file that is not code. The patch is not applied here, so a child
+    cannot be given the new bytes: the tests that open the file, and those that list its
+    directory when it appears or vanishes, are selected as they are."""
+    path = patch.path
+    old_path = patch.old_path or path
+    found = 0
+    opened = covmap.opened(old_path)
+    if opened:
+        found |= opened
+    if patch.new_file or old_path != path or patch.deleted:
+        for entry in {path, old_path}:
+            listed, _ = covmap.entry_listers(entry, root)
+            found |= listed
+    plan.candidates |= found
+    plan.rest_candidates |= found
+    plan.unverified |= found
+    plan.sliceable = False
+    plan.note(f"{path}: binary, not code: {found.bit_count()} tests open it or list its directory, selected unchecked")
+
+
 def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """A file that appears or vanishes changes what its directory lists.
 
@@ -601,7 +647,37 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
             plan.note(f"{entry}: appears in or vanishes from its directory, {found.bit_count()} tests list it or ask for its name")
 
 
-def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> None:
+_NEW_CLASS = re.compile(r"[+][ \t]*class[ \t]+([A-Za-z_][A-Za-z_0-9]*)")
+# The same class made by a call: type("MySQL", (Dialect,), {}), types.new_class("MySQL", ...).
+_MADE_CLASS = re.compile(r"""(?:\btype|\bnew_class|_Dialect)\(\s*["']([A-Za-z_][A-Za-z_0-9]*)["']""")
+_GENERATOR_PARTS = "SUPPORTED_JSON_PATH_PARTS"
+_registry_names_of: dict = {}
+
+
+def _registry_names(root: str) -> frozenset:
+    """The names under which the metaclass of Dialect files a class of the pinned tree, upper-cased:
+    the members of the enum `Dialects` and their values (`_Dialect.__new__` takes the member named
+    like the class in capitals, and its value as the key of the registry)."""
+    found = _registry_names_of.get(root)
+    if found is None:
+        names = set()
+        try:
+            with open(os.path.join(root, "sqlglot", "dialects", "dialect.py"), "rb") as handle:
+                tree = ast.parse(handle.read())
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name == "Dialects":
+                    for statement in node.body:
+                        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Constant):
+                            names |= {target.id.upper() for target in statement.targets if isinstance(target, ast.Name)}
+                            if isinstance(statement.value.value, str):
+                                names.add(statement.value.value.upper())
+        except (OSError, SyntaxError, ValueError):
+            names = set()
+        found = _registry_names_of[root] = frozenset(names)
+    return found
+
+
+def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: str) -> None:
     """Rules for a Python file under tests/ that no run of one test can settle.
 
     The runner executes tests with unittest in one forked child each, while the
@@ -611,6 +687,36 @@ def _test_file_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap) -> N
     old_path = patch.old_path or path
     if not (path.startswith("tests/") or old_path.startswith("tests/")):
         return
+    registry = _registry_names(root)
+    if patch.old_text is None or old_path != path:
+        # The file arrives (new or moved in): every line of it is new here.
+        rows = ["+" + line for line in (patch.new_text or "").splitlines()]
+    else:
+        rows = [row for hunk in patch.hunks for row in hunk[4]]
+    for row in rows:
+        if row[:1] == "+" and _GENERATOR_PARTS in row:
+            # When a dialect class is created, its metaclass takes the JSON path parts that
+            # the dialect's generator class does not support out of that class's TRANSFORMS
+            # (Dialect.__new__: `gen_cls.TRANSFORMS.pop(part, None)`). A generator class
+            # written on the spot has no TRANSFORMS of its own, so the entries go from the
+            # table of the built-in generator it inherits from, and stay gone for every
+            # test that runs later in the suite.
+            plan.select_all = True
+            plan.note(f"{path}: new code names {_GENERATOR_PARTS}, which the dialect metaclass applies to an inherited table")
+            return
+        found = _NEW_CLASS.match(row)
+        names = [found.group(1)] if found else []
+        if row[:1] == "+":
+            names += _MADE_CLASS.findall(row)
+        for name in names:
+            if name.upper() not in registry:
+                continue
+            # A subclass of Dialect is filed under its own name when the class statement
+            # runs, wherever that is (a test body, setUp, a helper): one named like a
+            # built-in dialect takes that dialect's place for every test that runs later.
+            plan.select_all = True
+            plan.note(f"{path}: a new class named {name}, the name of a built-in dialect in the registry")
+            return
     if pydiff.new_global_effects(patch.old_text or "", patch.new_text or ""):
         # A new or changed statement that stores into a class, a module or a
         # registry: in the whole suite it reaches tests of other files.
@@ -689,6 +795,9 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
                 patch.binary = True
         if patch.binary:
             patch.unapplied = True
+            if _inert_binary(path) and _inert_binary(old_path):
+                _binary_rules(plan, patch, covmap, root)
+                continue
         else:
             try:
                 patchlib.apply(patch, old_text)
@@ -699,6 +808,17 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
             plan.select_all = True
             plan.note(f"{path}: patch does not apply")
             continue
+        if patch.copied and old_path != path:
+            # A copy: the source stays where it is, so nothing vanishes. From here on the section
+            # is a new file that holds the text the copy has.
+            patch.old_path = None
+            patch.new_file = True
+            patch.old_text = None
+            patch.old_lines_changed = []
+            patch.pure_insert_after = []
+            patch._anchors = [(1, 0)]
+            old_path = path
+            old_text = None
         if old_text is None and not patch.new_file and patch.hunks:
             # The patch edits a file the pinned commit does not have.
             plan.select_all = True
@@ -715,7 +835,7 @@ def analyze(commit: str, text: str, covmap: CovMap, root: str, loaded) -> Plan:
                 continue
             _entry_rules(plan, patch, covmap, root)
             if path.endswith(".py") or old_path.endswith(".py"):
-                _test_file_rules(plan, patch, covmap)
+                _test_file_rules(plan, patch, covmap, root)
                 _analyze_python(plan, patch, covmap, root, loaded)
             else:
                 _analyze_data(plan, patch, covmap, root)

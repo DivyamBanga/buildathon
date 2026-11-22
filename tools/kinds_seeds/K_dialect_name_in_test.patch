@@ -1,0 +1,18 @@
+diff --git a/tests/dialects/test_custom_dialect.py b/tests/dialects/test_custom_dialect.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/dialects/test_custom_dialect.py
+@@ -0,0 +1,12 @@
++import unittest
++
++from sqlglot import parse_one
++from sqlglot.dialects.dialect import Dialect
++
++
++class TestCustomDialect(unittest.TestCase):
++    def test_custom_dialect(self):
++        class MySQL(Dialect):
++            pass
++
++        self.assertEqual(parse_one("SELECT 1", read="mysql").sql(), "SELECT 1")

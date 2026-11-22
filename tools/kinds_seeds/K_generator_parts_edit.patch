@@ -1,0 +1,16 @@
+diff --git a/tests/dialects/test_dialect.py b/tests/dialects/test_dialect.py
+index 1111111..2222222 100644
+--- a/tests/dialects/test_dialect.py
++++ b/tests/dialects/test_dialect.py
+@@ -6119,7 +6119,10 @@
+ 
+     @unittest.skipIf(_PARSER_IS_COMPILED, "mypyc compiled parsers cannot be subclassed")
+     def test_custom_dialect(self):
+-        class MyDialect(Dialect):
++        class MyDialect(Snowflake):
++            class Generator(Snowflake.Generator):
++                SUPPORTED_JSON_PATH_PARTS = {exp.JSONPathKey, exp.JSONPathRoot}
++
+             class Parser(SnowflakeParser):
+                 FUNCTIONS = {
+                     **SnowflakeParser.FUNCTIONS,

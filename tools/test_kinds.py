@@ -174,6 +174,11 @@ for label, body in (
     ("self rebound to a class", "import sqlglot\nself = sqlglot.Parser\nself.FUNCTIONS = {}"),
     ("nested def taking self", "import sqlglot\ndef f(self):\n    self.F = {}\nf(sqlglot.Parser)"),
     ("dict of a class", "import sqlglot\nsqlglot.Parser.__dict__"),
+    ("the decimal context replaced", "import decimal\ndecimal.setcontext(decimal.Context(prec=3))"),
+    ("the locale set", "import locale\nlocale.setlocale(locale.LC_ALL, 'C')"),
+    ("a resource limit", "import resource\nresource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))"),
+    ("logging configured", "import logging\nlogging.basicConfig(level=logging.DEBUG)"),
+    ("the limit on digits of an int", "import sys\nsys.set_int_max_str_digits(700)"),
 ):
     text = METHOD.format("\n".join("        " + row for row in body.split("\n")))
     expect("E: " + label, added(text), False)
@@ -563,6 +568,26 @@ expect("seed M: not 'only new tests'", any("only new tests" in note for note in 
 expect("seed M: the tests of the file run", plan.candidates & covmap.tests_of_file("tests/test_helper.py"), covmap.tests_of_file("tests/test_helper.py"))
 expect("seed M: and nothing is selected unchecked", (plan.select_all, plan.unverified), (False, 0))
 
+# seed S_prior_left_in_table: one token inside the lambda that Parser._parse_connect_with_prior puts into the class
+# table. To the plan it is an ordinary function edit: the three tests that run the lambda. That the entry then stays
+# in the table, and fails a fourth test later in the suite, is for the child to see (runner.RESTORED_TABLES, line
+# kind T, tools/test_leftover.py).
+plan = seed("S_prior_left_in_table")
+expect("seed S: an ordinary function edit", (plan.select_all, plan.candidates.bit_count()), (False, 3))
+expect("seed S: the test that fails later in the suite is no candidate", selected(plan, "tests/test_serde.py::TestSerde::test_serde"), False)
+
+# What the metaclass of the dialects does to shared tables when test code creates a dialect class.
+# The seeds K_generator_parts_* (a new test, an edited test, a new test file) give a generator class written in
+# the test its own SUPPORTED_JSON_PATH_PARTS: the metaclass then pops the other parts from the TRANSFORMS that
+# class inherits, i.e. from the built-in generator's table (checked above with the other K_ seeds: every test).
+# K_dialect_name_by_type makes the class named like a built-in dialect with type(...) instead of a class statement.
+# A class made by type() under a name of its own stays an ordinary new test:
+plan = seed("N_type_call_other")
+expect("seed N_type_call_other: an ordinary new test", (plan.select_all, plan.candidates), (False, 0))
+# and the name of the table alone, in a comment of the package, selects nothing by this rule
+plan = plan_for(comment_patch("sqlglot/helper.py", "# SUPPORTED_JSON_PATH_PARTS"))
+expect("the generator-parts rule is for test files", (plan.candidates, plan.select_all), (0, False))
+
 TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 for name in sorted(os.listdir(os.path.join(HERE, "kinds_seeds"))):
     if name.startswith("B_"):
@@ -700,6 +725,92 @@ if covmap._dirs["names"] is not None:
     for path in ("pytest.toml", ".pytest.toml", "tests/pytest.toml", "tests/dialects/pytest.ini", "tests/pyproject.toml", "tests/setup.cfg"):
         plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
         expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)
+
+# ---- P: a binary patch to a file that is not code -------------------------------
+
+def binary_patch(path, new=True):
+    head = "new file mode 100644\n" if new else ""
+    return f"diff --git a/{path} b/{path}\n{head}index 0000000..1234567\nGIT binary patch\nliteral 1\nIcmZPo000\n\n"
+
+
+plan = plan_for(binary_patch("tests/fixtures/zz_logo.png"))
+expect("P: a new image nobody lists", (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+for path in ("docs/logo.png", "sqlglot.png", "posts/zz.jpg", "tests/fixtures/notes.bin"):
+    plan = plan_for(binary_patch(path))
+    expect("P: a new binary file that is not code: " + path, (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+for path in ("sqlglot/zz.dat", "sqlglot/dialects/zz.png", "zz.dist-info/RECORD", "tests/zz.egg-info/PKG-INFO", "docs/zz.egg"):
+    plan = plan_for(binary_patch(path))
+    expect("P: a binary file in the package or of a distribution: " + path, plan.select_all, True)
+# the main session's seeds, made with `git diff --binary` against the pinned tree
+EXECUTOR = covmap.tests_of_file("tests/test_executor.py")
+for name, want in (("P_bin_new", 0), ("P_bin_edit", 0), ("P_bin_mixed", 0), ("P_bin_gz", EXECUTOR), ("P_bin_gz_same", EXECUTOR)):
+    plan = seed(name)
+    expect("seed " + name, (plan.select_all, plan.candidates, plan.unverified), (False, want, want))
+gone = (
+    "diff --git a/posts/onboarding_images/lineage_img.png b/posts/onboarding_images/lineage_img.png\n"
+    "deleted file mode 100644\nindex 1234567..0000000\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n"
+)
+plan = plan_for(gone)
+expect("P: an image deleted", (plan.select_all, plan.candidates, plan.unverified), (False, 0, 0))
+# every table file of the two TPC directories is read by the class setup of the executor tests (DuckDB reads it
+# itself, which no audit hook sees): the map must name every test of that class for each of them
+for directory in ("tests/fixtures/optimizer/tpc-h", "tests/fixtures/optimizer/tpc-ds"):
+    for file_name in sorted(os.listdir(os.path.join(ROOT, directory))):
+        if file_name.endswith(".csv.gz"):
+            expect("P: readers of " + directory + "/" + file_name, (covmap.opened(directory + "/" + file_name) or 0) & EXECUTOR, EXECUTOR)
+opened_paths = sorted(p for p in covmap._opens if not p.endswith((".py", ".pyc", ".so")) and "__pycache__" not in p)
+if opened_paths:
+    path = opened_paths[0]
+    plan = plan_for(binary_patch(path, new=False))
+    expect("P: a binary file a test opens: those tests, unchecked", (plan.select_all, plan.candidates != 0, plan.candidates == plan.unverified), (False, True, True))
+    expect("P: and exactly the tests that open it", plan.candidates, covmap.opened(path))
+for path in ("sqlglot/zz.so", "sqlglot/zz.pyc", "x.pth", "sqlglot/__pycache__/a.cpython-313.pyc", "sqlglot/zz.cpython-313-x86_64-linux-gnu.so.1", "pytest.ini",
+             "tests/test_notes.txt", "tests/dialects/test_a.txt"):
+    expect("P: " + path + " may be code", plan_for(binary_patch(path)).select_all or plan_for(binary_patch(path)).candidates != 0, True)
+
+
+# a class named like a built-in dialect, defined where a test runs: the registry files it under that name
+for name in ("K_dialect_name_in_test", "K_dialect_name_in_setup", "K_dialect_name_in_helper"):
+    expect("seed " + name + ": every test", seed(name).select_all, True)
+DIALECT_TEST = "import unittest\nfrom sqlglot import Dialect\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        class {}(Dialect):\n            pass\n\n        self.assertTrue(True)\n"
+for class_name, selects_all in (("MySQL", True), ("Mysql", True), ("DUCKDB", True), ("Dialect", True), ("Spark2", True), ("MyDialect", False), ("Custom", False), ("TestMySQL", False), ("MySQLish", False)):
+    plan = plan_for(new_file_patch("tests/dialects/test_zz_custom.py", DIALECT_TEST.format(class_name)))
+    expect("K: a new test defines class " + class_name, plan.select_all, selects_all)
+plan = plan_for(comment_patch("tests/test_time.py", "class Snowflake: pass"))
+expect("K: the name alone decides, also in an edited file", plan.select_all, True)
+plan = plan_for(comment_patch("sqlglot/helper.py", "class Snowflake: pass"))
+expect("K: outside tests/ the import-time rules judge a new class", plan.select_all, False)
+# no class statement of the pinned tests has such a name
+import ast as _ast  # noqa: E402
+taken = []
+for directory, _, names in os.walk(os.path.join(ROOT, "tests")):
+    for file_name in names:
+        if file_name.endswith(".py"):
+            with open(os.path.join(directory, file_name), "rb") as handle:
+                tree = _ast.parse(handle.read())
+            taken += [node.name for node in _ast.walk(tree) if isinstance(node, _ast.ClassDef) and node.name.upper() in analyze._registry_names(ROOT)]
+expect("K: no class of the pinned tests is named like a built-in dialect", taken, [])
+
+
+# ---- a copied file (`copy from` / `copy to`): the source stays, the copy is a new file ----
+
+def copy_patch(source, target):
+    return f"diff --git a/{source} b/{target}\nsimilarity index 100%\ncopy from {source}\ncopy to {target}\n"
+
+
+if covmap._dirs["names"] is not None:
+    plan = plan_for(copy_patch("sqlglot/time.py", "sqlglot/time_copy.py"))
+    expect("copy: a module copied under a name nobody asks for", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("README.md", "docs/README_copy.md"))
+    expect("copy: a text file copied", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("sqlglot/time.py", "json.py"))
+    expect("copy: the copy still counts as a new file under its own name", plan.candidates, everything)
+    plan = plan_for(copy_patch("tests/dialects/test_dune.py", "tests/dialects/test_dune_copy.py"))
+    expect("copy: a plain test file copied is a harmless new test file", (plan.candidates, plan.select_all), (0, False))
+    plan = plan_for(copy_patch("tests/test_dialect_entry_points.py", "tests/test_entry_points_copy.py"))
+    expect("copy: a test file that stores outside its locals, copied, selects everything", plan.select_all, True)
+plan = plan_for(copy_patch("sqlglot/time.py", "sqlglot/time_copy.py"))
+expect("copy: the source is not taken for removed", any("removed or renamed" in note for note in plan.notes), False)
 
 # seed add_trait_shadow gives the trait Predicate two attributes its ancestor Expr holds (is_var_len_args,
 # var_len_arg_key). sqlglot's expressions are built from traits: `class RegexpLike(Expression, Binary,

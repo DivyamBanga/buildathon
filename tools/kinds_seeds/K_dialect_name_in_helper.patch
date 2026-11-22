@@ -1,0 +1,21 @@
+diff --git a/tests/dialects/test_custom_dialect4.py b/tests/dialects/test_custom_dialect4.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/dialects/test_custom_dialect4.py
+@@ -0,0 +1,15 @@
++import unittest
++
++from sqlglot import Dialect
++
++
++def make():
++    class Presto(Dialect):
++        pass
++
++    return Presto
++
++
++class TestCustomDialect(unittest.TestCase):
++    def test_custom_dialect(self):
++        self.assertTrue(make())
