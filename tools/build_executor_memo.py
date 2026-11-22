@@ -18,6 +18,21 @@ pinned commit:
                    whose slots.json is the optional fifth argument), and for
                    an attribute that holds a table (a dict) and is only ever
                    looked up by key, the names of those keys (tools/recdict.py)
+  execfront.json   (optional sixth argument) {"lines": ...}: every line that runs
+                   between the start of the call `optimize(...)` inside `execute`
+                   and the start of the planner (the window F), in the shape of
+                   execphase.json
+  execfrontq.bin   (optional seventh argument) the key BEFORE the optimizer,
+                   query by query: runner.front_key of the call -> (the digest
+                   of the optimized tree, i.e. the last part of the memo key;
+                   which of the lines of execfront.json that query runs, as a
+                   bit mask over them in sorted order)
+
+A query's lines are those of its own fresh-fork run together with those it runs
+inside each whole-test order (a query that follows others can take other paths:
+a table already filled, a value already cached). The tracer's file of a process
+says which rows belong to which call through marker rows written here: `B` and `E`
+around every call of `execute` that the test makes, `K <memo key>` when its key is known.
 
 The selector reuses a recorded result only for a query whose optimized form is
 exactly the recorded one, run on tables that hold exactly the pinned data, and
@@ -45,6 +60,8 @@ memo_path, phase_path = sys.argv[1], sys.argv[2]
 attrs_path = sys.argv[3] if len(sys.argv) > 3 else None
 queries_path = sys.argv[4] if len(sys.argv) > 4 else None
 slots_path = sys.argv[5] if len(sys.argv) > 5 else None
+front_path = sys.argv[6] if len(sys.argv) > 6 else None
+frontq_path = sys.argv[7] if len(sys.argv) > 7 else None
 trace_dir = os.environ.get("BR_TRACE_DIR")
 work_dir = "/tmp/execmemo-work"
 shutil.rmtree(work_dir, ignore_errors=True)
@@ -55,8 +72,33 @@ os.environ["SKIP_INTEGRATION"] = "0"
 runner.warm_up("/sqlglot", ["tests/test_executor.py"])
 tracer = sys.modules.get("sitecustomize")
 runner.MEMO_RECORD = record_dir
+
+
+def mark(text) -> None:
+    """A marker row in the line tracer's file of this process, after what it has written so far."""
+    directory = getattr(tracer, "_DIR", None)
+    if directory:
+        with open(os.path.join(directory, f"{os.getpid()}.txt"), "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+
+
 if trace_dir and hasattr(tracer, "_phase"):
     runner.MEMO_PHASE = tracer._phase
+
+# The test calls `execute` by the name its module imported: every call is put between two marker rows.
+_test_module = sys.modules["tests.test_executor"]
+_test_execute = _test_module.execute
+
+
+def _marked_execute(*args, **kwargs):
+    mark("B")
+    try:
+        return _test_execute(*args, **kwargs)
+    finally:
+        mark("E")
+
+
+_test_module.execute = _marked_execute
 # The key of a result names the tables it was computed on: only tables holding
 # exactly what these hold are recognised.
 runner.build_executor_tables()
@@ -99,6 +141,8 @@ def run(order, case=None) -> list:
     def noting(*args, **kwargs):
         key = real_key(*args, **kwargs)
         keys.append(key)
+        if key is not None:
+            mark(f"K {key}")
         return key
 
     runner.memo_key = noting
@@ -135,10 +179,15 @@ if queries_path:
         in_fork(lambda: record_lines([case[1]], case, os.path.join(work_dir, f"lines-case-{number}.json")))
 
 memo = {}
+front_of = {}  # the key before the optimizer -> the memo key of the tree optimize made of it
 slots_of = {}  # memo key -> the digests of what its tree holds in each slot of runner.SLOTS
 for name in os.listdir(record_dir):
     with open(os.path.join(record_dir, name), "rb") as handle:
-        key, slots, data = pickle.load(handle)
+        key, slots, data, *more = pickle.load(handle)
+    if more and more[0] is not None:
+        # runner.front_key of the call of optimize that made this tree
+        if front_of.setdefault(more[0], key) != key:
+            raise SystemExit(f"one key before the optimizer, two optimized trees: {more[0]}")
     if slots_of.setdefault(key, slots) != slots:
         raise SystemExit(f"two trees with other annotations, comments or meta for {key}")
     known = memo.setdefault(key, data)
@@ -154,13 +203,36 @@ rows_of_pid = {}
 if trace_dir:
     if hasattr(tracer, "_dump"):
         tracer._dump()
+    front_rows_of_pid = {}
+    calls_of_pid = {}  # pid -> [(memo key or None, X rows, F rows)] for every call of execute, in order
     for name in os.listdir(trace_dir):
-        found = rows_of_pid.setdefault(name.split(".")[0], set())
+        pid = name.split(".")[0]
+        found = rows_of_pid.setdefault(pid, set())
+        front_found = front_rows_of_pid.setdefault(pid, set())
+        calls = calls_of_pid.setdefault(pid, [])
+        call = None  # [key, X rows, F rows] of the call of execute that is under way
         with open(os.path.join(trace_dir, name), encoding="utf-8") as handle:
             for row in handle:
-                if row.startswith("X "):
-                    _, path, first, line = row.rstrip("\n").rsplit(" ", 3)
-                    found.add((path[len("/sqlglot/"):], int(first), int(line)))
+                letter = row[:2]
+                if row.rstrip() == "B":
+                    call = [None, set(), set()]
+                elif row.rstrip() == "E":
+                    if call is not None:
+                        calls.append(tuple(call))
+                    call = None
+                elif letter == "K ":
+                    if call is not None:
+                        call[0] = row[2:].rstrip("\n")
+                elif letter in ("X ", "F "):
+                    parts = row.rstrip("\n").rsplit(" ", 3)
+                    if len(parts) != 4 or not parts[2].isdigit() or not parts[3].isdigit() or not parts[1].startswith("/sqlglot/"):
+                        continue
+                    entry = (parts[1][len("/sqlglot/"):], int(parts[2]), int(parts[3]))
+                    (found if letter == "X " else front_found).add(entry)
+                    if call is not None:
+                        call[1 if letter == "X " else 2].add(entry)
+        if call is not None:
+            calls.append(tuple(call))
     every = sorted(set().union(*rows_of_pid.values())) if rows_of_pid else []
     units = {}
     for path, first, line in every:
@@ -168,6 +240,66 @@ if trace_dir:
     json.dump(units, open(phase_path, "w"), separators=(",", ":"))
     print({path: len(rows) for path, rows in units.items()})
     row_index = {row: index for index, row in enumerate(every)}
+
+    # ---- what a query runs when it is not the first thing its process does --------
+    case_pids = set()
+    order_pids = set()
+    for name in os.listdir(work_dir):
+        if name.startswith("lines-case-"):
+            case_pids.add(str(json.load(open(os.path.join(work_dir, name)))["pid"]))
+        elif name.startswith("lines-order-"):
+            order_pids.add(str(json.load(open(os.path.join(work_dir, name)))["pid"]))
+    cold_rows, warm_rows = {}, {}  # memo key -> (X rows, F rows), from its own run and from the whole-test orders
+    for pid, calls in calls_of_pid.items():
+        target = cold_rows if pid in case_pids else warm_rows if pid in order_pids else None
+        if target is None:
+            continue
+        for key, x_rows, o_rows in calls:
+            if key is None:
+                continue
+            both = target.setdefault(key, (set(), set()))
+            both[0].update(x_rows)
+            both[1].update(o_rows)
+    extra_x = {key: rows[0] - cold_rows.get(key, (set(), set()))[0] for key, rows in warm_rows.items()}
+    extra_o = {key: rows[1] - cold_rows.get(key, (set(), set()))[1] for key, rows in warm_rows.items()}
+    print(f"rows a query runs only inside a whole-test order: phase X {sum(1 for rows in extra_x.values() if rows)} queries, "
+          f"{len(set().union(*extra_x.values()) if extra_x else ())} rows; window F {sum(1 for rows in extra_o.values() if rows)} queries, "
+          f"{len(set().union(*extra_o.values()) if extra_o else ())} rows")
+    for key, rows in sorted(extra_x.items(), key=lambda item: -len(item[1]))[:3]:
+        if rows:
+            print(f"   X only when not first, {key[-12:]}: {sorted(rows)[:6]}")
+    WARM_X = extra_x
+
+    # ---- the key before the optimizer, query by query ------------------------
+    if front_path and frontq_path and queries_path:
+        every_front = sorted(set().union(*front_rows_of_pid.values())) if front_rows_of_pid else []
+        front_index = {row: index for index, row in enumerate(every_front)}
+        front_units = {}
+        for path, first, line in every_front:
+            front_units.setdefault(path, []).append([first, line])
+        unplaced = set(every_front) - set().union(*(rows[1] for rows in cold_rows.values()), *(rows[1] for rows in warm_rows.values()))
+        if unplaced:
+            # Rows of the window that no call owns: they count for every query.
+            print(f"{len(unplaced)} rows of the window before the optimizer belong to no call: every query gets them")
+
+        def front_mask(rows) -> bytes:
+            value = 0
+            for row in rows:
+                value |= 1 << front_index[row]
+            return value.to_bytes((value.bit_length() + 7) // 8 or 1, "little")
+
+        fronts = {}
+        for name, key in sorted(front_of.items()):
+            if key not in cold_rows:
+                raise SystemExit(f"no run of its own for the query behind {name}")
+            rows = cold_rows[key][1] | warm_rows.get(key, (set(), set()))[1] | unplaced
+            fronts[name] = (key.rsplit(":", 1)[1], front_mask(rows))
+        json.dump({"lines": front_units}, open(front_path, "w"), separators=(",", ":"))
+        with open(frontq_path, "wb") as handle:
+            handle.write(zlib.compress(marshal.dumps(fronts), 9))
+        sizes = sorted(int.from_bytes(mask, "little").bit_count() for _digest, mask in fronts.values()) or [0]
+        print(f"before the optimizer: {len(fronts)} keys for {len(memo)} results, {sizes[0]} to {sizes[-1]} of {len(every_front)} lines each, "
+              f"{ {path: len(rows) for path, rows in front_units.items()} }, {os.path.getsize(frontq_path)} bytes")
 
 # ---- the class attributes the phase reads ----------------------------------
 
