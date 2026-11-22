@@ -661,10 +661,23 @@ if covmap._dirs["names"] is not None:
     expect("N: a name every importer of sqlglot asks for", plan.candidates.bit_count() >= 1600, True)
     plan = plan_for(new_file_patch("json.py", "raise RuntimeError\n"))
     expect("N: a module that shadows the standard one every test loads", plan.candidates, everything)
+    # a package marker that vanishes is a name pytest reads for itself: the rule for those files answers first
     plan = plan_for(empty_deleted_patch("tests/dialects/__init__.py"))
-    dialect_test = next(number for number, name in enumerate(covmap.ids) if name.startswith("tests/dialects/"))
-    expect("N: the package tests.dialects loses its __init__.py", bool(plan.candidates >> dialect_test & 1), True)
-    expect("N: and it is not every test", plan.candidates != everything, True)
+    expect("N: the package tests.dialects loses its __init__.py", plan.select_all, True)
+    # names the map cannot hold: what pytest's own import hook asks for, and what an existing or installed module answers to
+    for path in ("tests/test_parser.so", "tests/dialects/test_dialect.cpython-313-x86_64-linux-gnu.so", "sqlglot/parser.pyd",
+                 "sqlglot/helper/__init__.py", "sqlglot/tokens/extra.py", "xdist.py", "pytest_timeout.py", "duckdb.py",
+                 "typing.py", "json/__init__.py", "pandas/core.py"):
+        plan = plan_for(new_file_patch(path, "X = 1\n"))
+        expect("N: a new entry that shadows a module: " + path, plan.select_all or plan.candidates == everything, True)
+    for path in ("zz_notes.py", "zz_dir/mod.py", "sqlglot/zz_pkg_data/mod.py", "tests/zz_helper.py", "sqlglot/zz.txt", "docs/json.md"):
+        plan = plan_for(new_file_patch(path, "X = 1\n"))
+        expect("N: a new entry that shadows nothing: " + path, (plan.candidates, plan.select_all), (0, False))
+    for path in ("tests/test_notes.txt", "tests/fixtures/test_cases.txt", "tests/dialects/test_a.txt"):
+        plan = plan_for(new_file_patch(path, ">>> 1 + 1\n2\n"))
+        expect("N: a text file pytest takes for doctests: " + path, plan.select_all, True)
+    plan = plan_for(new_file_patch("tests/fixtures/notes.txt", "x\n"))
+    expect("N: any other text file", (plan.candidates, plan.select_all), (0, False))
     for path in ("pytest.toml", ".pytest.toml", "tests/pytest.toml", "tests/dialects/pytest.ini", "tests/pyproject.toml", "tests/setup.cfg"):
         plan = plan_for(new_file_patch(path, "[pytest]\naddopts = -x\n"))
         expect("N: pytest finds its configuration by name: " + path, plan.select_all, True)

@@ -9,6 +9,7 @@ this module never decides that a test fails or passes.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import importlib.util
 import marshal
 import os
@@ -565,10 +566,17 @@ def _entry_rules(plan: Plan, patch: patchlib.FilePatch, covmap: CovMap, root: st
     old_path = patch.old_path or path
     entries = []
     name = os.path.basename(path)
+    if (patch.new_file or old_path != path) and path.startswith("tests/") and fnmatch.fnmatch(name, "test*.txt"):
+        # pytest takes a text file of that name for a doctest file (its default
+        # --doctest-glob) and runs it in the process of every test.
+        plan.select_all = True
+        plan.note(f"{path}: pytest collects it as a doctest file")
+        return
     if (
         patch.new_file
         and old_path == path
         and path.startswith("tests/")
+        and name.endswith(".py")
         and (name.startswith("test_") or name.endswith("_test.py"))
         and pydiff.harmless_new_test_module(patch.new_text or "", _import_checker(root, plan))
     ):

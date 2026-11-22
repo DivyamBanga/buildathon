@@ -6,6 +6,7 @@ own tests.json. The coordinator translates bits to the run's test numbers.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import marshal
 import os
@@ -198,6 +199,11 @@ class CovMap:
         while depth > 0 and not os.path.isdir(os.path.join(root, *parts[:depth])):
             depth -= 1
         everything = (self.all, 0 if path.startswith(("sqlglot/", "tests/")) else self.all)
+        if self._shadows(parts, depth, root):
+            # The import system finds the new entry before something that answers to
+            # its name today, whoever asks; and pytest's own import hook asks for test
+            # modules and plugins without the map seeing it.
+            return everything
         found = 0
         unchecked = 0
         directory = "/".join(parts[:depth])
@@ -244,6 +250,51 @@ class CovMap:
             # Outside the two trees a child sees patched.
             unchecked |= found
         return found, unchecked
+
+    @staticmethod
+    def _shadows(parts: list, depth: int, root: str) -> bool:
+        """True when a new entry takes a name that something else answers to today.
+
+        Three ways. A file with a module suffix beside a module of the tree that
+        has the same stem under another suffix (`test_parser.so` beside
+        `test_parser.py`: an extension module is found first). A new directory
+        beside a module of that name (a package is found before a module). And a
+        new name at the top of the checkout that a standard or installed module
+        has (`xdist.py`, `duckdb.py`, a directory `json`): the checkout comes
+        before them on the path. Removing an entry is not judged here.
+        """
+        if depth >= len(parts):
+            return False
+        first = parts[depth]  # the first component that the pinned tree does not have, or the file itself
+        last = depth == len(parts) - 1
+        if last and not first.endswith(_MODULE_SUFFIXES):
+            return False
+        stem = first.split(".", 1)[0] if last else first
+        directory = os.path.join(root, *parts[:depth])
+        if os.path.lexists(os.path.join(directory, first)):
+            return False  # it is there already: an entry that vanishes, or an edit
+        for suffix in _MODULE_SUFFIXES:
+            if os.path.isfile(os.path.join(directory, stem + suffix)):
+                return True
+        try:
+            for name in os.listdir(directory):
+                # x.cpython-313-x86_64-linux-gnu.so and the like
+                if name.split(".", 1)[0] == stem and name.endswith(_MODULE_SUFFIXES):
+                    return True
+        except OSError:
+            pass
+        if depth == 0 and stem.isidentifier():
+            try:
+                spec = importlib.util.find_spec(stem)
+            except Exception:
+                return True
+            if spec is not None:
+                origin = getattr(spec, "origin", None) or ""
+                locations = list(getattr(spec, "submodule_search_locations", None) or ())
+                inside = [where for where in [origin] + locations if where and os.path.abspath(where).startswith(os.path.abspath(root) + os.sep)]
+                if not inside:
+                    return True
+        return False
 
     def opens_of(self, bit: int) -> list[str]:
         """Fixture files (relative to tests/fixtures/) the test opens."""
